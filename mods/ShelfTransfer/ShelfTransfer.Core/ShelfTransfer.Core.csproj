@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Pure logic. No BepInEx, interop or UnityEngine reference may ever be added here:
+       this project must build and test on CI without the game. -->
+  <PropertyGroup>
+    <RootNamespace>ShelfTransfer.Core</RootNamespace>
+    <AssemblyName>ShelfTransfer.Core</AssemblyName>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <Version>0.1.0</Version>
+  </PropertyGroup>
+</Project>

@@ -1,0 +1,5 @@
+# LF in the repo and in checkouts, regardless of core.autocrlf; matches .editorconfig
+* text=auto eol=lf
+*.sln text eol=crlf
+*.pdf binary
+*.png binary

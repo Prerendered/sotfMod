@@ -1,0 +1,7 @@
+<Project>
+  <!-- Copy to Directory.Build.local.props (git-ignored) and set your game folder if it is not
+       the default Steam location. -->
+  <PropertyGroup>
+    <GamePath>D:\SteamLibrary\steamapps\common\Sons Of The Forest</GamePath>
+  </PropertyGroup>
+</Project>

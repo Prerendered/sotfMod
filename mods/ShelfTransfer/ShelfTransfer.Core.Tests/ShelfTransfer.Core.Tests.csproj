@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Targets net10.0, not net6.0: no .NET 6 runtime is installed here or on CI, and a net10.0 test
+       host can load the net6.0 Core assembly. Core itself stays net6.0 for the game's CoreCLR. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>ShelfTransfer.Core.Tests</RootNamespace>
+    <IsTestProject>true</IsTestProject>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ShelfTransfer.Core\ShelfTransfer.Core.csproj" />
+  </ItemGroup>
+</Project>

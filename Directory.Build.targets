@@ -1,0 +1,40 @@
+<Project>
+  <!-- Evaluated after each project file, so $(IsBepInExPlugin) set in a csproj is visible here.
+       Everything in this file is a no-op for Core and test projects. -->
+  <PropertyGroup Condition="'$(IsBepInExPlugin)' == 'true'">
+    <BepInExCorePath>$(GamePath)\BepInEx\core</BepInExCorePath>
+    <BepInExInteropPath>$(GamePath)\BepInEx\interop</BepInExInteropPath>
+    <PluginDeployDir>$(GamePath)\BepInEx\plugins\$(PluginFolderName)\</PluginDeployDir>
+  </PropertyGroup>
+
+  <!-- Private=false: game-derived assemblies are referenced in place and never copied to bin/,
+       so they cannot end up in the repo or in the plugins folder. -->
+  <ItemGroup Condition="'$(IsBepInExPlugin)' == 'true'">
+    <Reference Include="$(BepInExCorePath)\BepInEx.Core.dll" Private="false" />
+    <Reference Include="$(BepInExCorePath)\BepInEx.Unity.IL2CPP.dll" Private="false" />
+    <Reference Include="$(BepInExCorePath)\0Harmony.dll" Private="false" />
+    <Reference Include="$(BepInExCorePath)\Il2CppInterop.Runtime.dll" Private="false" />
+    <Reference Include="$(BepInExInteropPath)\*.dll" Private="false" />
+  </ItemGroup>
+
+  <Target Name="CheckGameReferences" BeforeTargets="ResolveAssemblyReferences"
+          Condition="'$(IsBepInExPlugin)' == 'true'">
+    <Error Condition="'$(PluginFolderName)' == ''"
+           Text="Plugin project must set &lt;PluginFolderName&gt; (the folder under BepInEx/plugins)." />
+    <Error Condition="!Exists('$(BepInExCorePath)\BepInEx.Unity.IL2CPP.dll')"
+           Text="BepInEx not found at '$(BepInExCorePath)'. Install BepInEx 6 IL2CPP be.755 into GamePath, or set GamePath in Directory.Build.local.props." />
+    <Error Condition="!Exists('$(BepInExInteropPath)')"
+           Text="'$(BepInExInteropPath)' is missing. Launch the game once with BepInEx installed so Il2CppInterop generates the interop assemblies." />
+  </Target>
+
+  <!-- Deploy only what we built: the plugin DLL and its project references. Game assemblies
+       are Private=false so they never appear in $(OutDir). -->
+  <Target Name="DeployToGame" AfterTargets="Build" Condition="'$(IsBepInExPlugin)' == 'true'">
+    <ItemGroup>
+      <PluginDeployFiles Include="$(OutDir)*.dll;$(OutDir)*.pdb" />
+    </ItemGroup>
+    <MakeDir Directories="$(PluginDeployDir)" />
+    <Copy SourceFiles="@(PluginDeployFiles)" DestinationFolder="$(PluginDeployDir)" SkipUnchangedFiles="true" />
+    <Message Importance="high" Text="Deployed @(PluginDeployFiles->'%(Filename)%(Extension)', ', ') to $(PluginDeployDir)" />
+  </Target>
+</Project>
