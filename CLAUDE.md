@@ -151,8 +151,9 @@ running the setup that produced it; that is how the same corruption recurs worse
 **Model tiers (cost).** Each agent carries a `model:` in its frontmatter. Cheapest
 to most capable (and most costly): **haiku → sonnet → opus → fable**. Fable is the
 premium tier, used sparingly.
-- **fable**: architect only — runs once, highest-leverage design.
-- **opus**: dev; also the everyday escalation target.
+- **fable**: no agent by default — deliberate escalation only (see below).
+- **opus**: architect (`effort: high` — runs once, highest-leverage design); dev;
+  also the everyday escalation target.
 - **sonnet**: reviewer, tester, security, scout, seer, designer, refactor, cicd.
 - **haiku**: scribe, archivist — bounded, template-driven. Thin output is the
   signal to bump: a shallow archivist entry (wrong pitfalls carried) or docs that
