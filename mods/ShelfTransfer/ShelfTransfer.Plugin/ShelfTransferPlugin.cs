@@ -48,9 +48,9 @@ public sealed class ShelfTransferPlugin : BasePlugin
             new("fault_inject", config.InjectFaultAfterItems.Value),
         });
 
-        TransferFeature.Install(modLog);
-        LabelsFeature.Install(modLog);
-        UiFeature.Install(modLog);
+        TransferFeature.Install(modLog, config);
+        LabelsFeature.Install(modLog, config);
+        UiFeature.Install(modLog, config);
 
         RunErrorProbeIfRequested(logDirectory, modLog);
     }
