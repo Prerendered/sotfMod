@@ -10,7 +10,7 @@ namespace ShelfTransfer.Core.Tests.Gateway;
 
 public sealed class AimChangeDebouncerTests
 {
-    private const double Settle = AimChangeDebouncer.SettleSeconds;
+    private const double _settle = AimChangeDebouncer.SettleSeconds;
 
     private static AimTarget Shelf(string key = "A", int? slot = 0, int item = 312, int count = 6) =>
         new(new ShelfRef(key, "StorageShelf", default), new SlotRef(slot), new ItemId(item), count);
@@ -30,10 +30,10 @@ public sealed class AimChangeDebouncerTests
     public void Startup_into_none_logs_once_after_window()
     {
         var d = new AimChangeDebouncer();
-        // Start at 0.0 so now - start is exactly Settle (0.2 is not exact in binary at larger offsets).
+        // Start at 0.0 so now - start is exactly _settle (0.2 is not exact in binary at larger offsets).
         Assert.False(d.ShouldLog(null, 0.0));
         Assert.False(d.ShouldLog(null, 0.1));
-        Assert.True(d.ShouldLog(null, Settle));
+        Assert.True(d.ShouldLog(null, _settle));
         Assert.False(d.ShouldLog(null, 11.0));
     }
 
@@ -56,8 +56,8 @@ public sealed class AimChangeDebouncerTests
         var d = new AimChangeDebouncer();
         Hold(d, Shelf(), 0, 1);
         Assert.False(d.ShouldLog(null, 2.0));
-        Assert.False(d.ShouldLog(null, 2.0 + Settle - 0.001));
-        Assert.True(d.ShouldLog(null, 2.0 + Settle));
+        Assert.False(d.ShouldLog(null, 2.0 + _settle - 0.001));
+        Assert.True(d.ShouldLog(null, 2.0 + _settle));
         Assert.False(d.ShouldLog(null, 2.5));
     }
 
@@ -124,7 +124,7 @@ public sealed class AimChangeDebouncerTests
         var d = new AimChangeDebouncer();
         Assert.False(d.ShouldLog(Shelf(), 0.0));
         Assert.False(d.ShouldLog(Shelf(), 0.1999999));
-        Assert.True(d.ShouldLog(Shelf(), Settle));
+        Assert.True(d.ShouldLog(Shelf(), _settle));
     }
 
     [Fact]
@@ -142,7 +142,7 @@ public sealed class AimChangeDebouncerTests
         var d = new AimChangeDebouncer();
         Hold(d, Shelf("A"), 0, 1);
         Assert.False(d.ShouldLog(Shelf("B"), 1000.0));
-        Assert.True(d.ShouldLog(Shelf("B"), 1000.0 + Settle));
+        Assert.True(d.ShouldLog(Shelf("B"), 1000.0 + _settle));
     }
 
     [Fact]
@@ -172,7 +172,7 @@ public sealed class AimChangeDebouncerTests
         Hold(d, Shelf("A"), -2, -1);
         Assert.False(d.ShouldLog(Shelf("B"), 0.0));
         Assert.False(d.ShouldLog(Shelf("B"), 0.1));
-        Assert.True(d.ShouldLog(Shelf("B"), Settle));
+        Assert.True(d.ShouldLog(Shelf("B"), _settle));
     }
 
     [Fact]
@@ -212,7 +212,7 @@ public sealed class AimChangeDebouncerTests
         Hold(d, Shelf("A"), 100, 101);
         Assert.False(d.ShouldLog(Shelf("B"), 50.0));
         Assert.False(d.ShouldLog(Shelf("B"), 50.1));
-        Assert.True(d.ShouldLog(Shelf("B"), 50.0 + Settle));
+        Assert.True(d.ShouldLog(Shelf("B"), 50.0 + _settle));
     }
 
     [Fact]
