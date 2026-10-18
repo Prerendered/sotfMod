@@ -22,6 +22,7 @@ public sealed class TransferRunner
     private int _inventoryStart;
     private bool _isCancelRequested;
     private bool _isTickInFlight;
+    private bool _hasStoreVerdict;
 
     public TransferRunner(IShelfGateway gateway, IModLog log, TransferRequest request)
     {
@@ -172,7 +173,17 @@ public sealed class TransferRunner
     {
         int itemNumber = Moved + 1;
         int sourceBefore = _gateway.GetCount(_request.Source, _request.Item);
+        if (IsFinished)
+        {
+            return;
+        }
+
         int targetBefore = _gateway.GetCount(_request.Target, _request.Item);
+        if (IsFinished)
+        {
+            return;
+        }
+
         int inventoryBefore = _gateway.GetInventoryCount(_request.Item);
         if (IsFinished || !IsCycleStartAsTracked(sourceBefore, targetBefore, inventoryBefore))
         {
@@ -226,6 +237,11 @@ public sealed class TransferRunner
 
         State = TransferState.TakenAwaitingVerify;
         int sourceAfter = _gateway.GetCount(_request.Source, _request.Item);
+        if (IsFinished)
+        {
+            return false;
+        }
+
         int inventoryAfter = _gateway.GetInventoryCount(_request.Item);
         if (IsFinished)
         {
@@ -262,13 +278,20 @@ public sealed class TransferRunner
         }
 
         State = TransferState.StoredAwaitingVerify;
+        _hasStoreVerdict = false;
         int targetAfter = _gateway.GetCount(_request.Target, _request.Item);
+        if (IsFinished)
+        {
+            return false;
+        }
+
         int inventoryAfter = _gateway.GetInventoryCount(_request.Item);
         if (IsFinished)
         {
             return false;
         }
 
+        _hasStoreVerdict = true;
         bool isTargetVerified = targetAfter == targetBefore + 1;
         bool isInventoryVerified = inventoryAfter == inventoryBefore;
         LogStep("transfer.store", itemNumber, "dst", targetBefore, targetAfter, inventoryBefore + 1, inventoryAfter, isTargetVerified && isInventoryVerified);
@@ -277,17 +300,7 @@ public sealed class TransferRunner
             return true;
         }
 
-        // The report's S0 check sees only source + inventory, so a store the game called Ok that the counts contradict
-        // could hide a target-side loss or duplicate; flag it here.
-        _log.Write(LogLevel.Warn, "conservation.mismatch", new KeyValuePair<string, object?>[]
-        {
-            new("check", "store"),
-            new("n", itemNumber),
-            new("dst_before", targetBefore),
-            new("dst_after", targetAfter),
-            new("inv_before", inventoryBefore + 1),
-            new("inv_after", inventoryAfter),
-        });
+        LogStoreMismatch(itemNumber, targetBefore, targetAfter, inventoryBefore + 1, inventoryAfter);
         if (!isTargetVerified)
         {
             Finish(StopReason.TargetMismatch, $"store: target expected {targetBefore + 1} read {targetAfter}");
@@ -315,11 +328,15 @@ public sealed class TransferRunner
         State = TransferState.Finished;
 
         bool isItemOffSource = stoppedIn is TransferState.TakenAwaitingVerify or TransferState.StoredAwaitingVerify;
+        bool isStoreUnsettled = stoppedIn == TransferState.StoredAwaitingVerify && !_hasStoreVerdict;
         int trackedRemaining = _sourceStart - Moved - (isItemOffSource ? 1 : 0);
         int trackedStranded = stoppedIn == TransferState.TakenAwaitingVerify ? 1 : 0;
 
         // Re-read rather than derive (invariant 1); tracked counts only when the gateway cannot answer, and the detail says so.
         string? countsNote = null;
+        int? targetNow = isStoreUnsettled
+            ? ReadOrTrack<int?>(() => _gateway.GetCount(_request.Target, _request.Item), null, ref countsNote)
+            : null;
         bool isSourceReadable = ReadOrTrack(() => _gateway.IsAlive(_request.Source), false, ref countsNote);
         int remaining = isSourceReadable
             ? ReadOrTrack(() => _gateway.GetCount(_request.Source, _request.Item), trackedRemaining, ref countsNote)
@@ -329,11 +346,28 @@ public sealed class TransferRunner
             countsNote ??= "source gone, remaining tracked";
         }
 
-        int stranded = _hasBaseline
-            ? Math.Clamp(ReadOrTrack(() => _gateway.GetInventoryCount(_request.Item) - _inventoryStart, trackedStranded, ref countsNote), 0, 1)
-            : 0;
+        int? inventoryNow = _hasBaseline
+            ? ReadOrTrack<int?>(() => _gateway.GetInventoryCount(_request.Item), null, ref countsNote)
+            : null;
+        int stranded = inventoryNow is int inventory ? Math.Clamp(inventory - _inventoryStart, 0, 1) : trackedStranded;
 
-        string? fullDetail = countsNote is null ? detail : detail is null ? countsNote : $"{detail}; {countsNote}";
+        // The game said Ok but the stop came before the verify; settle the item from the fresh reads, never on the game's word.
+        string? storeNote = null;
+        if (isStoreUnsettled)
+        {
+            int targetBefore = _targetStart + Moved;
+            if (targetNow == targetBefore + 1 && inventoryNow == _inventoryStart)
+            {
+                Moved++;
+            }
+            else
+            {
+                LogStoreMismatch(Moved + 1, targetBefore, targetNow, _inventoryStart + 1, inventoryNow);
+                storeNote = "store unverified";
+            }
+        }
+
+        string? fullDetail = JoinNotes(detail, storeNote, countsNote);
         Report = new TransferReport(reason, Requested, Moved, remaining, stranded, fullDetail);
 
         LogLevel level = reason is StopReason.Completed or StopReason.Cancelled or StopReason.BlockedBeforeStart
@@ -361,6 +395,27 @@ public sealed class TransferRunner
                 new("stranded", stranded),
             });
         }
+    }
+
+    // The report's S0 check sees only source + inventory, so a store the game called Ok that the counts contradict
+    // could hide a target-side loss or duplicate; flag it separately.
+    private void LogStoreMismatch(int itemNumber, int targetBefore, int? targetAfter, int inventoryBefore, int? inventoryAfter)
+    {
+        _log.Write(LogLevel.Warn, "conservation.mismatch", new KeyValuePair<string, object?>[]
+        {
+            new("check", "store"),
+            new("n", itemNumber),
+            new("dst_before", targetBefore),
+            new("dst_after", targetAfter),
+            new("inv_before", inventoryBefore),
+            new("inv_after", inventoryAfter),
+        });
+    }
+
+    private static string? JoinNotes(params string?[] notes)
+    {
+        string joined = string.Join("; ", Array.FindAll(notes, note => note is not null));
+        return joined.Length == 0 ? null : joined;
     }
 
     // The one catch in Core: a gateway that just threw may throw again here, and the player must still get a report.
