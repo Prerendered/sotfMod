@@ -4,12 +4,11 @@
 // caution: read-only (I2): static auto-property backing fields and instance fields only, except the IsMpClient and
 //          IsSavedGame getters, which have no backing field and so run game code. Nothing but the GameState instance
 //          check runs until a world is loaded, so no class constructor or getter runs first at the menu or during load.
-//          Game types appear only inside the read lambdas, so a member missing after a game update fails that one read
+//          Game types appear only inside the read lambdas, so a member missing after a game update fails that one read.
+//          No user id or hash of one is ever logged (personal data)
 
 using System;
 using System.Collections.Generic;
-using System.Security.Cryptography;
-using System.Text;
 
 using Endnight.Types;
 using Sons.Save;
@@ -24,13 +23,11 @@ public static class WorldIdentityProbe
     private const string _gameSetupSource = "TheForest.Utils.GameSetup";
     private const string _gameStateSource = "Sons.Save.GameState";
 
-    // 32 bits: enough to tell two ids apart in a debug log without printing the id.
-    private const int _userIdHashLength = 8;
-
     private static readonly (string Key, Func<object, object?> Read)[] _gameSetupReads =
     {
         ("slot", _ => GameSetup._Slot_k__BackingField),
-        ("save_user_hash", _ => HashUserId(GameSetup._SaveUserId_k__BackingField)),
+        // SaveUserId is the player's platform id; even a short hash of it is reversible, so only its presence is logged.
+        ("save_user_present", _ => !string.IsNullOrEmpty(GameSetup._SaveUserId_k__BackingField)),
         ("mp_type", _ => GameSetup._MpType_k__BackingField),
         ("game", _ => GameSetup._Game_k__BackingField),
         ("init", _ => GameSetup._Init_k__BackingField),
@@ -98,9 +95,4 @@ public static class WorldIdentityProbe
         return state == null ? null : state._storedGameStateData;
     }
 
-    // SaveUserId is the player's platform id (personal data); equal ids still give equal hashes, which is all card 39 needs.
-    private static string? HashUserId(string? userId) =>
-        string.IsNullOrEmpty(userId)
-            ? userId
-            : Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(userId)))[.._userIdHashLength].ToLowerInvariant();
 }
