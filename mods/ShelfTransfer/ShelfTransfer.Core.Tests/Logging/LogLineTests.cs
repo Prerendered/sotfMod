@@ -696,6 +696,360 @@ public sealed class LogLineTests
         Assert.Equal(value, Unquote(ValueOf(value)));
     }
 
+    // ---- card 33: lone surrogates ----
+
+    [Fact]
+    public void Format_LoneHighSurrogate_EscapedAndQuoted()
+    {
+        Assert.Equal("\"a\\uD800b\"", ValueOf("a\uD800b"));
+    }
+
+    [Fact]
+    public void Format_LoneLowSurrogate_EscapedAndQuoted()
+    {
+        Assert.Equal("\"a\\uDC00b\"", ValueOf("a\uDC00b"));
+    }
+
+    [Theory]
+    [InlineData("D800", "\"\\uD800\"")]
+    [InlineData("DFFF", "\"\\uDFFF\"")]
+    [InlineData("78 D83D", "\"x\\uD83D\"")]
+    [InlineData("DE00 78", "\"\\uDE00x\"")]
+    [InlineData("DC00 D800", "\"\\uDC00\\uD800\"")]
+    [InlineData("D800 D800", "\"\\uD800\\uD800\"")]
+    [InlineData("DC00 DC00", "\"\\uDC00\\uDC00\"")]
+    public void Format_LoneSurrogates_EscapedPerChar(string unitsHex, string expected)
+    {
+        Assert.Equal(expected, ValueOf(FromUnits(unitsHex)));
+    }
+
+    [Fact]
+    public void Format_LoneHighBeforeValidPair_OnlyTheLoneOneEscaped()
+    {
+        Assert.Equal("\"\\uD800\uD83D\uDE00\"", ValueOf("\uD800\uD83D\uDE00"));
+    }
+
+    [Fact]
+    public void Format_ValidPairBeforeLoneLow_OnlyTheLoneOneEscaped()
+    {
+        Assert.Equal("\"\uD83D\uDE00\\uDE00\"", ValueOf("\uD83D\uDE00\uDE00"));
+    }
+
+    [Theory]
+    [InlineData("\U0001F600")]
+    [InlineData("\U00010000")]
+    [InlineData("\U0010FFFF")]
+    [InlineData("a\U0001F600b")]
+    public void Format_ValidSurrogatePair_WrittenAsItselfUnquoted(string value)
+    {
+        Assert.Equal(value, ValueOf(value));
+    }
+
+    [Theory]
+    [InlineData("61 D800 62")]
+    [InlineData("DC00 D800")]
+    [InlineData("D800 D83D DE00")]
+    [InlineData("78 DFFF")]
+    [InlineData("D800 202E DC00")]
+    public void Format_LoneSurrogateValue_LineEncodesToStrictUtf8AndRoundTrips(string unitsHex)
+    {
+        string value = FromUnits(unitsHex);
+        string line = FormatOne(value);
+
+        byte[] bytes = new UTF8Encoding(false, true).GetBytes(line);
+        Assert.Equal(line, new UTF8Encoding(false, true).GetString(bytes));
+        Assert.DoesNotContain('\uFFFD', line);
+        Assert.Equal(value, Unquote(line.Substring(_prefix.Length + "INFO  t.e k=".Length)));
+    }
+
+    [Fact]
+    public void Format_EverySurrogateChar_AloneIsEscapedAndRoundTrips()
+    {
+        for (int cp = 0xD800; cp <= 0xDFFF; cp++)
+        {
+            char c = (char)cp;
+            string token = ValueOf(c.ToString());
+
+            Assert.Equal("\"\\u" + cp.ToString("X4", CultureInfo.InvariantCulture) + "\"", token);
+            Assert.Equal(c.ToString(), Unquote(token));
+        }
+    }
+
+    [Fact]
+    public void Format_LoneSurrogateStraddlingBoundary_IsNotSplit()
+    {
+        string cut = ValueOf(new string('a', 251) + "\uD800");
+        string fits = ValueOf(new string('a', 250) + "\uD800");
+
+        Assert.Equal("\"" + new string('a', 251) + _ellipsis + "(+1)\"", cut);
+        Assert.Equal("\"" + new string('a', 250) + "\\uD800\"", fits);
+    }
+
+    // ---- card 36: Format-category chars ----
+
+    [Theory]
+    [InlineData(0x202A)]
+    [InlineData(0x202B)]
+    [InlineData(0x202C)]
+    [InlineData(0x202D)]
+    [InlineData(0x202E)]
+    [InlineData(0x2066)]
+    [InlineData(0x2067)]
+    [InlineData(0x2068)]
+    [InlineData(0x2069)]
+    [InlineData(0x200B)]
+    [InlineData(0x200C)]
+    [InlineData(0x200D)]
+    [InlineData(0x200E)]
+    [InlineData(0x200F)]
+    [InlineData(0xFEFF)]
+    [InlineData(0x061C)]
+    [InlineData(0x00AD)]
+    public void Format_NamedFormatChar_QuotedAndEscaped(int codePoint)
+    {
+        string escape = "\\u" + codePoint.ToString("X4", CultureInfo.InvariantCulture);
+        string single = ((char)codePoint).ToString();
+
+        Assert.Equal("\"" + escape + "\"", ValueOf(single));
+        Assert.Equal("\"a" + escape + "b\"", ValueOf("a" + single + "b"));
+        Assert.Equal(single, Unquote(ValueOf(single)));
+    }
+
+    [Fact]
+    public void Format_TrojanSourceBidiOverride_NoRawBidiCharReachesLine()
+    {
+        string line = FormatOne("admin\u202Etxt.exe \u2066x\u2069");
+
+        Assert.Equal(_prefix + "INFO  t.e k=\"admin\\u202Etxt.exe \\u2066x\\u2069\"", line);
+        foreach (char c in line)
+        {
+            Assert.NotEqual(UnicodeCategory.Format, CharUnicodeInfo.GetUnicodeCategory(c));
+        }
+    }
+
+    [Fact]
+    public void Format_ZwjEmojiSequence_ZwjEscapedEmojiRaw()
+    {
+        Assert.Equal("\"\U0001F468\\u200D\U0001F469\"", ValueOf("\U0001F468\u200D\U0001F469"));
+    }
+
+    [Fact]
+    public void Format_SoftHyphen_Escaped()
+    {
+        Assert.Equal("\"co\\u00ADop\"", ValueOf("co\u00ADop"));
+    }
+
+    [Theory]
+    [InlineData(0xE0001, "\\uDB40\\uDC01")]
+    [InlineData(0xE0020, "\\uDB40\\uDC20")]
+    [InlineData(0xE0041, "\\uDB40\\uDC41")]
+    [InlineData(0xE007F, "\\uDB40\\uDC7F")]
+    public void Format_TagCharacter_BothHalvesEscaped(int codePoint, string expected)
+    {
+        string tag = char.ConvertFromUtf32(codePoint);
+
+        Assert.Equal("\"" + expected + "\"", ValueOf(tag));
+        Assert.Equal(tag, Unquote(ValueOf(tag)));
+        Assert.Equal(12, expected.Length);
+    }
+
+    [Fact]
+    public void Format_TagSequenceAfterEmoji_EmojiRawTagsEscaped()
+    {
+        string value = "\U0001F3F4" + char.ConvertFromUtf32(0xE0067) + char.ConvertFromUtf32(0xE007F);
+
+        Assert.Equal("\"\U0001F3F4\\uDB40\\uDC67\\uDB40\\uDC7F\"", ValueOf(value));
+        Assert.Equal(value, Unquote(ValueOf(value)));
+    }
+
+    [Fact]
+    public void Format_TagPairStraddlingBoundary_CutWhole()
+    {
+        string tag = char.ConvertFromUtf32(0xE0001);
+        string cut = ValueOf(new string('a', 250) + tag);
+        string fits = ValueOf(new string('a', 244) + tag);
+        string cutOne = ValueOf(new string('a', 245) + tag);
+
+        Assert.Equal("\"" + new string('a', 250) + _ellipsis + "(+2)\"", cut);
+        Assert.Equal("\"" + new string('a', 244) + "\\uDB40\\uDC01\"", fits);
+        Assert.Equal("\"" + new string('a', 245) + _ellipsis + "(+2)\"", cutOne);
+    }
+
+    [Fact]
+    public void Format_FormatCharStraddlingBoundary_IsNotSplit()
+    {
+        string cut = ValueOf(new string('a', 251) + "\u202E");
+        string fits = ValueOf(new string('a', 250) + "\u202E");
+
+        Assert.Equal("\"" + new string('a', 251) + _ellipsis + "(+1)\"", cut);
+        Assert.Equal("\"" + new string('a', 250) + "\\u202E\"", fits);
+    }
+
+    // ---- card 36: stack frames ----
+
+    [Fact]
+    public void MaxFrameLength_Is512()
+    {
+        Assert.Equal(512, LogLine.MaxFrameLength);
+    }
+
+    [Fact]
+    public void FormatException_FrameWithControlChar_EscapedNeverRaw()
+    {
+        Exception ex = new FakeStackException("m", "   at A.B(\u001B[31mred\u001B[0m)\n   at C.D()");
+
+        string text = LogLine.FormatException(_at, "x", ex);
+
+        Assert.Equal(
+            _prefix + "ERROR error event=x type=FakeStackException message=m\n    at A.B(\\u001B[31mred\\u001B[0m)\n    at C.D()",
+            text);
+        Assert.DoesNotContain('\u001B', text);
+    }
+
+    [Fact]
+    public void FormatException_FrameWithBidiOverride_Escaped()
+    {
+        Exception ex = new FakeStackException("m", "   at A.B() in evil\u202Etxt.cs");
+
+        string frame = LogLine.FormatException(_at, "x", ex).Split('\n')[1];
+
+        Assert.Equal("    at A.B() in evil\\u202Etxt.cs", frame);
+    }
+
+    [Fact]
+    public void FormatException_FrameWithSeparatorsAndNul_EscapedOnOneLine()
+    {
+        Exception ex = new FakeStackException("m", "at A\u2028B\u2029C\0D\u0085E\tF\rG");
+
+        string[] lines = LogLine.FormatException(_at, "x", ex).Split('\n');
+
+        Assert.Equal(2, lines.Length);
+        Assert.Equal("    at A\\u2028B\\u2029C\\u0000D\\u0085E\\u0009F\\rG", lines[1]);
+    }
+
+    [Fact]
+    public void FormatException_FrameWithLoneSurrogate_Escaped()
+    {
+        Exception ex = new FakeStackException("m", "at A\uD800B\uDC00C");
+
+        string frame = LogLine.FormatException(_at, "x", ex).Split('\n')[1];
+
+        Assert.Equal("    at A\\uD800B\\uDC00C", frame);
+    }
+
+    [Fact]
+    public void FormatException_FrameWithEmojiPair_PassesThroughRaw()
+    {
+        Exception ex = new FakeStackException("m", "at A\U0001F600B");
+
+        Assert.Equal("    at A\U0001F600B", LogLine.FormatException(_at, "x", ex).Split('\n')[1]);
+    }
+
+    [Fact]
+    public void FormatException_WindowsPathBackslashes_DoubledAndNeverQuoted()
+    {
+        Exception ex = new FakeStackException("m", "   at A.B() in C:\\src\\my \"dir\"\\x.cs:line 5");
+
+        string frame = LogLine.FormatException(_at, "x", ex).Split('\n')[1];
+
+        Assert.Equal("    at A.B() in C:\\\\src\\\\my \\\"dir\\\"\\\\x.cs:line 5", frame);
+        Assert.False(frame.TrimStart().StartsWith('"'));
+        Assert.False(frame.EndsWith('"'));
+    }
+
+    [Fact]
+    public void FormatException_FrameRoundTripsThroughReferenceDecoder()
+    {
+        string original = "at A.B(\u001B) in C:\\x\\y.cs \u202E \uD800 \U0001F600 \"q\"";
+        Exception ex = new FakeStackException("m", "   " + original + "  ");
+
+        string frame = LogLine.FormatException(_at, "x", ex).Split('\n')[1];
+
+        Assert.StartsWith("    ", frame);
+        Assert.Equal(original, Unquote("\"" + frame.Substring(4) + "\""));
+    }
+
+    [Fact]
+    public void FormatException_ContinuationLines_FourSpacesAndNoRawControl()
+    {
+        Exception ex = new FakeStackException("m", "at A\u001B\n at B\u202E\n at C\u2028\n at D\0");
+
+        string[] lines = LogLine.FormatException(_at, "x", ex).Split('\n');
+
+        Assert.Equal(5, lines.Length);
+        foreach (string l in lines[1..])
+        {
+            Assert.StartsWith("    at ", l);
+            Assert.All(l, ch => Assert.False(char.IsControl(ch) || ch == '\u2028' || ch == '\u2029'));
+        }
+    }
+
+    [Fact]
+    public void FormatException_Frame603Chars_Keeps512ThenMarkerPlus91()
+    {
+        string raw = "at " + new string('x', 600);
+        Assert.Equal(603, raw.Length);
+        Exception ex = new FakeStackException("m", raw);
+
+        string frame = LogLine.FormatException(_at, "x", ex).Split('\n')[1];
+
+        Assert.Equal("    " + raw.Substring(0, 512) + _ellipsis + "(+91)", frame);
+    }
+
+    [Fact]
+    public void FormatException_Frame512And513_Boundary()
+    {
+        string at512 = "at " + new string('x', 509);
+        string at513 = "at " + new string('x', 510);
+
+        string kept = LogLine.FormatException(_at, "x", new FakeStackException("m", at512)).Split('\n')[1];
+        string cut = LogLine.FormatException(_at, "x", new FakeStackException("m", at513)).Split('\n')[1];
+
+        Assert.Equal("    " + at512, kept);
+        Assert.Equal("    " + at512 + _ellipsis + "(+1)", cut);
+    }
+
+    [Fact]
+    public void FormatException_EachFrameCappedIndependently()
+    {
+        string stack = "at " + new string('a', 600) + "\nat short\nat " + new string('b', 600);
+
+        string[] lines = LogLine.FormatException(_at, "x", new FakeStackException("m", stack)).Split('\n');
+
+        Assert.Equal(4, lines.Length);
+        Assert.EndsWith(_ellipsis + "(+91)", lines[1]);
+        Assert.Equal("    at short", lines[2]);
+        Assert.EndsWith(_ellipsis + "(+91)", lines[3]);
+    }
+
+    [Fact]
+    public void FormatException_FrameCapDoesNotSplitEscape()
+    {
+        string head = "at " + new string('a', 509);
+        string cut = LogLine.FormatException(_at, "x", new FakeStackException("m", head + "\u001B")).Split('\n')[1];
+        string cutTwo = LogLine.FormatException(_at, "x", new FakeStackException("m", head + "\\")).Split('\n')[1];
+        string fits = LogLine.FormatException(_at, "x", new FakeStackException("m", head.Substring(0, 506) + "\u001B")).Split('\n')[1];
+
+        Assert.Equal("    " + head + _ellipsis + "(+1)", cut);
+        Assert.Equal("    " + head + _ellipsis + "(+1)", cutTwo);
+        Assert.Equal("    " + head.Substring(0, 506) + "\\u001B", fits);
+    }
+
+    [Fact]
+    public void FormatException_FrameCapDoesNotSplitPairOrTagPair()
+    {
+        string head = "at " + new string('a', 509);
+        string pairCut = LogLine.FormatException(_at, "x", new FakeStackException("m", head + "\U0001F600")).Split('\n')[1];
+        string tag = char.ConvertFromUtf32(0xE0001);
+        string tagHead = "at " + new string('a', 497);
+        string tagCut = LogLine.FormatException(_at, "x", new FakeStackException("m", tagHead + "a" + tag)).Split('\n')[1];
+        string tagFits = LogLine.FormatException(_at, "x", new FakeStackException("m", tagHead + tag)).Split('\n')[1];
+
+        Assert.Equal("    " + head + _ellipsis + "(+2)", pairCut);
+        Assert.Equal("    " + tagHead + "a" + _ellipsis + "(+2)", tagCut);
+        Assert.Equal("    " + tagHead + "\\uDB40\\uDC01", tagFits);
+    }
+
     private sealed class TextObject
     {
         private readonly string _text;
@@ -707,6 +1061,11 @@ public sealed class LogLineTests
 
         public override string ToString() => _text;
     }
+
+    // Lone surrogates cannot live in InlineData (attribute metadata is UTF-8 and turns them into U+FFFD), so
+    // theories pass the UTF-16 units as space-separated hex.
+    private static string FromUnits(string unitsHex) =>
+        string.Concat(unitsHex.Split(' ').Select(u => (char)int.Parse(u, NumberStyles.HexNumber, CultureInfo.InvariantCulture)));
 
     private static string FormatOne(object? value) =>
         LogLine.Format(_at, LogLevel.Info, "t.e", new[] { new KeyValuePair<string, object?>("k", value) });
