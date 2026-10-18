@@ -1,7 +1,7 @@
-// purpose: the transfer state machine (flow F2): plan, then take → verify → store → verify one item per cycle
+// purpose: the transfer state machine (flow F2): plan, then take → verify → store → verify one item per cycle; any fault stops, never retries
 // owns:    TransferRunner
 // deps:    IShelfGateway, IModLog, AmountClamp, TransferRequest, TransferReport, TransferState, StopReason
-// caution: a cycle never yields between its take and its store (D7); TakeOne/StoreOne are the only mutations (invariant 2)
+// caution: a cycle never splits across ticks (D7); only TakeOne/StoreOne mutate (I2); Tick never catches — after a throw, Abort or the next Tick finishes (P2)
 
 using System;
 using System.Collections.Generic;
@@ -16,9 +16,13 @@ public sealed class TransferRunner
     private readonly IShelfGateway _gateway;
     private readonly IModLog _log;
     private readonly TransferRequest _request;
+    private bool _hasBaseline;
     private int _sourceStart;
-    private int? _inventoryStart;
+    private int _targetStart;
+    private int _inventoryStart;
     private bool _isCancelRequested;
+    private bool _isTickInFlight;
+    private bool _hasStoreVerdict;
 
     public TransferRunner(IShelfGateway gateway, IModLog log, TransferRequest request)
     {
@@ -37,8 +41,13 @@ public sealed class TransferRunner
     /// <summary>Null until <see cref="State"/> is <see cref="TransferState.Finished"/>.</summary>
     public TransferReport? Report { get; private set; }
 
+    private bool IsFinished => State == TransferState.Finished;
+
     /// <summary>Honoured at the next <see cref="TransferState.ReadyForNext"/>, never mid-cycle (D7).</summary>
     public void RequestCancel() => _isCancelRequested = true;
+
+    /// <summary>Finishes from any state with a freshly read report; the driver calls it after a throw (P2). No-op once finished.</summary>
+    public void Abort(StopReason reason, string? detail) => Finish(reason, detail);
 
     /// <summary>Runs Planning if pending, then at most <paramref name="maxCycles"/> full cycles.</summary>
     public void Tick(int maxCycles)
@@ -48,6 +57,26 @@ public sealed class TransferRunner
             throw new ArgumentOutOfRangeException(nameof(maxCycles), maxCycles, "must be at least 1");
         }
 
+        if (IsFinished)
+        {
+            return;
+        }
+
+        if (_isTickInFlight)
+        {
+            // The last tick threw and nobody aborted; resuming would act on an unverified cycle (invariant 3).
+            Finish(StopReason.GatewayError, $"previous tick threw during {State}");
+            return;
+        }
+
+        // Cleared only on a normal return, so a throw leaves it set for Abort or the next Tick to see.
+        _isTickInFlight = true;
+        RunTick(maxCycles);
+        _isTickInFlight = false;
+    }
+
+    private void RunTick(int maxCycles)
+    {
         if (State == TransferState.Planning)
         {
             Plan();
@@ -74,13 +103,28 @@ public sealed class TransferRunner
             return;
         }
 
-        _sourceStart = _gateway.GetCount(_request.Source, _request.Item);
+        int sourceStart = _gateway.GetCount(_request.Source, _request.Item);
         int targetStart = _gateway.GetCount(_request.Target, _request.Item);
-        _inventoryStart = _gateway.GetInventoryCount(_request.Item);
+        int inventoryStart = _gateway.GetInventoryCount(_request.Item);
+        if (IsFinished)
+        {
+            return;
+        }
+
+        _sourceStart = sourceStart;
+        _targetStart = targetStart;
+        _inventoryStart = inventoryStart;
+        _hasBaseline = true;
+
         bool canHold = _gateway.CanHold(_request.Target, _request.Item);
         ClampResult clamp = canHold
             ? AmountClamp.Clamp(_request.Amount, _sourceStart, _gateway.GetFreeCapacity(_request.Target, _request.Item))
             : new ClampResult(0, ClampReason.TargetFull);
+        if (IsFinished)
+        {
+            return;
+        }
+
         Requested = clamp.Amount;
 
         _log.Write(LogLevel.Info, "transfer.start", new KeyValuePair<string, object?>[]
@@ -90,7 +134,7 @@ public sealed class TransferRunner
             new("item", _request.Item.Value),
             new("amount", Requested),
             new("s0", _sourceStart),
-            new("t0", targetStart),
+            new("t0", _targetStart),
             new("i0", _inventoryStart),
         });
 
@@ -124,46 +168,30 @@ public sealed class TransferRunner
         }
     }
 
+    // IsFinished checks after each gateway step: Abort can arrive re-entrantly, and a finished runner must not act again.
     private void RunCycle()
     {
         int itemNumber = Moved + 1;
         int sourceBefore = _gateway.GetCount(_request.Source, _request.Item);
-        int inventoryBefore = _gateway.GetInventoryCount(_request.Item);
-
-        GatewayOutcome take = _gateway.TakeOne(_request.Source, _request.SourceSlot, _request.Item);
-        if (!take.IsOk)
+        if (IsFinished)
         {
-            StopOnFault($"take {take.Status}: {take.Detail}");
-            return;
-        }
-
-        State = TransferState.TakenAwaitingVerify;
-        int sourceAfter = _gateway.GetCount(_request.Source, _request.Item);
-        int inventoryAfterTake = _gateway.GetInventoryCount(_request.Item);
-        bool isTakeVerified = sourceAfter == sourceBefore - 1 && inventoryAfterTake == inventoryBefore + 1;
-        LogStep("transfer.take", itemNumber, "src", sourceBefore, sourceAfter, inventoryBefore, inventoryAfterTake, isTakeVerified);
-        if (!isTakeVerified)
-        {
-            StopOnFault("take verify failed");
             return;
         }
 
         int targetBefore = _gateway.GetCount(_request.Target, _request.Item);
-        GatewayOutcome store = _gateway.StoreOne(_request.Target, _request.Item);
-        if (!store.IsOk)
+        if (IsFinished)
         {
-            StopOnFault($"store {store.Status}: {store.Detail}");
             return;
         }
 
-        State = TransferState.StoredAwaitingVerify;
-        int targetAfter = _gateway.GetCount(_request.Target, _request.Item);
-        int inventoryAfterStore = _gateway.GetInventoryCount(_request.Item);
-        bool isStoreVerified = targetAfter == targetBefore + 1 && inventoryAfterStore == inventoryBefore;
-        LogStep("transfer.store", itemNumber, "dst", targetBefore, targetAfter, inventoryAfterTake, inventoryAfterStore, isStoreVerified);
-        if (!isStoreVerified)
+        int inventoryBefore = _gateway.GetInventoryCount(_request.Item);
+        if (IsFinished || !IsCycleStartAsTracked(sourceBefore, targetBefore, inventoryBefore))
         {
-            StopOnFault("store verify failed");
+            return;
+        }
+
+        if (!TryTake(itemNumber, sourceBefore, inventoryBefore) || !TryStore(itemNumber, targetBefore, inventoryBefore))
+        {
             return;
         }
 
@@ -171,21 +199,176 @@ public sealed class TransferRunner
         State = TransferState.ReadyForNext;
     }
 
-    // TODO(dev): card 7 splits this into TakeRefused, StoreRefused and the *Mismatch reasons; card 6 only guarantees the stop.
-    private void StopOnFault(string detail) => Finish(StopReason.GatewayError, detail);
+    // Another player can touch either shelf between ticks; drift from the tracked totals stops the run instead of
+    // carrying on from a baseline that no longer holds. Inventory too, since Stranded is measured against I0.
+    private bool IsCycleStartAsTracked(int source, int target, int inventory)
+    {
+        int expectedSource = _sourceStart - Moved;
+        int expectedTarget = _targetStart + Moved;
+        if (source != expectedSource)
+        {
+            Finish(StopReason.SourceMismatch, $"source changed between items: expected {expectedSource} read {source}");
+        }
+        else if (target != expectedTarget)
+        {
+            Finish(StopReason.TargetMismatch, $"target changed between items: expected {expectedTarget} read {target}");
+        }
+        else if (inventory != _inventoryStart)
+        {
+            Finish(StopReason.InventoryMismatch, $"inventory changed between items: expected {_inventoryStart} read {inventory}");
+        }
+
+        return !IsFinished;
+    }
+
+    private bool TryTake(int itemNumber, int sourceBefore, int inventoryBefore)
+    {
+        GatewayOutcome take = _gateway.TakeOne(_request.Source, _request.SourceSlot, _request.Item);
+        if (IsFinished)
+        {
+            return false;
+        }
+
+        if (!take.IsOk)
+        {
+            Finish(GetFaultReason(take.Status, StopReason.TakeRefused), $"take {take.Status}: {take.Detail}");
+            return false;
+        }
+
+        State = TransferState.TakenAwaitingVerify;
+        int sourceAfter = _gateway.GetCount(_request.Source, _request.Item);
+        if (IsFinished)
+        {
+            return false;
+        }
+
+        int inventoryAfter = _gateway.GetInventoryCount(_request.Item);
+        if (IsFinished)
+        {
+            return false;
+        }
+
+        bool isSourceVerified = sourceAfter == sourceBefore - 1;
+        bool isInventoryVerified = inventoryAfter == inventoryBefore + 1;
+        LogStep("transfer.take", itemNumber, "src", sourceBefore, sourceAfter, inventoryBefore, inventoryAfter, isSourceVerified && isInventoryVerified);
+        if (!isSourceVerified)
+        {
+            Finish(StopReason.SourceMismatch, $"take: source expected {sourceBefore - 1} read {sourceAfter}");
+        }
+        else if (!isInventoryVerified)
+        {
+            Finish(StopReason.InventoryMismatch, $"take: inventory expected {inventoryBefore + 1} read {inventoryAfter}");
+        }
+
+        return !IsFinished;
+    }
+
+    private bool TryStore(int itemNumber, int targetBefore, int inventoryBefore)
+    {
+        GatewayOutcome store = _gateway.StoreOne(_request.Target, _request.Item);
+        if (IsFinished)
+        {
+            return false;
+        }
+
+        if (!store.IsOk)
+        {
+            Finish(GetFaultReason(store.Status, StopReason.StoreRefused), $"store {store.Status}: {store.Detail}");
+            return false;
+        }
+
+        State = TransferState.StoredAwaitingVerify;
+        _hasStoreVerdict = false;
+        int targetAfter = _gateway.GetCount(_request.Target, _request.Item);
+        if (IsFinished)
+        {
+            return false;
+        }
+
+        int inventoryAfter = _gateway.GetInventoryCount(_request.Item);
+        if (IsFinished)
+        {
+            return false;
+        }
+
+        _hasStoreVerdict = true;
+        bool isTargetVerified = targetAfter == targetBefore + 1;
+        bool isInventoryVerified = inventoryAfter == inventoryBefore;
+        LogStep("transfer.store", itemNumber, "dst", targetBefore, targetAfter, inventoryBefore + 1, inventoryAfter, isTargetVerified && isInventoryVerified);
+        if (isTargetVerified && isInventoryVerified)
+        {
+            return true;
+        }
+
+        LogStoreMismatch(itemNumber, targetBefore, targetAfter, inventoryBefore + 1, inventoryAfter);
+        if (!isTargetVerified)
+        {
+            Finish(StopReason.TargetMismatch, $"store: target expected {targetBefore + 1} read {targetAfter}");
+        }
+        else
+        {
+            Finish(StopReason.InventoryMismatch, $"store: inventory expected {inventoryBefore} read {inventoryAfter}");
+        }
+
+        return false;
+    }
+
+    private static StopReason GetFaultReason(GatewayStatus status, StopReason refusedReason) =>
+        status == GatewayStatus.Refused ? refusedReason : StopReason.GatewayError;
 
     private void Finish(StopReason reason, string? detail)
     {
-        // Re-read rather than derive (invariant 1); a gone source cannot be read, so it falls back to the tracked count.
-        int remaining = _gateway.IsAlive(_request.Source)
-            ? _gateway.GetCount(_request.Source, _request.Item)
-            : _sourceStart - Moved;
-        int stranded = _inventoryStart is int inventoryStart
-            ? Math.Clamp(_gateway.GetInventoryCount(_request.Item) - inventoryStart, 0, 1)
-            : 0;
+        if (IsFinished)
+        {
+            return;
+        }
 
-        Report = new TransferReport(reason, Requested, Moved, remaining, stranded, detail);
+        // Marked first so a re-entrant Abort during the re-reads below is a no-op; the first stop wins.
+        TransferState stoppedIn = State;
         State = TransferState.Finished;
+
+        bool isItemOffSource = stoppedIn is TransferState.TakenAwaitingVerify or TransferState.StoredAwaitingVerify;
+        bool isStoreUnsettled = stoppedIn == TransferState.StoredAwaitingVerify && !_hasStoreVerdict;
+        int trackedRemaining = _sourceStart - Moved - (isItemOffSource ? 1 : 0);
+        int trackedStranded = stoppedIn == TransferState.TakenAwaitingVerify ? 1 : 0;
+
+        // Re-read rather than derive (invariant 1); tracked counts only when the gateway cannot answer, and the detail says so.
+        string? countsNote = null;
+        int? targetNow = isStoreUnsettled
+            ? ReadOrTrack<int?>(() => _gateway.GetCount(_request.Target, _request.Item), null, ref countsNote)
+            : null;
+        bool isSourceReadable = ReadOrTrack(() => _gateway.IsAlive(_request.Source), false, ref countsNote);
+        int remaining = isSourceReadable
+            ? ReadOrTrack(() => _gateway.GetCount(_request.Source, _request.Item), trackedRemaining, ref countsNote)
+            : trackedRemaining;
+        if (!isSourceReadable)
+        {
+            countsNote ??= "source gone, remaining tracked";
+        }
+
+        int? inventoryNow = _hasBaseline
+            ? ReadOrTrack<int?>(() => _gateway.GetInventoryCount(_request.Item), null, ref countsNote)
+            : null;
+        int stranded = inventoryNow is int inventory ? Math.Clamp(inventory - _inventoryStart, 0, 1) : trackedStranded;
+
+        // The game said Ok but the stop came before the verify; settle the item from the fresh reads, never on the game's word.
+        string? storeNote = null;
+        if (isStoreUnsettled)
+        {
+            int targetBefore = _targetStart + Moved;
+            if (targetNow == targetBefore + 1 && inventoryNow == _inventoryStart)
+            {
+                Moved++;
+            }
+            else
+            {
+                LogStoreMismatch(Moved + 1, targetBefore, targetNow, _inventoryStart + 1, inventoryNow);
+                storeNote = "store unverified";
+            }
+        }
+
+        string? fullDetail = JoinNotes(detail, storeNote, countsNote);
+        Report = new TransferReport(reason, Requested, Moved, remaining, stranded, fullDetail);
 
         LogLevel level = reason is StopReason.Completed or StopReason.Cancelled or StopReason.BlockedBeforeStart
             ? LogLevel.Info
@@ -197,8 +380,57 @@ public sealed class TransferRunner
             new("moved", Moved),
             new("remaining", remaining),
             new("stranded", stranded),
-            new("detail", detail),
+            new("detail", fullDetail),
         });
+
+        if (_hasBaseline && _sourceStart != remaining + Moved + stranded)
+        {
+            _log.Write(LogLevel.Warn, "conservation.mismatch", new KeyValuePair<string, object?>[]
+            {
+                new("check", "report"),
+                new("reason", reason),
+                new("s0", _sourceStart),
+                new("moved", Moved),
+                new("remaining", remaining),
+                new("stranded", stranded),
+            });
+        }
+    }
+
+    // The report's S0 check sees only source + inventory, so a store the game called Ok that the counts contradict
+    // could hide a target-side loss or duplicate; flag it separately.
+    private void LogStoreMismatch(int itemNumber, int targetBefore, int? targetAfter, int inventoryBefore, int? inventoryAfter)
+    {
+        _log.Write(LogLevel.Warn, "conservation.mismatch", new KeyValuePair<string, object?>[]
+        {
+            new("check", "store"),
+            new("n", itemNumber),
+            new("dst_before", targetBefore),
+            new("dst_after", targetAfter),
+            new("inv_before", inventoryBefore),
+            new("inv_after", inventoryAfter),
+        });
+    }
+
+    private static string? JoinNotes(params string?[] notes)
+    {
+        string joined = string.Join("; ", Array.FindAll(notes, note => note is not null));
+        return joined.Length == 0 ? null : joined;
+    }
+
+    // The one catch in Core: a gateway that just threw may throw again here, and the player must still get a report.
+    private T ReadOrTrack<T>(Func<T> read, T tracked, ref string? countsNote)
+    {
+        try
+        {
+            return read();
+        }
+        catch (Exception ex)
+        {
+            _log.WriteException("transfer.stop", ex);
+            countsNote = $"counts tracked, re-read threw {ex.GetType().Name}";
+            return tracked;
+        }
     }
 
     private void LogStep(

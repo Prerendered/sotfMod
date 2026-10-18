@@ -1,5 +1,5 @@
-// purpose: per-session byte budget for the mod log, so a chatty session cannot fill the disk (F4 log.cap)
-// owns:    LogSizeCap, LogSizeCap.Admission, LogSizeCap.MaxSessionBytes
+// purpose: byte budget for the mod log, so a chatty session or a failing rotation cannot fill the disk (F4 log.cap)
+// owns:    LogSizeCap, LogSizeCap.Admission, LogSizeCap.MaxSessionBytes, LogSizeCap.IsAppendAllowed
 // deps:    none
 // caution: not thread-safe; the caller admits and writes under the same lock
 
@@ -34,6 +34,20 @@ public sealed class LogSizeCap
 
     /// <summary>Bytes admitted as <see cref="Admission.Write"/> so far; the cap notice itself is not counted.</summary>
     public long WrittenBytes { get; private set; }
+
+    /// <summary>
+    /// Whether a log that could not be rotated may be appended to. At or past one session's budget it must be
+    /// truncated instead, so a persistently failing rotation keeps the file under twice the cap across sessions.
+    /// </summary>
+    public bool IsAppendAllowed(long existingBytes)
+    {
+        if (existingBytes < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(existingBytes), existingBytes, "must not be negative");
+        }
+
+        return existingBytes < _maxBytes;
+    }
 
     public Admission Admit(long byteCount)
     {
