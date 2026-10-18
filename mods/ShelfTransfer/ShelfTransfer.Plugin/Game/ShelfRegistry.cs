@@ -2,7 +2,7 @@
 // owns:    ShelfRegistry
 // deps:    ShelfKey, ShelfRef, WorldPosition, IModLog, Sons.Gameplay.ItemStorageController (interop)
 // caution: read-only (I2). List() is a full scene scan; call it on demand, never per frame. The map holds live Il2Cpp
-//          components across frames, so callers go through TryGetLive (destroyed check) before touching one
+//          components across frames, so callers go through TryResolve/TryGetLive (destroyed check) before touching one
 
 using System;
 using System.Collections.Generic;
@@ -27,13 +27,20 @@ public sealed class ShelfRegistry
 {
     private const string _cloneSuffix = "(Clone)";
 
+    // A gone shelf is asked about every runner tick; this bounds the scene scans that a miss triggers.
+    private const double _minRescanSeconds = 5.0;
+
     private readonly IModLog _log;
     private readonly Dictionary<string, ItemStorageController> _byKey = new(StringComparer.Ordinal);
+    private bool _hasListed;
+    private double _lastListAt;
 
     public ShelfRegistry(IModLog log) => _log = log;
 
     public IReadOnlyList<ShelfRef> List()
     {
+        _hasListed = true;
+        _lastListAt = Time.unscaledTimeAsDouble;
         _byKey.Clear();
         List<ShelfRef> shelves = new();
         int duplicateKeys = 0;
@@ -62,6 +69,27 @@ public sealed class ShelfRegistry
             new("duplicate_keys", duplicateKeys),
         });
         return shelves;
+    }
+
+    /// <summary>
+    /// <see cref="TryGetLive"/>, and on a miss one rescan (rate-limited) so shelves built or streamed in after the
+    /// last <see cref="List"/> resolve too.
+    /// </summary>
+    public bool TryResolve(string key, [NotNullWhen(true)] out ItemStorageController? controller)
+    {
+        if (TryGetLive(key, out controller))
+        {
+            return true;
+        }
+
+        double now = Time.unscaledTimeAsDouble;
+        if (_hasListed && now - _lastListAt < _minRescanSeconds)
+        {
+            return false;
+        }
+
+        List();
+        return TryGetLive(key, out controller);
     }
 
     public bool TryGetLive(string key, [NotNullWhen(true)] out ItemStorageController? controller)

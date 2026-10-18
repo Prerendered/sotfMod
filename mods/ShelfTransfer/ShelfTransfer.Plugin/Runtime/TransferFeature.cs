@@ -1,6 +1,6 @@
-// purpose: installs the transfer feature from the composition root: the shelf registry and the per-frame aim watcher
+// purpose: installs the transfer feature from the composition root: registry, gateway and the per-frame aim watcher
 // owns:    TransferFeature
-// deps:    ModConfig, ShelfRegistry, AimWatcher, ShelfTransfer.Core.Logging (IModLog, LogLevel), BepInEx IL2CPPChainloader
+// deps:    ModConfig, ShelfRegistry, InteropShelfGateway, AimWatcher, ShelfTransfer.Core.Logging (IModLog, LogLevel), BepInEx IL2CPPChainloader
 
 using System.Collections.Generic;
 
@@ -19,6 +19,6 @@ public static class TransferFeature
         log.Write(LogLevel.Info, "plugin.load", new KeyValuePair<string, object?>[] { new("feature", "transfer") });
 
         // What BasePlugin.AddComponent calls; registers the injected type and adds it to BepInEx's persistent manager object.
-        IL2CPPChainloader.AddUnityComponent<AimWatcher>().Init(log, new ShelfRegistry(log));
+        IL2CPPChainloader.AddUnityComponent<AimWatcher>().Init(log, new InteropShelfGateway(new ShelfRegistry(log), log));
     }
 }
