@@ -33,7 +33,7 @@ public sealed class TransferRunnerTests
         }
 
         FakeModLog log = new();
-        TransferRunner runner = new(gateway, log, new TransferRequest(_src, new SlotRef(null, null), _dst, _item, amount));
+        TransferRunner runner = new(gateway, log, new TransferRequest(_src, new SlotRef(null), _dst, _item, amount));
         return new Rig(gateway, log, runner, source, source + target);
     }
 
