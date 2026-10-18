@@ -2,13 +2,16 @@
 // owns:    JsonLabelFileSystem, JsonLabelFileSystem.MaxFileBytes
 // deps:    ILabelFileSystem, LabelFile, WorldId, IModLog
 // caution: P4 catch site: every disk or JSON step runs through Guard once, never from inside another guarded step.
-//          Corrupt is returned only after the .bad copy exists; if the copy fails the result is Failed, so Save stays
-//          blocked. Exception text is reduced to type + path-stripped message before it reaches Detail or the log.
+//          Corrupt is returned only once a .bad with the same content exists (new copy, or an identical one already
+//          there, so a still-corrupt file is not copied again each launch); if neither, Failed keeps Save blocked.
+//          Exception text is reduced to type + path-stripped message before it reaches Detail or the log.
+//          Main thread only: concurrent Read/Write for one world is unsupported (both share <id>.json.tmp).
 
 using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
@@ -104,9 +107,13 @@ public sealed class JsonLabelFileSystem : ILabelFileSystem
         return AcceptRead(worldId, parsed.File);
     }
 
-    /// <summary>Never throws. Creates the folder if missing; the existing file is replaced only by a complete one.</summary>
+    /// <summary>
+    /// Throws only ArgumentNullException for a null file (programmer error, P4). Creates the folder if missing; the
+    /// existing file is replaced only by a complete one.
+    /// </summary>
     public LabelWriteResult Write(LabelFile file)
     {
+        ArgumentNullException.ThrowIfNull(file);
         string worldId = file.WorldId;
         int count = file.Shelves.Count;
         if (!IsSanitised(worldId))
@@ -276,9 +283,9 @@ public sealed class JsonLabelFileSystem : ILabelFileSystem
     // At Read time, never deferred: LabelStore allows Save after Corrupt, which would overwrite the only copy.
     private LabelReadResult PreserveCorrupt(string worldId, string path, string detail)
     {
-        string? badName = null;
-        Exception? copyError = Guard(() => badName = CopyToBad(path, worldId));
-        if (copyError is not null || badName is null)
+        BadCopy? bad = null;
+        Exception? copyError = Guard(() => bad = PreserveAsBad(path, worldId));
+        if (copyError is not null || bad is null)
         {
             return FailRead(worldId, copyError, "bad_copy");
         }
@@ -290,8 +297,49 @@ public sealed class JsonLabelFileSystem : ILabelFileSystem
             0,
             Field("reason", "corrupt"),
             Field("detail", detail),
-            Field("bad", badName));
+            Field("bad", bad.Name),
+            Field("bad_copy", bad.IsExisting ? "existing" : "new"));
         return LabelReadResult.Corrupt(detail);
+    }
+
+    private static byte[] HashFile(string path)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        using var sha = SHA256.Create();
+        return sha.ComputeHash(stream);
+    }
+
+    private BadCopy PreserveAsBad(string path, string worldId)
+    {
+        string? existing = FindIdenticalBad(path, worldId);
+        return existing is null ? new BadCopy(CopyToBad(path, worldId), false) : new BadCopy(existing, true);
+    }
+
+    // Length first, so the corrupt file is hashed only when a same-size copy exists.
+    private string? FindIdenticalBad(string path, string worldId)
+    {
+        string prefix = worldId + _extension + ".";
+        long length = new FileInfo(path).Length;
+        byte[]? hash = null;
+        foreach (string candidate in Directory.EnumerateFiles(_directory, prefix + "*" + _badSuffix))
+        {
+            // The pattern alone can also match 8.3 short names and longer extensions on Windows.
+            string name = Path.GetFileName(candidate);
+            bool isBadCopy = name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+                && name.EndsWith(_badSuffix, StringComparison.OrdinalIgnoreCase);
+            if (!isBadCopy || new FileInfo(candidate).Length != length)
+            {
+                continue;
+            }
+
+            hash ??= HashFile(path);
+            if (HashFile(candidate).AsSpan().SequenceEqual(hash))
+            {
+                return name;
+            }
+        }
+
+        return null;
     }
 
     // No-clobber: a same-second name gets -2, -3, ...; File.Copy without overwrite still refuses a racing file.
@@ -376,4 +424,6 @@ public sealed class JsonLabelFileSystem : ILabelFileSystem
     private sealed record FileContent(byte[]? Bytes, long Length);
 
     private sealed record ParsedFile(LabelFile? File, string? Problem);
+
+    private sealed record BadCopy(string Name, bool IsExisting);
 }
