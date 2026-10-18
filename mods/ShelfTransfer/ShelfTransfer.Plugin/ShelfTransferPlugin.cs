@@ -59,18 +59,27 @@ public sealed class ShelfTransferPlugin : BasePlugin
     // Triggered by an "error-probe*" file in the log folder; a file, not config, so it needs no ModConfig entry.
     private static void RunErrorProbeIfRequested(string logDirectory, IModLog modLog)
     {
-        if (!Directory.Exists(logDirectory) || Directory.GetFiles(logDirectory, _errorProbePattern).Length == 0)
-        {
-            return;
-        }
-
         try
         {
+            if (!Directory.Exists(logDirectory) || Directory.GetFiles(logDirectory, _errorProbePattern).Length == 0)
+            {
+                return;
+            }
+
             ThrowProbeException();
         }
         catch (InvalidOperationException ex)
         {
             modLog.WriteException("debug.probe", ex);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            modLog.Write(LogLevel.Warn, "debug.probe", new KeyValuePair<string, object?>[]
+            {
+                new("outcome", "skipped"),
+                new("type", ex.GetType().Name),
+                new("message", ex.Message),
+            });
         }
     }
 

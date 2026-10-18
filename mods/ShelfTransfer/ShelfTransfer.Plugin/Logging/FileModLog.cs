@@ -28,22 +28,18 @@ public sealed class FileModLog : IModLog
     public FileModLog(string directory, ManualLogSource fallback)
     {
         _fallback = fallback;
-        try
-        {
-            Directory.CreateDirectory(directory);
-            string current = Path.Combine(directory, FileName);
-            if (File.Exists(current))
-            {
-                File.Move(current, Path.Combine(directory, PreviousFileName), overwrite: true);
-            }
+        string current = Path.Combine(directory, FileName);
+        string? rotationError = RotatePrevious(directory, current);
 
-            // FileShare.ReadWrite so the log can be opened in an editor while the game runs.
-            FileStream stream = new(current, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
-            _writer = new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
-        }
-        catch (Exception ex)
+        // A failed rotation appends to last run's file rather than losing file logging for the session.
+        _writer = OpenWriter(current, isAppend: rotationError is not null);
+        if (rotationError is not null)
         {
-            _fallback.LogError($"mod log unavailable, using BepInEx log only: {ex.GetType().Name}: {ex.Message}");
+            Write(LogLevel.Warn, "log.rotate", new KeyValuePair<string, object?>[]
+            {
+                new("outcome", "failed"),
+                new("error", rotationError),
+            });
         }
     }
 
@@ -51,7 +47,7 @@ public sealed class FileModLog : IModLog
     {
         try
         {
-            Append(LogLine.Format(DateTimeOffset.Now, level, eventName, fields));
+            Append(level, LogLine.Format(DateTimeOffset.Now, level, eventName, fields));
         }
         catch (Exception ex)
         {
@@ -63,7 +59,7 @@ public sealed class FileModLog : IModLog
     {
         try
         {
-            Append(LogLine.FormatException(DateTimeOffset.Now, eventName, exception));
+            Append(LogLevel.Error, LogLine.FormatException(DateTimeOffset.Now, eventName, exception));
         }
         catch (Exception ex)
         {
@@ -72,12 +68,46 @@ public sealed class FileModLog : IModLog
         }
     }
 
+    // Returns the failure description, or null when the directory is ready and any old log was moved aside.
+    private static string? RotatePrevious(string directory, string current)
+    {
+        try
+        {
+            Directory.CreateDirectory(directory);
+            if (File.Exists(current))
+            {
+                File.Move(current, Path.Combine(directory, PreviousFileName), overwrite: true);
+            }
+
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return $"{ex.GetType().Name}: {ex.Message}";
+        }
+    }
+
+    private StreamWriter? OpenWriter(string path, bool isAppend)
+    {
+        try
+        {
+            // FileShare.ReadWrite so the log can be opened in an editor while the game runs.
+            FileStream stream = new(path, isAppend ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
+            return new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        }
+        catch (Exception ex)
+        {
+            _fallback.LogError($"mod log unavailable, using BepInEx log only: {ex.GetType().Name}: {ex.Message}");
+            return null;
+        }
+    }
+
     // Flushed per event so the file is complete even if the game crashes or is killed.
-    private void Append(string text)
+    private void Append(LogLevel level, string text)
     {
         if (_writer is null)
         {
-            _fallback.LogInfo(text);
+            WriteFallback(level, text);
             return;
         }
 
@@ -86,6 +116,25 @@ public sealed class FileModLog : IModLog
             _writer.Write(text);
             _writer.Write('\n');
             _writer.Flush();
+        }
+    }
+
+    private void WriteFallback(LogLevel level, string text)
+    {
+        switch (level)
+        {
+            case LogLevel.Debug:
+                _fallback.LogDebug(text);
+                break;
+            case LogLevel.Warn:
+                _fallback.LogWarning(text);
+                break;
+            case LogLevel.Error:
+                _fallback.LogError(text);
+                break;
+            default:
+                _fallback.LogInfo(text);
+                break;
         }
     }
 }

@@ -1,8 +1,7 @@
 // purpose: pure formatter for the D5 mod log line format, so the format is unit-testable without a file
 // owns:    LogLine.Format, LogLine.FormatException
 // deps:    LogLevel
-// caution: newlines inside a value are written as the two characters \n so one event stays one line;
-//          backslashes are not escaped (lines are for grep, not for round-trip parsing)
+// caution: quoted values escape \ " LF CR as \\ \" \n \r, so user text (labels) cannot forge a field or break a line
 
 using System;
 using System.Collections.Generic;
@@ -116,7 +115,7 @@ public static class LogLine
 
         foreach (char c in raw)
         {
-            if (char.IsWhiteSpace(c) || c == '=' || c == '"')
+            if (char.IsWhiteSpace(c) || c == '=' || c == '"' || c == '\\')
             {
                 return true;
             }
@@ -127,11 +126,12 @@ public static class LogLine
 
     private static string Quote(string raw)
     {
+        // Backslash first, or the escapes added below would themselves be doubled.
         string escaped = raw
+            .Replace("\\", "\\\\")
             .Replace("\"", "\\\"")
-            .Replace("\r\n", "\\n")
             .Replace("\n", "\\n")
-            .Replace("\r", "\\n");
+            .Replace("\r", "\\r");
         return "\"" + escaped + "\"";
     }
 }
