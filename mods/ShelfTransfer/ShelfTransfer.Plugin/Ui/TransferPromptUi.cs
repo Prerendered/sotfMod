@@ -1,7 +1,7 @@
 // purpose: the transfer prompt: the transfer key opens a small IMGUI text box that runs the `transfer` commands (list,
 //          <count> <index>, cancel) and shows their output, because the game's debug console is not reachable
 // owns:    TransferPromptUi
-// deps:    TransferCommand (CaptureAim, RunCaptured, IsRunning, GetRunningText, IsCapturedShelfGone), InputBlocker, Styles,
+// deps:    TransferCommand (CaptureAim, ReleaseAim, RunCaptured, GetRunningText, IsCapturedShelfGone), InputBlocker, Styles,
 //          ModConfig (TransferKey, TransferAltKey), IModLog, UnityEngine IMGUI
 // caution: I1/I2 - never touches the gateway; a start goes through TransferCommand to the runner (TransferDriver). The aimed
 //          slot is captured on open, not on Enter. Update and OnGUI are P2 boundaries: a throw logs error event=ui.prompt,
@@ -47,7 +47,7 @@ public sealed class TransferPromptUi : MonoBehaviour
     private const string _hintText = "list  |  <count> <index>  |  cancel          Enter runs, Esc closes";
     private const string _runText = "Run";
     private const string _closeText = "Close";
-    private const string _noAimText = "No aimed slot: list works; to move items close, aim at a stocked slot, reopen.";
+    private const string _noAimText = "No aimed slot. Aim at a shelf slot that holds items, then press + to move them.";
     private const string _runningPrefix = "Running: ";
     private const string _cancelHintText = "Type cancel to stop after the current item.";
     private const string _inputEcho = "> ";
@@ -274,6 +274,7 @@ public sealed class TransferPromptUi : MonoBehaviour
         _isOpen = false;
         _input = string.Empty;
         _focusFrame = -1;
+        _command?.ReleaseAim();
     }
 
     [HideFromIl2Cpp]

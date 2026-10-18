@@ -42,6 +42,7 @@ public sealed class ShelfTransferPlugin : BasePlugin
             new("core", coreVersion),
             new("bepinex", GetBepInExVersion()),
             new("transfer_key", config.TransferKey.Value),
+            new("transfer_key_alt", config.TransferAltKey.Value),
             new("label_key", config.LabelKey.Value),
             new("discovery_key", config.DiscoveryKey.Value),
             new("items_per_frame", config.ItemsPerFrame.Value),

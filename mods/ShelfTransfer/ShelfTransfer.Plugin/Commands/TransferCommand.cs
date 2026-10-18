@@ -101,6 +101,15 @@ public sealed class TransferCommand : MonoBehaviour
         return _capturedAim;
     }
 
+    /// <summary>Drops the CaptureAim slot so no Il2Cpp controller is held once the prompt is closed.</summary>
+    [HideFromIl2Cpp]
+    public void ReleaseAim()
+    {
+        _capturedAim = null;
+        _capturedShelf = null;
+        _hasCapturedShelf = false;
+    }
+
     /// <summary>
     /// Runs one command line against the CaptureAim slot. Lines go to <paramref name="output"/>, the finished run's result
     /// line to <paramref name="onFinished"/>. True when a transfer started.
@@ -157,7 +166,7 @@ public sealed class TransferCommand : MonoBehaviour
     [HideFromIl2Cpp]
     private bool HandleCommand(string? arguments)
     {
-        if (_aimWatcher is null)
+        if (_log is null || _registry is null || _gateway is null || _aimWatcher is null || _driver is null)
         {
             return false;
         }
