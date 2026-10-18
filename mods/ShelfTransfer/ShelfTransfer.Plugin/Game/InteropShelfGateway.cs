@@ -38,6 +38,7 @@ public sealed class InteropShelfGateway : IShelfGateway
     // One gateway.fail per disappearance, not one per runner tick; a key leaves the set once it resolves again.
     private readonly HashSet<string> _reportedGone = new(StringComparer.Ordinal);
     private bool _hasReportedNoInventory;
+    private CapacityRead? _lastCapacity;
 
     public InteropShelfGateway(ShelfRegistry registry, IModLog log)
     {
@@ -70,10 +71,10 @@ public sealed class InteropShelfGateway : IShelfGateway
         });
 
     public int GetFreeCapacity(ShelfRef shelf, ItemId item) =>
-        Guard("get_free_capacity", _ => 0, () => ReadCapacity(shelf, item).Free);
+        Guard("get_free_capacity", _ => 0, () => ReadCapacityShared(shelf, item).Free, isCapacityRead: true);
 
     public bool CanHold(ShelfRef shelf, ItemId item) =>
-        Guard("can_hold", _ => false, () => ReadCapacity(shelf, item).CanHold);
+        Guard("can_hold", _ => false, () => ReadCapacityShared(shelf, item).CanHold, isCapacityRead: true);
 
     public int GetInventoryCount(ItemId item) =>
         Guard("get_inventory_count", _ => 0, () =>
@@ -146,12 +147,35 @@ public sealed class InteropShelfGateway : IShelfGateway
             return GatewayOutcome.Refused("slot holds item " + group._itemId);
         }
 
+        // RemoveItem moves the group's whole transfer unit; anything but 1 would put more than one item in hand (I1).
+        int unit = group._transferAmount;
+        if (unit != 1)
+        {
+            return GatewayOutcome.Refused("transfer unit " + unit);
+        }
+
         group.RemoveItem(false);
         return GatewayOutcome.Ok;
     }
 
     // A stocked hook takes more only of its own item; an empty hook takes any item it has a layout template for,
     // up to that template's cap. A hook stocked with another item still proves the shelf accepts the type.
+    // CanHold and GetFreeCapacity asked back to back (aim line, runner Planning) share one hook walk. Any other gateway
+    // call in between, or a new frame, drops the shared read, so it never outlives a take/store.
+    private Capacity ReadCapacityShared(ShelfRef shelf, ItemId item)
+    {
+        int frame = Time.frameCount;
+        if (_lastCapacity is { } last && last.Frame == frame && last.Item == item
+            && string.Equals(last.ShelfKey, shelf.Key, StringComparison.Ordinal))
+        {
+            return last.Value;
+        }
+
+        Capacity value = ReadCapacity(shelf, item);
+        _lastCapacity = new CapacityRead(shelf.Key, item, frame, value);
+        return value;
+    }
+
     private Capacity ReadCapacity(ShelfRef shelf, ItemId item)
     {
         if (!TryGetShelf(shelf, out ItemStorageController? controller))
@@ -260,8 +284,13 @@ public sealed class InteropShelfGateway : IShelfGateway
     }
 
     // The Core/game boundary (P1): interop can throw on a collected object, and Core must only ever see a value.
-    private T Guard<T>(string operation, Func<string, T> onThrow, Func<T> call)
+    private T Guard<T>(string operation, Func<string, T> onThrow, Func<T> call, bool isCapacityRead = false)
     {
+        if (!isCapacityRead)
+        {
+            _lastCapacity = null;
+        }
+
         try
         {
             return call();
@@ -312,4 +341,6 @@ public sealed class InteropShelfGateway : IShelfGateway
     }
 
     private readonly record struct Capacity(bool CanHold, int Free);
+
+    private readonly record struct CapacityRead(string ShelfKey, ItemId Item, int Frame, Capacity Value);
 }

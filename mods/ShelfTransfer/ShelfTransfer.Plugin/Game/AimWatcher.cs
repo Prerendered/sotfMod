@@ -1,4 +1,4 @@
-// purpose: resolves the aimed shelf slot (shelf, hook index, item, count) every frame and logs aim.change once it settles
+// purpose: resolves the aimed shelf slot (shelf, hook index, item, count) every frame; logs aim.change and aim.probe once settled
 // owns:    AimWatcher
 // deps:    ShelfRegistry, IShelfGateway, AimTarget, AimChangeDebouncer, IModLog, UnityEngine (Camera, Physics), Sons.Gameplay / Sons.Inventory (interop)
 // caution: read-only (I2): field reads, the getters GetCurrentCount, GetItemCount, StorageSlotIndex and gateway reads (never
@@ -40,6 +40,8 @@ public sealed class AimWatcher : MonoBehaviour
     private IShelfGateway? _gateway;
     private bool _isHalted;
     private readonly AimChangeDebouncer _debouncer = new();
+    private readonly AimChangeDebouncer _probeDebouncer = new();
+    private static readonly SlotRef _anySlot = new(null);
 
     // Key cache: GetShelfKey formats a string, so it is rebuilt only when the aimed controller or its position changes.
     private int _cachedControllerId;
@@ -77,7 +79,8 @@ public sealed class AimWatcher : MonoBehaviour
 
         try
         {
-            Tick(_log, _gateway);
+            ItemStorageController? unstocked = Tick(_log, _gateway);
+            UpdateEmptyProbe(_log, _gateway, unstocked);
         }
         catch (Exception ex)
         {
@@ -88,29 +91,30 @@ public sealed class AimWatcher : MonoBehaviour
         }
     }
 
+    // Returns the aimed storage when the ray is on it but on no stocked slot (the empty-storage probe's input), else null.
     [HideFromIl2Cpp]
-    private void Tick(IModLog log, IShelfGateway gateway)
+    private ItemStorageController? Tick(IModLog log, IShelfGateway gateway)
     {
         Camera camera = Camera.main;
         if (camera == null)
         {
             // Loading screens have no main camera; keep the last logged state so a reload logs only real changes.
             _current = null;
-            return;
+            return null;
         }
 
         Collider? hit = FindAimedCollider(camera);
         if (hit == null)
         {
             SetNoTarget(log, _reasonNoHit);
-            return;
+            return null;
         }
 
         ItemStorageController? controller = FindInParent<ItemStorageController>(hit);
         if (controller == null)
         {
             SetNoTarget(log, _reasonNotShelf);
-            return;
+            return null;
         }
 
         InWorldLayoutItemGroup? group = FindInParent<InWorldLayoutItemGroup>(hit);
@@ -120,14 +124,14 @@ public sealed class AimWatcher : MonoBehaviour
             if (hook == null)
             {
                 SetNoTarget(log, _reasonNoSlot);
-                return;
+                return controller;
             }
 
             group = FindActiveGroup(hook);
             if (group == null)
             {
                 SetNoTarget(log, _reasonEmptySlot);
-                return;
+                return controller;
             }
         }
 
@@ -135,14 +139,14 @@ public sealed class AimWatcher : MonoBehaviour
         if (storage == null)
         {
             SetNoTarget(log, _reasonNoSlot);
-            return;
+            return controller;
         }
 
         int count = group.GetCurrentCount();
         if (count <= 0)
         {
             SetNoTarget(log, _reasonEmptySlot);
-            return;
+            return controller;
         }
 
         int item = group._itemId;
@@ -151,7 +155,7 @@ public sealed class AimWatcher : MonoBehaviour
         _current = new AimTarget(shelf, new SlotRef(slot), new ItemId(item), count);
         if (!_debouncer.ShouldLog(_current, Time.unscaledTimeAsDouble))
         {
-            return;
+            return null;
         }
 
         WriteTargetChange(log, gateway, _current, group._maxAmount, controller, storage);
@@ -162,6 +166,27 @@ public sealed class AimWatcher : MonoBehaviour
 
         _lastLoggedShelfKey = shelf.Key;
         _lastLoggedItem = item;
+        return null;
+    }
+
+    // An empty storage never writes a target line, so it is probed here, settled by its own debouncer like aim.change.
+    [HideFromIl2Cpp]
+    private void UpdateEmptyProbe(IModLog log, IShelfGateway gateway, ItemStorageController? unstocked)
+    {
+        AimTarget? candidate = null;
+        if (unstocked != null && _lastLoggedShelfKey is not null)
+        {
+            ShelfRef shelf = GetShelf(unstocked);
+            if (shelf.Key != _lastLoggedShelfKey)
+            {
+                candidate = new AimTarget(shelf, _anySlot, new ItemId(_lastLoggedItem), 0);
+            }
+        }
+
+        if (_probeDebouncer.ShouldLog(candidate, Time.unscaledTimeAsDouble) && candidate is not null)
+        {
+            WriteProbe(log, gateway, candidate.Shelf, candidate.Item);
+        }
     }
 
     [HideFromIl2Cpp]
