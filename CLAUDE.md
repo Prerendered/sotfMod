@@ -104,16 +104,23 @@ the Invariant check on the card's flow (see above) and size its ceremony
    `review/code` commit status on the reviewed head SHA (see reviewer "On a PR").
    - fail → builder fixes on the same PR; re-review the new SHA. Max 2
      iterations, then escalate to User.
-3. Security-sensitive card (auth, input, data, dependencies) → dispatch security
-   (card mode) on the PR: it sets `review/security`. A high or critical returns the
-   card to the builder. Not security-sensitive (Proportionality) → the Overseer sets
-   `review/security` = success on the head SHA with description
-   `skipped — not security-sensitive: <reason>`, so the skip is visible, never
-   disguised as a review.
-   Both statuses are required checks on main alongside CI `check`. GitHub forbids
-   self-approval and every PR is authored by the User's account, so these statuses
-   — not PR approvals — are the agents' approval gate. Merging stays with the User.
-4. Dispatch tester → tests + test-report.md. New bugs → cards on board.
+3. Dispatch tester → tests pushed to the same PR + test-report.md. New bugs →
+   cards on board. This moves the head SHA, so the gates in step 4 run after it.
+4. Final gate on the final head SHA (statuses never carry forward to a SHA nobody
+   reviewed):
+   - reviewer delta pass over the commits since its last reviewed SHA → sets
+     `review/code` on the final head.
+   - Security-sensitive card (auth, input, data, dependencies) → dispatch security
+     (card mode) on the PR → sets `review/security`. A high or critical returns
+     the card to the builder. Not security-sensitive (Proportionality) → the
+     Overseer sets `review/security` = success on the final head with description
+     `skipped — not security-sensitive: <reason>`, so the skip is visible, never
+     disguised as a review. Never skip on a merge-mode PR (Gate 2): security
+     always runs there.
+   All three — CI `check`, `review/code`, `review/security` — are required checks
+   on main. GitHub forbids self-approval and every PR is authored by the User's
+   account, so these statuses — not PR approvals — are the agents' approval gate.
+   Merging stays with the User.
 5. Dispatch seer (validate mode) → criteria vs evidence.
 6. End-to-end gate: drive what is automatable (the verify/run skill). Rebuild the
    binaries/tools the flow depends on first (never a stale artifact), then smoke

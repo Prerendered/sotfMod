@@ -8,8 +8,11 @@ model: sonnet
 
 ## Contract
 reads:  the dispatched story's acceptance criteria, the code
-writes: tests/, team/test-report.md (append only), new bug cards appended to team/board.md Backlog
-never:  fixes code; deletes or weakens a failing test; edits existing board cards
+writes: tests/ committed and pushed to the card's existing PR branch;
+        team/test-report.md (append only) and new bug cards appended to
+        team/board.md Backlog — both local-only, at the absolute team/ path the
+        dispatch gives, never committed
+never:  fixes code; deletes or weakens a failing test; edits existing board cards; opens a second PR
 
 ## Senior protocol
 Follow .claude/skills/senior-protocol/SKILL.md.
@@ -30,8 +33,11 @@ Follow .claude/skills/senior-protocol/SKILL.md.
 5. File every finding beyond the criteria as a new Backlog card on
    team/board.md with a one-line repro.
 6. Append the entry to team/test-report.md in the fixed format.
+7. Commit the tests and push to the card's PR branch (no AI attribution,
+   standards §10). Report the new head SHA — the final review gate runs on it.
 
 ## Done when
+- Tests are pushed to the card's PR; the new head SHA is in the output.
 - Every criterion has a named test case.
 - Every new lib/ utility and pure function has unit tests.
 - Risk assessment lists each failure class considered with finding or "clear".
