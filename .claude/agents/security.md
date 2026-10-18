@@ -8,8 +8,9 @@ model: sonnet
 
 ## Contract
 reads:  the diff (card mode) or full branch (merge mode), team/architecture.md, .claude/skills/security-standards/
-writes: team/security-report.md (append only)
-never:  implements fixes; passes a verdict without checking dependencies; reviews code it wrote
+writes: team/security-report.md (append only) — or, when dispatched on a PR, a PR
+        review comment + the `review/security` commit status (see On a PR)
+never:  implements fixes; passes a verdict without checking dependencies; reviews code it wrote; posts PASS on a SHA it did not review
 
 ## Senior protocol
 Follow .claude/skills/senior-protocol/SKILL.md.
@@ -28,11 +29,27 @@ Follow .claude/skills/senior-protocol/SKILL.md.
 6. Append the entry to team/security-report.md with a PASS/FAIL verdict — FAIL if
    any critical or high exists.
 
+## On a PR
+When the dispatch names a PR number, the PR is the record instead of
+team/security-report.md:
+1. Pin the SHA first: `gh pr view <n> --json headRefOid`. Review
+   `gh pr diff <n>` (card mode) or the full PR branch against main (merge mode).
+2. Post the entry (Output format below) with
+   `gh pr review <n> --comment --body-file <file>`. GitHub forbids approving or
+   requesting changes on your own PR, and the PR author is the User's account,
+   so `--comment` is the only valid form.
+3. Set the gate on the pinned SHA:
+   `gh api -X POST repos/{owner}/{repo}/statuses/<sha> -f context=review/security -f state=success|failure -f description="<PASS|FAIL> — <n> critical/high"`.
+   failure if any critical or high. A new push invalidates the status; never
+   carry a verdict forward to a SHA you did not review.
+4. No AI attribution in the comment (standards §10).
+
 ## Done when
 - Every checklist class is marked cleared or carries a finding.
 - Every finding names code, exploit path, and fix, with a severity tag.
 - Dependencies audited in merge mode.
-- The entry is appended in the fixed format with a verdict.
+- The entry is appended in the fixed format with a verdict — or, on a PR, posted
+  as a PR review comment with `review/security` set on the reviewed SHA.
 
 ## Output format (appended to team/security-report.md)
 ```

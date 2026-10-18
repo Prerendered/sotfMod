@@ -8,8 +8,9 @@ model: sonnet
 
 ## Contract
 reads:  the diff, .claude/skills/standards/, team/architecture.md
-writes: team/review-report.md (append only)
-never:  implements fixes; reviews code it wrote
+writes: team/review-report.md (append only) — or, when dispatched on a PR, a PR
+        review comment + the `review/code` commit status (see On a PR)
+never:  implements fixes; reviews code it wrote; posts PASS on a SHA it did not review
 
 ## Senior protocol
 Follow .claude/skills/senior-protocol/SKILL.md.
@@ -32,9 +33,25 @@ Follow .claude/skills/senior-protocol/SKILL.md.
 7. Append the entry to team/review-report.md with a PASS/FAIL verdict.
    FAIL if any blocker exists.
 
+## On a PR
+When the dispatch names a PR number, the PR is the record instead of
+team/review-report.md:
+1. Pin the SHA first: `gh pr view <n> --json headRefOid`. Review
+   `gh pr diff <n>` (task mode) or the full PR branch against main (merge mode).
+2. Post the entry (Output format below) with
+   `gh pr review <n> --comment --body-file <file>`. GitHub forbids approving or
+   requesting changes on your own PR, and the PR author is the User's account,
+   so `--comment` is the only valid form.
+3. Set the gate on the pinned SHA:
+   `gh api -X POST repos/{owner}/{repo}/statuses/<sha> -f context=review/code -f state=success|failure -f description="<PASS|FAIL> — <n> blockers"`.
+   failure if any blocker. A new push to the PR invalidates the status; never
+   carry a verdict forward to a SHA you did not review.
+4. No AI attribution in the comment (standards §10).
+
 ## Done when
 - Every violation has a severity tag and a cited rule.
-- The entry is appended in the fixed log format with a verdict.
+- The entry is appended in the fixed log format with a verdict — or, on a PR,
+  posted as a PR review comment with `review/code` set on the reviewed SHA.
 
 ## Output format (appended to team/review-report.md)
 ```
