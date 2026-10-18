@@ -22,7 +22,7 @@ public sealed class OverlayModelTests
     private const int _sourceCount = 10;
 
     private static readonly ShelfRef _sourceShelf = new("src", "StorageShelf", new WorldPosition(0f, 0f, 0f));
-    private static readonly SlotRef _slot = new(1, 2);
+    private static readonly SlotRef _slot = new(9);
     private static readonly ItemId _item = new(42);
 
     private static AimTarget Source(int count = _sourceCount) => new(_sourceShelf, _slot, _item, count);

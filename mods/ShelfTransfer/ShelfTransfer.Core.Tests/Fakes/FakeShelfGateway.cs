@@ -34,6 +34,9 @@ public sealed class FakeShelfGateway : IShelfGateway
 
     public int TakeCalls { get; private set; }
 
+    /// <summary>The slot argument of every TakeOne call, in order.</summary>
+    public List<SlotRef> TakeSlots { get; } = new();
+
     public int StoreCalls { get; private set; }
 
     /// <summary>Every TakeOne plus StoreOne call: the only mutations (invariant 2).</summary>
@@ -129,6 +132,7 @@ public sealed class FakeShelfGateway : IShelfGateway
     public GatewayOutcome TakeOne(ShelfRef shelf, SlotRef slot, ItemId item)
     {
         TakeCalls++;
+        TakeSlots.Add(slot);
         Record($"TakeOne({shelf.Key})");
         return TakeBehavior?.Invoke(TakeCalls) ?? ApplyTake(shelf);
     }
