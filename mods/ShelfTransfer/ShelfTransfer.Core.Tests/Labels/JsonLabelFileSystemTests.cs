@@ -3,9 +3,13 @@
 // deps:    JsonLabelFileSystem, LabelStore, LabelFile, FakeModLog
 // caution: real disk, one temp directory per test. Failure injection that is OS-specific is marked [Windows-only] and
 //          returns early elsewhere (a silent pass there, so CI Linux does not exercise it).
+//          Card 40 link tests use directory links (a junction on Windows via mklink /J, a symlink on Unix): no privilege
+//          needed, and a link that cannot be created fails the test loudly. File-symlink tests (the final <id>.json)
+//          skip with a message in the test output when the OS refuses the symlink (Windows without developer mode).
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -20,6 +24,7 @@ using ShelfTransfer.Core.Logging;
 using ShelfTransfer.Core.Tests.Fakes;
 
 using Xunit;
+using Xunit.Abstractions;
 
 namespace ShelfTransfer.Core.Tests.Labels;
 
@@ -31,9 +36,11 @@ public sealed class JsonLabelFileSystemTests : IDisposable
     private readonly string _root;
     private readonly string _dir;
     private readonly FakeModLog _log = new();
+    private readonly ITestOutputHelper _output;
 
-    public JsonLabelFileSystemTests()
+    public JsonLabelFileSystemTests(ITestOutputHelper output)
     {
+        _output = output;
         _root = Path.Combine(Path.GetTempPath(), "shelftransfer-jlfs-" + Guid.NewGuid().ToString("N"));
         _dir = Path.Combine(_root, "labels");
         Directory.CreateDirectory(_root);
@@ -1085,5 +1092,538 @@ public sealed class JsonLabelFileSystemTests : IDisposable
         Assert.Equal(before, File.ReadAllBytes(path));
         Assert.Equal(stamp, File.GetLastWriteTimeUtc(path));
         Assert.Equal(new[] { "w1.json" }, AllFileNames());
+    }
+
+    // ---- card 40: link hardening and .bad cap ----
+
+    private string Outside(string name = "outside")
+    {
+        string path = Path.Combine(_root, name);
+        Directory.CreateDirectory(path);
+        return path;
+    }
+
+    // Directory link: junction on Windows (no privilege), symlink on Unix. Fails the test if it cannot be made.
+    private void MakeDirLink(string link, string target)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(link)!);
+        if (OperatingSystem.IsWindows())
+        {
+            var psi = new ProcessStartInfo("cmd.exe", $"/c mklink /J \"{link}\" \"{target}\"")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            using Process process = Process.Start(psi)!;
+            string output = process.StandardOutput.ReadToEnd() + process.StandardError.ReadToEnd();
+            process.WaitForExit();
+            if (process.ExitCode != 0)
+            {
+                Assert.Fail("cannot create junction (test environment problem, not a product result): " + output);
+            }
+        }
+        else
+        {
+            Directory.CreateSymbolicLink(link, target);
+        }
+
+        Assert.True(IsLink(link), "test setup: planted entry is not a reparse point/link");
+    }
+
+    // File symlink; false (with a message in the test output) when the OS refuses it, e.g. Windows without privilege.
+    private bool TryMakeFileLink(string link, string target)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(link)!);
+        try
+        {
+            File.CreateSymbolicLink(link, target);
+            return true;
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
+        {
+            _output.WriteLine("SKIPPED: cannot create a file symlink here (" + ex.GetType().Name + "); the Linux CI run covers this case.");
+            return false;
+        }
+    }
+
+    private static bool IsLink(string path)
+    {
+        FileAttributes attributes = new FileInfo(path).Attributes;
+        return (int)attributes != -1 && attributes.HasFlag(FileAttributes.ReparsePoint);
+    }
+
+    private void PlantBadLinks(string worldId, string target)
+    {
+        DateTime now = DateTime.UtcNow;
+        for (int s = -1; s <= 8; s++)
+        {
+            string stamp = now.AddSeconds(s).ToString("yyyyMMdd'T'HHmmss'Z'", CultureInfo.InvariantCulture);
+            MakeDirLink(PathOf(worldId + ".json." + stamp + ".bad"), target);
+        }
+    }
+
+    private string PutBad(string name, string text, DateTime? writeTime = null)
+    {
+        string path = PutText(name, text);
+        if (writeTime is not null)
+        {
+            File.SetLastWriteTimeUtc(path, writeTime.Value);
+        }
+
+        return path;
+    }
+
+    private static string OldBadName(int second) => $"w1.json.20200101T0000{second:D2}Z.bad";
+
+    private string[] OldBadNames() =>
+        BadFiles().Where(b => b.StartsWith("w1.json.2020", StringComparison.Ordinal)).ToArray();
+
+    [Fact]
+    public void MaxBadCopies_IsFive() => Assert.Equal(5, JsonLabelFileSystem.MaxBadCopies);
+
+    [Fact]
+    public void Write_TempIsDirectoryLink_Failed_LinkAndTargetUntouched_NothingWritten()
+    {
+        string existing = PutText("w1.json", _validEmpty);
+        string outside = Outside();
+        string sentinel = Path.Combine(outside, "sentinel.txt");
+        File.WriteAllText(sentinel, "keep");
+        MakeDirLink(PathOf("w1.json.tmp"), outside);
+
+        LabelWriteResult write = NewFs().Write(FileOf("w1", ("k", "A", null)));
+
+        Assert.False(write.IsOk);
+        Assert.Equal("temp file is a link (reparse point); refused", write.Detail);
+        Assert.True(IsLink(PathOf("w1.json.tmp")));
+        Assert.Equal(new[] { sentinel }, Directory.GetFileSystemEntries(outside));
+        Assert.Equal("keep", File.ReadAllText(sentinel));
+        Assert.Equal(_validEmpty, File.ReadAllText(existing));
+        LogEntry error = Single("labels.write", LogLevel.Error);
+        Assert.Equal("w1", error.Text("world"));
+        Assert.Equal("1", error.Text("count"));
+        Assert.Equal("reparse_point", error.Text("reason"));
+        Assert.Equal("write", error.Text("step"));
+        Assert.DoesNotContain(_log.Entries, e => e.Event == "error");
+        Assert.DoesNotContain(_log.Entries, e => e.Level == LogLevel.Info);
+        Assert.All(AllLogText(), text => Assert.DoesNotContain(_root, text, StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Write_TempIsDirectoryLink_NoFileYet_NoTargetFileCreated()
+    {
+        string outside = Outside();
+        MakeDirLink(PathOf("w1.json.tmp"), outside);
+
+        LabelWriteResult write = NewFs().Write(FileOf("w1", ("k", "A", null)));
+
+        Assert.False(write.IsOk);
+        Assert.False(File.Exists(PathOf("w1.json")));
+        Assert.Empty(Directory.GetFileSystemEntries(outside));
+        Assert.True(IsLink(PathOf("w1.json.tmp")));
+    }
+
+    // [Unix-only] file symlinks (dangling and to an existing outside file); Windows covers the link case with the junction above.
+    [Fact]
+    public void Write_TempIsFileSymlink_Failed_OutsideFileUntouched()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            _output.WriteLine("SKIPPED: [Unix-only] file symlink case; Windows runs the junction case.");
+            return;
+        }
+
+        string outside = Outside();
+        string existingTarget = Path.Combine(outside, "existing.txt");
+        File.WriteAllText(existingTarget, "keep");
+        string danglingTarget = Path.Combine(outside, "dangling.txt");
+        File.CreateSymbolicLink(PathOf("w1.json.tmp"), existingTarget);
+        File.CreateSymbolicLink(PathOf("w2.json.tmp"), danglingTarget);
+
+        LabelWriteResult w1 = NewFs().Write(FileOf("w1", ("k", "A", null)));
+        LabelWriteResult w2 = NewFs().Write(FileOf("w2", ("k", "A", null)));
+
+        Assert.False(w1.IsOk);
+        Assert.False(w2.IsOk);
+        Assert.Equal("keep", File.ReadAllText(existingTarget));
+        Assert.False(File.Exists(danglingTarget));
+        Assert.True(IsLink(PathOf("w1.json.tmp")));
+        Assert.True(IsLink(PathOf("w2.json.tmp")));
+    }
+
+    [Fact]
+    public void Write_StaleRegularTemp_IsReplaced_NotRefused()
+    {
+        PutText("w1.json.tmp", "stale partial");
+
+        LabelWriteResult write = NewFs().Write(FileOf("w1", ("k", "A", null)));
+
+        Assert.True(write.IsOk);
+        Assert.False(File.Exists(PathOf("w1.json.tmp")));
+        Assert.Equal(LabelReadStatus.Ok, NewFs().Read("w1").Status);
+    }
+
+    [Fact]
+    public void Read_BadTargetIsLink_Failed_NeverCorrupt_LinksAndOutsideUntouched_SaveBlocked()
+    {
+        byte[] bytes = Encoding.UTF8.GetBytes("{ corrupt");
+        string path = PutBytes("w1.json", bytes);
+        string outside = Outside();
+        PlantBadLinks("w1", outside);
+        JsonLabelFileSystem fs = NewFs();
+
+        LabelReadResult read = fs.Read("w1");
+
+        Assert.Equal(LabelReadStatus.Failed, read.Status);
+        Assert.Equal("bad copy target is a link (reparse point); refused", read.Detail);
+        Assert.Empty(Directory.GetFileSystemEntries(outside));
+        Assert.Equal(bytes, File.ReadAllBytes(path));
+        Assert.All(
+            Directory.GetFileSystemEntries(_dir).Where(p => p.EndsWith(".bad", StringComparison.Ordinal)),
+            p => Assert.True(IsLink(p)));
+        LogEntry error = Single("labels.read", LogLevel.Error);
+        Assert.Equal("w1", error.Text("world"));
+        Assert.Equal("0", error.Text("count"));
+        Assert.Equal("reparse_point", error.Text("reason"));
+        Assert.Equal("bad_copy", error.Text("step"));
+        Assert.DoesNotContain(_log.Entries, e => e.Event == "error");
+        Assert.DoesNotContain(_log.Entries, e => e.Level == LogLevel.Warn);
+
+        var store = new LabelStore(fs, "w1");
+        Assert.Equal(LabelLoadStatus.Failed, store.Load().Status);
+        Assert.Equal(LabelSaveStatus.Blocked, store.Save().Status);
+        Assert.Equal(bytes, File.ReadAllBytes(path));
+    }
+
+    [Fact]
+    public void Prune_LinkWithBadName_IsNotCounted_NotDeleted_NotHashed()
+    {
+        PutText("w1.json", "{ new corrupt");
+        for (int i = 1; i <= 6; i++)
+        {
+            PutBad(OldBadName(i), "{ old " + i);
+        }
+
+        string outside = Outside();
+        string linkName = "w1.json.20990101T000000Z.bad";
+        MakeDirLink(PathOf(linkName), outside);
+
+        LabelReadResult read = NewFs().Read("w1");
+
+        Assert.Equal(LabelReadStatus.Corrupt, read.Status);
+        Assert.Equal("2", Single("labels.read", LogLevel.Warn).Text("bad_pruned"));
+        Assert.True(IsLink(PathOf(linkName)));
+        Assert.Empty(Directory.GetFileSystemEntries(outside));
+        Assert.Equal(new[] { OldBadName(3), OldBadName(4), OldBadName(5), OldBadName(6) }, OldBadNames());
+    }
+
+    [Fact]
+    public void Write_FinalJsonIsFileSymlink_ReplacedByRegularFile_TargetNotWritten()
+    {
+        string outside = Outside();
+        string target = Path.Combine(outside, "real.json");
+        File.WriteAllText(target, _validEmpty);
+        if (!TryMakeFileLink(PathOf("w1.json"), target))
+        {
+            return;
+        }
+
+        LabelWriteResult write = NewFs().Write(FileOf("w1", ("k", "A", null)));
+
+        Assert.True(write.IsOk);
+        Assert.False(IsLink(PathOf("w1.json")));
+        Assert.Equal(_validEmpty, File.ReadAllText(target));
+        Assert.Equal(new[] { "real.json" }, Directory.GetFileSystemEntries(outside).Select(p => Path.GetFileName(p)!).ToArray());
+        LabelReadResult read = NewFs().Read("w1");
+        Assert.Equal(LabelReadStatus.Ok, read.Status);
+        Assert.Equal("A", read.File!.Shelves["k"].Label);
+    }
+
+    [Fact]
+    public void Read_FinalJsonIsFileSymlink_ReadsThrough()
+    {
+        string outside = Outside();
+        string target = Path.Combine(outside, "real.json");
+        File.WriteAllText(target, "{\"version\":1,\"worldId\":\"w1\",\"shelves\":{\"k\":{\"label\":\"Linked\"}}}");
+        if (!TryMakeFileLink(PathOf("w1.json"), target))
+        {
+            return;
+        }
+
+        LabelReadResult read = NewFs().Read("w1");
+
+        Assert.Equal(LabelReadStatus.Ok, read.Status);
+        Assert.Equal("Linked", read.File!.Shelves["k"].Label);
+        Assert.True(IsLink(PathOf("w1.json")));
+    }
+
+    [Fact]
+    public void Read_FinalJsonIsFileSymlinkToOversizedFile_SizeCapped_Corrupt()
+    {
+        string outside = Outside();
+        string target = Path.Combine(outside, "big.json");
+        File.WriteAllBytes(target, new byte[JsonLabelFileSystem.MaxFileBytes + 1]);
+        if (!TryMakeFileLink(PathOf("w1.json"), target))
+        {
+            return;
+        }
+
+        LabelReadResult read = NewFs().Read("w1");
+
+        Assert.Equal(LabelReadStatus.Corrupt, read.Status);
+        Assert.Contains("limit", read.Detail!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Cap_EightOldCopies_NewCorrupt_Corrupt_PrunedFour_NewAndNewestFourRemain()
+    {
+        PutText("w1.json", "{ brand new corrupt");
+        for (int i = 1; i <= 8; i++)
+        {
+            PutBad(OldBadName(i), "{ old " + i);
+        }
+
+        LabelReadResult read = NewFs().Read("w1");
+
+        Assert.Equal(LabelReadStatus.Corrupt, read.Status);
+        LogEntry warn = Single("labels.read", LogLevel.Warn);
+        Assert.Equal("new", warn.Text("bad_copy"));
+        Assert.Equal("4", warn.Text("bad_pruned"));
+        Assert.Equal(new[] { OldBadName(5), OldBadName(6), OldBadName(7), OldBadName(8) }, OldBadNames());
+        string newCopy = Assert.Single(BadFiles(), b => !b.StartsWith("w1.json.2020", StringComparison.Ordinal));
+        Assert.Equal(newCopy, warn.Text("bad"));
+        Assert.Equal("{ brand new corrupt", File.ReadAllText(PathOf(newCopy)));
+        Assert.Equal(5, BadFiles().Length);
+        Assert.DoesNotContain(_log.Entries, e => e.Event == "error");
+    }
+
+    [Fact]
+    public void Cap_ReuseAfterPrune_ExistingCopy_PrunedZero_NothingMoreDeleted()
+    {
+        PutText("w1.json", "{ brand new corrupt");
+        for (int i = 1; i <= 8; i++)
+        {
+            PutBad(OldBadName(i), "{ old " + i);
+        }
+
+        JsonLabelFileSystem fs = NewFs();
+        fs.Read("w1");
+        string[] afterFirst = BadFiles();
+        Assert.Equal(LabelReadStatus.Corrupt, fs.Read("w1").Status);
+
+        LogEntry last = _log.Named("labels.read").Last();
+        Assert.Equal("existing", last.Text("bad_copy"));
+        Assert.Equal("0", last.Text("bad_pruned"));
+        Assert.Equal(afterFirst, BadFiles());
+    }
+
+    [Fact]
+    public void Cap_ExactlyFiveOldCopies_NewCopy_PrunesOne_KeepsFiveTotal()
+    {
+        PutText("w1.json", "{ new");
+        for (int i = 1; i <= 5; i++)
+        {
+            PutBad(OldBadName(i), "{ old " + i);
+        }
+
+        NewFs().Read("w1");
+
+        Assert.Equal("1", Single("labels.read", LogLevel.Warn).Text("bad_pruned"));
+        Assert.Equal(5, BadFiles().Length);
+        Assert.DoesNotContain(OldBadName(1), BadFiles());
+    }
+
+    [Fact]
+    public void Cap_FourOldCopies_NewCopy_PrunesNothing()
+    {
+        PutText("w1.json", "{ new");
+        for (int i = 1; i <= 4; i++)
+        {
+            PutBad(OldBadName(i), "{ old " + i);
+        }
+
+        NewFs().Read("w1");
+
+        Assert.Equal("0", Single("labels.read", LogLevel.Warn).Text("bad_pruned"));
+        Assert.Equal(5, BadFiles().Length);
+    }
+
+    [Fact]
+    public void Cap_ForeignNamedAndOtherWorldBadFiles_AreNeverCountedOrDeleted()
+    {
+        PutText("w1.json", "{ new");
+        for (int i = 1; i <= 8; i++)
+        {
+            PutBad(OldBadName(i), "{ old " + i);
+        }
+
+        string[] foreign =
+        {
+            "w1.json.notmine.bad",
+            "w1.json.20200101T000001Z.bad.bak",
+            "w1.json.2020.bad",
+            "w10.json.20200101T000001Z.bad",
+            "w2.json.20200101T000002Z.bad",
+        };
+        foreach (string name in foreign)
+        {
+            PutText(name, "foreign " + name);
+        }
+
+        NewFs().Read("w1");
+
+        Assert.Equal("4", Single("labels.read", LogLevel.Warn).Text("bad_pruned"));
+        foreach (string name in foreign)
+        {
+            Assert.Equal("foreign " + name, File.ReadAllText(PathOf(name)));
+        }
+    }
+
+    [Fact]
+    public void Cap_OrdersByNameStamp_NotByFileTimes_EvenWhenTimesDisagree()
+    {
+        PutText("w1.json", "{ new");
+        DateTime baseTime = new(2030, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        for (int i = 1; i <= 8; i++)
+        {
+            // the newest stamp gets the oldest write time, and the reverse
+            PutBad(OldBadName(i), "{ old " + i, baseTime.AddHours(-i));
+        }
+
+        NewFs().Read("w1");
+
+        Assert.Equal(new[] { OldBadName(5), OldBadName(6), OldBadName(7), OldBadName(8) }, OldBadNames());
+    }
+
+    [Fact]
+    public void Cap_SameSecondSuffixes_OrderedNumerically_NoSuffixIsOne()
+    {
+        PutText("w1.json", "{ new");
+        string stamp = "20200101T000000Z";
+        string[] names =
+        {
+            $"w1.json.{stamp}.bad",
+            $"w1.json.{stamp}-2.bad",
+            $"w1.json.{stamp}-9.bad",
+            $"w1.json.{stamp}-10.bad",
+            $"w1.json.{stamp}-11.bad",
+            $"w1.json.{stamp}-12.bad",
+        };
+        foreach (string name in names)
+        {
+            PutBad(name, "{ " + name);
+        }
+
+        NewFs().Read("w1");
+
+        // numeric newest first: -12 -11 -10 -9 -2 (none); string order would have kept -2 and dropped -10
+        Assert.Equal("2", Single("labels.read", LogLevel.Warn).Text("bad_pruned"));
+        Assert.Equal(new[] { names[3], names[4], names[5], names[2] }.OrderBy(n => n, StringComparer.Ordinal).ToArray(), OldBadNames());
+    }
+
+    [Fact]
+    public void Cap_IdenticalCopyFifthNewest_IsFound_Reused_NoPruneEvenWithSixOld()
+    {
+        string content = "{ identical body";
+        PutText("w1.json", content);
+        for (int i = 1; i <= 6; i++)
+        {
+            PutBad(OldBadName(i), i == 2 ? content : "{ otherbody" + i);
+        }
+
+        NewFs().Read("w1");
+
+        LogEntry warn = Single("labels.read", LogLevel.Warn);
+        Assert.Equal("existing", warn.Text("bad_copy"));
+        Assert.Equal(OldBadName(2), warn.Text("bad"));
+        Assert.Equal("0", warn.Text("bad_pruned"));
+        Assert.Equal(6, BadFiles().Length);
+    }
+
+    [Fact]
+    public void Cap_IdenticalCopySixthNewest_NotFound_NewCopyMade_ThenPrunedToFive()
+    {
+        string content = "{ identical body";
+        PutText("w1.json", content);
+        for (int i = 1; i <= 6; i++)
+        {
+            PutBad(OldBadName(i), i == 1 ? content : "{ otherbody" + i);
+        }
+
+        NewFs().Read("w1");
+
+        LogEntry warn = Single("labels.read", LogLevel.Warn);
+        Assert.Equal("new", warn.Text("bad_copy"));
+        Assert.Equal("2", warn.Text("bad_pruned"));
+        Assert.Equal(5, BadFiles().Length);
+        Assert.Equal(new[] { OldBadName(3), OldBadName(4), OldBadName(5), OldBadName(6) }, OldBadNames());
+        Assert.Equal(content, File.ReadAllText(PathOf(warn.Text("bad"))));
+    }
+
+    [Fact]
+    public void Cap_RepeatedDistinctCorruptions_NeverExceedFiveCopies()
+    {
+        JsonLabelFileSystem fs = NewFs();
+        for (int i = 0; i < 9; i++)
+        {
+            PutText("w1.json", "{ corrupt " + i);
+            Assert.Equal(LabelReadStatus.Corrupt, fs.Read("w1").Status);
+            Assert.True(BadFiles().Length <= JsonLabelFileSystem.MaxBadCopies);
+        }
+
+        Assert.Equal(5, BadFiles().Length);
+    }
+
+    // Fails today (bug card filed): within one second the freed lowest -n suffix is reused, so a new copy can rank below
+    // older ones and the newest content is pruned on a later copy while older content survives.
+    [Fact]
+    public void Cap_RepeatedDistinctCorruptions_SameSecondBurst_KeepsTheNewestFive()
+    {
+        JsonLabelFileSystem fs = NewFs();
+        for (int i = 0; i < 9; i++)
+        {
+            PutText("w1.json", "{ corrupt " + i);
+            Assert.Equal(LabelReadStatus.Corrupt, fs.Read("w1").Status);
+        }
+
+        Assert.Equal(
+            new[] { "{ corrupt 4", "{ corrupt 5", "{ corrupt 6", "{ corrupt 7", "{ corrupt 8" },
+            BadFiles().Select(b => File.ReadAllText(PathOf(b))).OrderBy(t => t, StringComparer.Ordinal).ToArray());
+    }
+
+    // [Windows-only] an open handle without FileShare.Delete makes File.Delete throw; no portable way to do that on Unix
+    // (directory permissions would also block the copy), so this is unverified on Linux CI.
+    [Fact]
+    public void Prune_FailureAfterCopyExists_StillCorrupt_BadPruneErrorLogged_NewCopyKept()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            _output.WriteLine("SKIPPED: [Windows-only] undeletable file needs an open handle; unverified on Linux.");
+            return;
+        }
+
+        PutText("w1.json", "{ brand new corrupt");
+        for (int i = 1; i <= 6; i++)
+        {
+            PutBad(OldBadName(i), "{ old " + i);
+        }
+
+        // deletion starts at the 5th newest (stamp 2); hold that one open
+        using var held = new FileStream(PathOf(OldBadName(2)), FileMode.Open, FileAccess.Read, FileShare.None);
+
+        LabelReadResult read = NewFs().Read("w1");
+
+        Assert.Equal(LabelReadStatus.Corrupt, read.Status);
+        LogEntry error = Single("error", LogLevel.Error);
+        Assert.Equal("labels.read", error.Text("event"));
+        Assert.Equal("bad_prune", error.Text("step"));
+        Assert.Equal("w1", error.Text("world"));
+        LogEntry warn = Single("labels.read", LogLevel.Warn);
+        Assert.Equal("new", warn.Text("bad_copy"));
+        Assert.Equal("0", warn.Text("bad_pruned"));
+        Assert.True(File.Exists(PathOf(warn.Text("bad"))));
+        Assert.Equal("{ brand new corrupt", File.ReadAllText(PathOf(warn.Text("bad"))));
+        Assert.DoesNotContain(_log.Entries, e => e.Level == LogLevel.Error && e.Event == "labels.read");
     }
 }
