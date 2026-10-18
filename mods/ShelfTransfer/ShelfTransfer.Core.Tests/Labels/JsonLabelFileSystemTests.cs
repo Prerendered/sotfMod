@@ -1238,6 +1238,7 @@ public sealed class JsonLabelFileSystemTests : IDisposable
         string existingTarget = Path.Combine(outside, "existing.txt");
         File.WriteAllText(existingTarget, "keep");
         string danglingTarget = Path.Combine(outside, "dangling.txt");
+        Directory.CreateDirectory(_dir);
         File.CreateSymbolicLink(PathOf("w1.json.tmp"), existingTarget);
         File.CreateSymbolicLink(PathOf("w2.json.tmp"), danglingTarget);
 
