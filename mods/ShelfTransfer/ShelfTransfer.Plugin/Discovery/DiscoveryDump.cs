@@ -84,27 +84,9 @@ public sealed class DiscoveryDump : MonoBehaviour
 
     private static void WriteDump(IModLog log)
     {
-        Camera camera = Camera.main;
-        if (camera == null)
-        {
-            WriteMissing(log, "no_camera");
-            return;
-        }
-
-        Transform view = camera.transform;
-        // Collide: interaction volumes on shelf slots may be triggers. The ray starts inside the player's own collider, which it ignores.
-        bool isHit = Physics.Raycast(view.position, view.forward, out RaycastHit hit, _maxAimDistance,
-            Physics.DefaultRaycastLayers, QueryTriggerInteraction.Collide);
-        Collider? collider = isHit ? hit.collider : null;
+        Collider? collider = FindAimedCollider(log);
         if (collider == null)
         {
-            WriteMissing(log, "no_target", new KeyValuePair<string, object?>("detail", "no_hit"));
-            return;
-        }
-
-        if (FormatTypeName(collider.GetIl2CppType()) == _terrainColliderType)
-        {
-            WriteMissing(log, "no_target", new KeyValuePair<string, object?>("detail", "terrain"));
             return;
         }
 
@@ -125,6 +107,61 @@ public sealed class DiscoveryDump : MonoBehaviour
         {
             WriteMissing(log, "depth_cap", new("limit", _maxParentDepth), new("next", current.gameObject.name));
         }
+    }
+
+    // Nearest hit that is not part of the player rig, or null after logging why there is none.
+    private static Collider? FindAimedCollider(IModLog log)
+    {
+        Camera camera = Camera.main;
+        if (camera == null)
+        {
+            WriteMissing(log, "no_camera");
+            return null;
+        }
+
+        Transform view = camera.transform;
+        Transform playerRoot = view.root;
+        // Triggers stay in (shelf slots may be triggers); the player's own trigger volumes around the camera are skipped below.
+        List<RaycastHit> rawHits = new(Physics.RaycastAll(view.position, view.forward, _maxAimDistance,
+            Physics.DefaultRaycastLayers, QueryTriggerInteraction.Collide));
+        List<(float Distance, Collider Collider)> hits = new();
+        foreach (RaycastHit hit in rawHits)
+        {
+            Collider hitCollider = hit.collider;
+            if (hitCollider != null)
+            {
+                hits.Add((hit.distance, hitCollider));
+            }
+        }
+
+        // RaycastAll returns hits in no particular order.
+        hits.Sort((a, b) => a.Distance.CompareTo(b.Distance));
+        int skippedPlayer = 0;
+        foreach ((float distance, Collider hitCollider) in hits)
+        {
+            if (hitCollider.transform.IsChildOf(playerRoot))
+            {
+                skippedPlayer++;
+                continue;
+            }
+
+            log.Write(LogLevel.Info, "discovery.aim", new KeyValuePair<string, object?>[]
+            {
+                new("hit", hitCollider.gameObject.name),
+                new("distance", MathF.Round(distance, 2)),
+                new("skipped_player", skippedPlayer),
+            });
+            if (FormatTypeName(hitCollider.GetIl2CppType()) == _terrainColliderType)
+            {
+                WriteMissing(log, "no_target", new("detail", "terrain"), new("skipped_player", skippedPlayer));
+                return null;
+            }
+
+            return hitCollider;
+        }
+
+        WriteMissing(log, "no_target", new("detail", "no_hit"), new("skipped_player", skippedPlayer));
+        return null;
     }
 
     // False once the component cap is hit, which ends the walk.
