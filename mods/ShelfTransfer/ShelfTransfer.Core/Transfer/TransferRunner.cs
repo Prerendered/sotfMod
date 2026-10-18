@@ -1,7 +1,7 @@
-// purpose: the transfer state machine (flow F2): plan, then take → verify → store → verify one item per cycle; any fault stops, never retries
+// purpose: the transfer state machine (flow F2): plan, then take -> verify -> store -> verify one item per cycle; any fault stops, never retries
 // owns:    TransferRunner
 // deps:    IShelfGateway, IModLog, AmountClamp, TransferRequest, TransferReport, TransferState, StopReason
-// caution: a cycle never splits across ticks (D7); only TakeOne/StoreOne mutate (I2); Tick never catches — after a throw, Abort or the next Tick finishes (P2)
+// caution: a cycle never splits across ticks (D7); only TakeOne/StoreOne mutate (I2); Tick never catches; after a throw, Abort or the next Tick finishes (P2)
 
 using System;
 using System.Collections.Generic;
@@ -22,6 +22,7 @@ public sealed class TransferRunner
     private int _inventoryStart;
     private bool _isCancelRequested;
     private bool _isTickInFlight;
+    private bool _isTickOnStack;
     private bool _hasStoreVerdict;
 
     public TransferRunner(IShelfGateway gateway, IModLog log, TransferRequest request)
@@ -62,6 +63,13 @@ public sealed class TransferRunner
             return;
         }
 
+        if (_isTickOnStack)
+        {
+            // Called from a gateway call inside the running tick; carrying on would interleave two cycles (D7).
+            Finish(StopReason.GatewayError, $"re-entrant tick during {State}");
+            return;
+        }
+
         if (_isTickInFlight)
         {
             // The last tick threw and nobody aborted; resuming would act on an unverified cycle (invariant 3).
@@ -69,9 +77,19 @@ public sealed class TransferRunner
             return;
         }
 
-        // Cleared only on a normal return, so a throw leaves it set for Abort or the next Tick to see.
+        // _isTickInFlight is cleared only on a normal return, so a throw leaves it set for Abort or the next Tick;
+        // _isTickOnStack also clears on unwind, so only a call from inside the running tick sees it set.
         _isTickInFlight = true;
-        RunTick(maxCycles);
+        _isTickOnStack = true;
+        try
+        {
+            RunTick(maxCycles);
+        }
+        finally
+        {
+            _isTickOnStack = false;
+        }
+
         _isTickInFlight = false;
     }
 
@@ -338,10 +356,18 @@ public sealed class TransferRunner
             ? ReadOrTrack<int?>(() => _gateway.GetCount(_request.Target, _request.Item), null, ref countsNote)
             : null;
         bool isSourceReadable = ReadOrTrack(() => _gateway.IsAlive(_request.Source), false, ref countsNote);
-        int remaining = isSourceReadable
-            ? ReadOrTrack(() => _gateway.GetCount(_request.Source, _request.Item), trackedRemaining, ref countsNote)
-            : trackedRemaining;
-        if (!isSourceReadable)
+        int? sourceNow = isSourceReadable
+            ? ReadOrTrack<int?>(() => _gateway.GetCount(_request.Source, _request.Item), null, ref countsNote)
+            : null;
+        int remaining = sourceNow ?? trackedRemaining;
+
+        // Before a baseline the tracked fallback is a 0 nobody counted; Remaining is an int, so the detail says so.
+        string? sourceNote = null;
+        if (sourceNow is null && !_hasBaseline)
+        {
+            sourceNote = "source never read, remaining unknown";
+        }
+        else if (!isSourceReadable)
         {
             countsNote ??= "source gone, remaining tracked";
         }
@@ -367,7 +393,7 @@ public sealed class TransferRunner
             }
         }
 
-        string? fullDetail = JoinNotes(detail, storeNote, countsNote);
+        string? fullDetail = JoinNotes(detail, storeNote, countsNote, sourceNote);
         Report = new TransferReport(reason, Requested, Moved, remaining, stranded, fullDetail);
 
         LogLevel level = reason is StopReason.Completed or StopReason.Cancelled or StopReason.BlockedBeforeStart
