@@ -32,11 +32,9 @@ public static class WorldId
         }
 
         string trimmed = raw.Trim();
-        int length = Math.Min(trimmed.Length, MaxLength);
-        var builder = new StringBuilder(length + 1);
-        for (int i = 0; i < length; i++)
+        var builder = new StringBuilder(trimmed.Length + 1);
+        foreach (char c in trimmed)
         {
-            char c = trimmed[i];
             builder.Append(IsAllowed(c) ? c : '_');
         }
 
@@ -46,7 +44,8 @@ public static class WorldId
             sanitised = "_" + sanitised;
         }
 
-        return sanitised;
+        // Capped last so the prefix can never push the result past MaxLength.
+        return sanitised.Length <= MaxLength ? sanitised : sanitised.Substring(0, MaxLength);
     }
 
     // ASCII only: char.IsLetterOrDigit would admit non-ASCII letters the F3 rule excludes.

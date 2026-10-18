@@ -1,7 +1,9 @@
 // purpose: the I/O seam for the label file; the plugin implements it with System.Text.Json, tests with a fake (invariant 5)
 // owns:    ILabelFileSystem, LabelReadResult, LabelReadStatus, LabelWriteResult
 // deps:    LabelFile
-// caution: implementations convert their own I/O and JSON exceptions to Failed/Corrupt; LabelStore still guards the call
+// caution: implementations convert their own I/O and JSON exceptions to Failed/Corrupt; LabelStore still guards the call.
+//          Returning Corrupt MUST first preserve the corrupt file (e.g. as .bad) at Read time — never defer it to Write —
+//          because LabelStore allows Save after a Corrupt load and the first Save would overwrite the only copy.
 
 namespace ShelfTransfer.Core.Labels;
 

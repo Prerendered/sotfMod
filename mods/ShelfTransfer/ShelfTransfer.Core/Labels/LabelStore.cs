@@ -3,6 +3,8 @@
 // deps:    ILabelFileSystem, LabelFile, ShelfLabel, WorldId
 // caution: keys are opaque ShelfKey strings — never reference Core/Gateway here. Not thread-safe (main thread only).
 //          Prune trusts its caller: an empty live set from a registry that has not populated yet drops every label.
+//          Save is allowed after a Corrupt load, so the file system must preserve the corrupt file (e.g. .bad) at Read
+//          time when it returns Corrupt — never defer it to Write — or the first Save overwrites the only copy.
 
 using System;
 using System.Collections.Generic;
