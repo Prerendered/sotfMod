@@ -1,5 +1,5 @@
 // purpose: owns the current world's LabelStore over BepInEx/config/ShelfTransfer/<worldId>.json, opened on world entry (F3, I5)
-// owns:    LabelsFeature (Install, Store, SaveNow)
+// owns:    LabelsFeature (Install, Store, SaveNow, MaxNewWorldFilesPerSession)
 // deps:    WorldIdSource, ModConfig, ShelfTransfer.Core.Labels (LabelStore, JsonLabelFileSystem), ShelfTransfer.Core.Logging, BepInEx (Paths, IL2CPPChainloader)
 // caution: main thread only. Store is null outside a world and is replaced on every world change, so callers read it
 //          fresh each time and never keep it. A change counts only once SaveNow is called after Set; nothing else saves it
@@ -18,12 +18,16 @@ namespace ShelfTransfer.Plugin.Labels;
 
 public static class LabelsFeature
 {
+    /// <summary>Empty files written on a first visit per game run; later new worlds load but get no file until SaveNow.</summary>
+    public const int MaxNewWorldFilesPerSession = 5;
+
     private const string _folderName = "ShelfTransfer";
     private const string _sourceGameId = "game_id";
     private const string _sourceUnknown = "unknown";
 
     private static IModLog? _log;
     private static ILabelFileSystem? _fileSystem;
+    private static int _newWorldFiles;
 
     /// <summary>The loaded world's labels; null when no world is loaded or the feature halted.</summary>
     public static LabelStore? Store { get; private set; }
@@ -69,15 +73,39 @@ public static class LabelsFeature
             });
         }
 
-        // NoFile: write the empty file so it exists after the first visit. Corrupt: the .bad copy already exists, and
-        // without a valid file every later launch would read the same corrupt bytes again.
+        // Corrupt: the .bad copy already exists, and without a valid file every later launch would read the same
+        // corrupt bytes again. NoFile: write the empty file so it exists after the first visit (see WriteNewWorldFile).
         LabelLoadResult loaded = store.Load();
-        if (loaded.Status is LabelLoadStatus.NoFile or LabelLoadStatus.Corrupt)
+        if (loaded.Status == LabelLoadStatus.Corrupt)
         {
             Save(store, _log);
         }
+        else if (loaded.Status == LabelLoadStatus.NoFile && hasGameId)
+        {
+            WriteNewWorldFile(store, _log);
+        }
 
         Store = store;
+    }
+
+    // Not for unknown: a menu state or a GameId that arrives late would leave a stray unknown.json; SaveNow still
+    // writes it. Capped because the GameId comes from the host, and a modified host could send a new one every join.
+    private static void WriteNewWorldFile(LabelStore store, IModLog log)
+    {
+        if (_newWorldFiles >= MaxNewWorldFilesPerSession)
+        {
+            log.Write(LogLevel.Warn, "labels.write", new KeyValuePair<string, object?>[]
+            {
+                new("world", store.SanitisedWorldId),
+                new("count", store.Count),
+                new("reason", "new_world_cap"),
+                new("limit", MaxNewWorldFilesPerSession),
+            });
+            return;
+        }
+
+        _newWorldFiles++;
+        Save(store, log);
     }
 
     // Nothing to flush: SaveNow writes every change when it is made.

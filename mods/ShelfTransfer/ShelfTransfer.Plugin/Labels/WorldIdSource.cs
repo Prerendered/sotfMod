@@ -4,7 +4,8 @@
 // caution: read-only (I2): one static field, one instance field and GameStateData.GameId (a field) per poll, no getter
 //          or method of the game. An observation must repeat on two consecutive polls before it is reported, so a world
 //          whose GameId arrives a moment after its data does not open, then drop, an unknown.json session.
-//          Update is the P2 boundary: the first throw logs labels.tick, reports exit, and halts polling for the session
+//          Update is the P2 boundary: the first throw logs labels.tick and reports exit, and polling then stays off until
+//          the game restarts, so labels are unavailable for the rest of that run
 
 using System;
 using System.Runtime.CompilerServices;
