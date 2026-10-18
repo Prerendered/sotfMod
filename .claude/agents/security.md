@@ -51,7 +51,7 @@ team/security-report.md:
 - The entry is appended in the fixed format with a verdict — or, on a PR, posted
   as a PR review comment with `review/security` set on the reviewed SHA.
 
-## Output format (appended to team/security-report.md)
+## Output format (appended to team/security-report.md, or posted as the PR review body)
 ```
 ## [date] — [story|branch] — [card|merge] — PASS|FAIL
 - [critical|high|medium|low] <vuln> @ <file:line> — exploit: <how> — fix: <suggestion>

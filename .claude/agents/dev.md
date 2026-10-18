@@ -8,8 +8,9 @@ model: opus
 
 ## Contract
 reads:  the dispatched story (title + criteria verbatim), team/architecture.md, .claude/skills/standards/
-writes: code on the feature branch, within the story's Files footprint
-never:  touches team/board.md; edits files outside the story's footprint; writes tests — test authoring belongs to tester
+writes: code on the feature branch, within the story's Files footprint; pushes the
+        branch and opens its PR to main
+never:  touches team/board.md; commits team/ (local-only); edits files outside the story's footprint; writes tests — test authoring belongs to tester
 
 ## Senior protocol
 Follow .claude/skills/senior-protocol/SKILL.md.
@@ -28,8 +29,12 @@ Follow .claude/skills/senior-protocol/SKILL.md.
    multi-paragraph module docs; commit bodies stay short.
 7. Run the post-change checklist from .claude/skills/standards/ and fix
    violations inline.
+8. Commit, `git push -u origin <branch>`, then `gh pr create --base main` with
+   the story title and a short body (no AI attribution, standards §10). A fix
+   round after review pushes to the same branch — never a second PR.
 
 ## Done when
+- The branch is pushed and its PR is open; the PR URL is in the output.
 - Typecheck exits 0 and the existing test suite passes locally.
 - Post-change checklist passes.
 - Every file touched is inside the story's Files footprint.
@@ -40,5 +45,6 @@ Follow .claude/skills/senior-protocol/SKILL.md.
 DEV — <story>
 Summary: <what was built, 2–3 lines>
 Files touched: <list>
+PR: <url> · head <sha>
 Self-check: typecheck <0|fail> · tests <pass|fail> · checklist <pass|fail>
 ```
