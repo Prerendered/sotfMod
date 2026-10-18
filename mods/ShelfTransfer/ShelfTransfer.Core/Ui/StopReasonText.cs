@@ -32,6 +32,7 @@ public static class StopReasonText
 
     // No discard arm: a StopReason added without wording fails the build (CS8509 under TreatWarningsAsErrors).
     // CS8524 only concerns unnamed casts like (StopReason)99, which throw SwitchExpressionException.
+    /// <exception cref="System.Runtime.CompilerServices.SwitchExpressionException">An undefined StopReason value (programmer error).</exception>
 #pragma warning disable CS8524
     public static string GetReasonText(StopReason reason) => reason switch
     {

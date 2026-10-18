@@ -3,6 +3,7 @@
 // deps:    AimTarget, ShelfList, ShelfGroup, ShelfRow, AmountClamp, TransferRequest, TransferReport, StopReasonText
 // caution: I4 - Confirm only ever emits AmountClamp's result for the selected row, and only when it is > 0.
 //          D7 - Esc while Running yields Cancel once; the Plugin forwards it to TransferRunner.RequestCancel.
+//          Not thread-safe: call only from the Unity main thread (the overlay's OnGUI/Update).
 
 using System;
 using System.Collections.Generic;
@@ -346,6 +347,12 @@ public sealed class OverlayModel
         }
 
         ClampResult clamp = ClampAgainstSelectedRow(_requestedAmount);
+        if (clamp.Reason == ClampReason.Ok && _requestedAmount != AmountClamp.All)
+        {
+            // A refresh that shrinks Fits shrinks the player's amount for good; only the default All follows Fits back up.
+            _requestedAmount = clamp.Amount;
+        }
+
         Amount = clamp.Reason == ClampReason.Ok ? clamp.Amount : 0;
         AmountDisplay = Amount.ToString(CultureInfo.InvariantCulture);
         _amountReason = clamp.Reason switch
