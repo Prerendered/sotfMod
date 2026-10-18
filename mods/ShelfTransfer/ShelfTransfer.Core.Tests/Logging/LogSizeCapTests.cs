@@ -156,6 +156,73 @@ public sealed class LogSizeCapTests
         Assert.Equal(LogSizeCap.Admission.Write, cap.Admit(7));
     }
 
+    // ---- card 36: rotation-failure bound ----
+
+    [Theory]
+    [InlineData(0L)]
+    [InlineData(1L)]
+    [InlineData(10_485_758L)]
+    [InlineData(10_485_759L)]
+    public void IsAppendAllowed_BelowCap_True(long existing)
+    {
+        LogSizeCap cap = new(LogSizeCap.MaxSessionBytes);
+
+        Assert.True(cap.IsAppendAllowed(existing));
+    }
+
+    [Theory]
+    [InlineData(10_485_760L)]
+    [InlineData(10_485_761L)]
+    [InlineData(long.MaxValue)]
+    public void IsAppendAllowed_AtOrPastCap_False(long existing)
+    {
+        LogSizeCap cap = new(LogSizeCap.MaxSessionBytes);
+
+        Assert.False(cap.IsAppendAllowed(existing));
+    }
+
+    [Theory]
+    [InlineData(-1L)]
+    [InlineData(long.MinValue)]
+    public void IsAppendAllowed_Negative_Throws(long existing)
+    {
+        LogSizeCap cap = new(LogSizeCap.MaxSessionBytes);
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => cap.IsAppendAllowed(existing));
+    }
+
+    [Fact]
+    public void IsAppendAllowed_SmallInstanceCap_UsesThatCap()
+    {
+        LogSizeCap cap = new(10);
+
+        Assert.True(cap.IsAppendAllowed(0));
+        Assert.True(cap.IsAppendAllowed(9));
+        Assert.False(cap.IsAppendAllowed(10));
+        Assert.False(cap.IsAppendAllowed(11));
+    }
+
+    [Fact]
+    public void IsAppendAllowed_CapOfOne_OnlyEmptyFileAppends()
+    {
+        LogSizeCap cap = new(1);
+
+        Assert.True(cap.IsAppendAllowed(0));
+        Assert.False(cap.IsAppendAllowed(1));
+    }
+
+    [Fact]
+    public void IsAppendAllowed_DoesNotChangeAdmissionState()
+    {
+        LogSizeCap cap = new(10);
+        cap.Admit(4);
+
+        Assert.False(cap.IsAppendAllowed(10));
+
+        Assert.Equal(4, cap.WrittenBytes);
+        Assert.Equal(LogSizeCap.Admission.Write, cap.Admit(6));
+    }
+
     [Fact]
     public void Admit_NegativeCountAfterCapped_StillThrows()
     {
