@@ -99,10 +99,20 @@ the Invariant check on the card's flow (see above) and size its ceremony
      for characterization tests first.
    Story in unfamiliar code → dispatch scout (brief mode) first; pass its brief to
    the builder.
-2. Dispatch reviewer (task mode) on the diff.
-   - fail → builder fixes. Max 2 iterations, then escalate to User.
+2. Builder pushes the feature branch and opens a PR. Dispatch reviewer (task mode)
+   on the PR number: it posts its verdict as a PR review comment and sets the
+   `review/code` commit status on the reviewed head SHA (see reviewer "On a PR").
+   - fail → builder fixes on the same PR; re-review the new SHA. Max 2
+     iterations, then escalate to User.
 3. Security-sensitive card (auth, input, data, dependencies) → dispatch security
-   (card mode). A high or critical returns the card to the builder.
+   (card mode) on the PR: it sets `review/security`. A high or critical returns the
+   card to the builder. Not security-sensitive (Proportionality) → the Overseer sets
+   `review/security` = success on the head SHA with description
+   `skipped — not security-sensitive: <reason>`, so the skip is visible, never
+   disguised as a review.
+   Both statuses are required checks on main alongside CI `check`. GitHub forbids
+   self-approval and every PR is authored by the User's account, so these statuses
+   — not PR approvals — are the agents' approval gate. Merging stays with the User.
 4. Dispatch tester → tests + test-report.md. New bugs → cards on board.
 5. Dispatch seer (validate mode) → criteria vs evidence.
 6. End-to-end gate: drive what is automatable (the verify/run skill). Rebuild the
@@ -133,6 +143,11 @@ Return: summary + files touched + self-check result
 If an agent needs something not in its reads:, that is an Overseer bug —
 fix the contract, do not widen the payload ad hoc.
 
+**team/ is local-only (git-ignored, never on the remote).** A worktree checkout
+does not contain it. Every dispatch passes team/ files as absolute paths into the
+main checkout, and agents write team/ artifacts (reports, board updates) there,
+never inside a worktree and never into a commit.
+
 Parallel dispatch: check the Files column on each story. Shared file =
 sequential. No shared files = parallel builder dispatches, reviews still sequential.
 
@@ -151,8 +166,9 @@ running the setup that produced it; that is how the same corruption recurs worse
 **Model tiers (cost).** Each agent carries a `model:` in its frontmatter. Cheapest
 to most capable (and most costly): **haiku → sonnet → opus → fable**. Fable is the
 premium tier, used sparingly.
-- **fable**: architect only — runs once, highest-leverage design.
-- **opus**: dev; also the everyday escalation target.
+- **fable**: no agent by default — deliberate escalation only (see below).
+- **opus**: architect (`effort: high` — runs once, highest-leverage design); dev;
+  also the everyday escalation target.
 - **sonnet**: reviewer, tester, security, scout, seer, designer, refactor, cicd.
 - **haiku**: scribe, archivist — bounded, template-driven. Thin output is the
   signal to bump: a shallow archivist entry (wrong pitfalls carried) or docs that
@@ -188,8 +204,9 @@ only when the rule must bind the agents directly.
 
 ## GATE 2 — merge gate
 Backlog empty (or phase complete):
-1. Dispatch reviewer (merge mode, `model: opus`).
-2. Dispatch security (merge mode, `model: opus`) — full-branch pass + dependency audit.
+1. Dispatch reviewer (merge mode, `model: opus`) on the phase/merge PR.
+2. Dispatch security (merge mode, `model: opus`) on the same PR — full-branch pass
+   + dependency audit. Both post to the PR and set their statuses as in the Task loop.
 3. Dispatch scribe → README + docs from what is Done.
 4. Verify CI green by reading the actual run status (the workflow file exists on
    the pushed branch and its latest run is green) — not by inferring it from
