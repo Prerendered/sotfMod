@@ -578,21 +578,259 @@ public sealed class TransferRunnerFailureTests
         rig.AssertFrozen();
     }
 
-    // Criterion 9, 7: store done but unverified, Moved not yet credited; I1 may break but must be warned
+    private static bool IsStoredThrowPoint(Rig rig, string entry) => entry == "GetCount(dst)" && rig.Gateway.StoreCalls == 1;
+
+    private static List<string> CallsSince(FakeShelfGateway gateway, int count) => gateway.Calls.Skip(count).ToList();
+
+    private static LogEntry StoreWarn(Rig rig) =>
+        Assert.Single(rig.Log.Named("conservation.mismatch"), e => e.Text("check") == "store");
+
+    private static Func<string, bool> ThrowPoint(Rig rig, string state) => state switch
+    {
+        "taken" => e => e == "GetCount(src)" && rig.Gateway.TakeCalls == 1 && rig.Gateway.StoreCalls == 0,
+        "stored" => e => IsStoredThrowPoint(rig, e),
+        "ready" => e => e == "IsAlive(src)" && rig.Gateway.StoreCalls == 1,
+        "planning-after-baseline" => e => e == "CanHold(dst)",
+        _ => e => e == "IsAlive(src)",
+    };
+
+    // Criterion 9, 7, card 34: item landed but the target re-read threw; Finish settles it from a fresh read
     [Fact]
-    public void Abort_FromStoredAwaitingVerify_FinishesAndWarnsIfConservationBroken()
+    public void Abort_StoreOkItemLandedButTargetReadThrew_CountsItemMovedAndConserves()
     {
         Rig rig = Build(source: 6);
-        ThrowOnce(rig, e => e == "GetCount(dst)" && rig.Gateway.StoreCalls == 1);
+        ThrowOnce(rig, e => IsStoredThrowPoint(rig, e));
         Assert.Throws<InvalidOperationException>(() => rig.Runner.Tick(100));
         Assert.Equal(TransferState.StoredAwaitingVerify, rig.Runner.State);
+        int callsAtThrow = rig.Gateway.Calls.Count;
 
         rig.Runner.Abort(StopReason.GatewayError, "boom");
 
-        Assert.Equal(StopReason.GatewayError, rig.Report.Reason);
-        Assert.Equal(5, rig.Report.Remaining);
+        TransferReport r = rig.Report;
+        Assert.Equal(StopReason.GatewayError, r.Reason);
+        Assert.Equal("boom", r.Detail);
+        Assert.Equal(1, r.Moved);
+        Assert.Equal(5, r.Remaining);
+        Assert.Equal(0, r.StrandedInInventory);
         Assert.Equal(1, rig.Gateway.StoreCalls);
+        Assert.Equal(new[] { "GetCount(dst)", "IsAlive(src)", "GetCount(src)", "GetInventoryCount" }, CallsSince(rig.Gateway, callsAtThrow));
+        Assert.Empty(rig.Log.Named("conservation.mismatch"));
+        rig.AssertAddsUp();
+        rig.AssertFrozen();
+    }
+
+    // Card 34: store said Ok but the item did not land; it stays out of Moved and is stranded
+    [Fact]
+    public void Abort_StoreOkButItemDidNotLandAndTargetReadThrew_StaysOutOfMovedStrandedOneWithStoreWarn()
+    {
+        Rig rig = Build(source: 6);
+        rig.Gateway.StoreBehavior = _ => GatewayOutcome.Ok;
+        ThrowOnce(rig, e => IsStoredThrowPoint(rig, e));
+        Assert.Throws<InvalidOperationException>(() => rig.Runner.Tick(100));
+
+        rig.Runner.Abort(StopReason.GatewayError, "boom");
+
+        TransferReport r = rig.Report;
+        Assert.Equal(0, r.Moved);
+        Assert.Equal(1, r.StrandedInInventory);
+        Assert.Equal(5, r.Remaining);
+        Assert.Equal("boom; store unverified", r.Detail);
+        Assert.Equal(LogLevel.Warn, StoreWarn(rig).Level);
+        rig.AssertAddsUp();
+        rig.AssertFrozen();
+    }
+
+    // Card 34: target rose but inventory did not fall (duplicate); not counted as Moved
+    [Fact]
+    public void Abort_StoreDuplicatedItemAndTargetReadThrew_StaysOutOfMovedStrandedOneWithStoreWarn()
+    {
+        Rig rig = Build(source: 6);
+        rig.Gateway.StoreBehavior = _ =>
+        {
+            GatewayOutcome outcome = rig.Gateway.ApplyStore(_dst);
+            rig.Gateway.Inventory++;
+            return outcome;
+        };
+        ThrowOnce(rig, e => IsStoredThrowPoint(rig, e));
+        Assert.Throws<InvalidOperationException>(() => rig.Runner.Tick(100));
+
+        rig.Runner.Abort(StopReason.GatewayError, "boom");
+
+        TransferReport r = rig.Report;
+        Assert.Equal(0, r.Moved);
+        Assert.Equal(1, r.StrandedInInventory);
+        Assert.Equal(5, r.Remaining);
+        Assert.Contains("store unverified", r.Detail);
+        Assert.Equal(1, rig.Gateway.Shelf(_dst).Count);
+        Assert.Equal(LogLevel.Warn, StoreWarn(rig).Level);
+        rig.AssertAddsUp();
+        rig.AssertFrozen();
+    }
+
+    // Card 34: the settling re-read throws too; item uncounted, store warn plus report warn, tracked-counts suffix
+    [Fact]
+    public void Abort_StoreOkAndTargetRereadThrowsAgain_UncountedWithStoreAndReportWarns()
+    {
+        Rig rig = Build(source: 6);
+        ThrowThenBreak(rig, e => IsStoredThrowPoint(rig, e));
+        Assert.Throws<InvalidOperationException>(() => rig.Runner.Tick(100));
+
+        rig.Runner.Abort(StopReason.GatewayError, "boom");
+
+        TransferReport r = rig.Report;
+        Assert.Equal(0, r.Moved);
+        Assert.Equal(5, r.Remaining);
+        Assert.Equal(0, r.StrandedInInventory);
+        Assert.StartsWith("boom; store unverified; ", r.Detail);
+        Assert.EndsWith("; counts tracked, re-read threw InvalidOperationException", r.Detail);
+        Assert.Equal(LogLevel.Warn, StoreWarn(rig).Level);
+        Assert.True(rig.HasReportMismatchWarn);
         rig.AssertI1OrWarned();
+        rig.AssertFrozen();
+    }
+
+    // Read-set table, row: StoredAwaitingVerify with the verdict not in -> 4 (pinned in order above); verdict in -> 3
+    [Fact]
+    public void Finish_StoredAwaitingVerifyWithVerdictIn_RereadsExactlyThreeAfterVerifyReads()
+    {
+        Rig rig = Build(source: 6);
+        rig.Gateway.StoreBehavior = _ => GatewayOutcome.Ok;
+
+        rig.Runner.Tick(100);
+
+        Assert.Equal(StopReason.TargetMismatch, rig.Report.Reason);
+        int store = rig.Gateway.Calls.IndexOf("StoreOne(dst)");
+        Assert.Equal(
+            new[] { "GetCount(dst)", "GetInventoryCount", "IsAlive(src)", "GetCount(src)", "GetInventoryCount" },
+            CallsSince(rig.Gateway, store + 1));
+    }
+
+    // Read-set table: Taken / ReadyForNext / Planning after baseline -> the same three reads
+    [Theory]
+    [InlineData("taken", 5, 1, 0)]
+    [InlineData("ready", 5, 0, 1)]
+    [InlineData("planning-after-baseline", 6, 0, 0)]
+    public void Abort_FromStateWithBaseline_RereadsExactlyThree(string state, int remaining, int stranded, int moved)
+    {
+        Rig rig = Build(source: 6);
+        ThrowOnce(rig, ThrowPoint(rig, state));
+        Assert.Throws<InvalidOperationException>(() => rig.Runner.Tick(100));
+        int callsAtThrow = rig.Gateway.Calls.Count;
+
+        rig.Runner.Abort(StopReason.GatewayError, "x");
+
+        Assert.Equal(new[] { "IsAlive(src)", "GetCount(src)", "GetInventoryCount" }, CallsSince(rig.Gateway, callsAtThrow));
+        Assert.Equal(remaining, rig.Report.Remaining);
+        Assert.Equal(stranded, rig.Report.StrandedInInventory);
+        Assert.Equal(moved, rig.Report.Moved);
+        rig.AssertAddsUp();
+    }
+
+    // Read-set table: source not alive -> IsAlive + inventory only
+    [Theory]
+    [InlineData("taken", 5, 1, 0)]
+    [InlineData("ready", 5, 0, 1)]
+    [InlineData("planning-after-baseline", 6, 0, 0)]
+    public void Abort_SourceNotAlive_RereadsOnlyAliveAndInventory(string state, int remaining, int stranded, int moved)
+    {
+        Rig rig = Build(source: 6);
+        ThrowOnce(rig, ThrowPoint(rig, state));
+        Assert.Throws<InvalidOperationException>(() => rig.Runner.Tick(100));
+        rig.Gateway.Shelf(_src).IsAlive = false;
+        int callsAtThrow = rig.Gateway.Calls.Count;
+
+        rig.Runner.Abort(StopReason.GatewayError, "x");
+
+        Assert.Equal(new[] { "IsAlive(src)", "GetInventoryCount" }, CallsSince(rig.Gateway, callsAtThrow));
+        Assert.Equal(remaining, rig.Report.Remaining);
+        Assert.Equal(stranded, rig.Report.StrandedInInventory);
+        Assert.Equal(moved, rig.Report.Moved);
+        Assert.Contains("source gone, remaining tracked", rig.Report.Detail);
+        rig.AssertAddsUp();
+    }
+
+    // Source not alive in StoredAwaitingVerify without a verdict: the target read still happens first (3 reads, not 2)
+    [Fact]
+    public void Abort_SourceNotAliveInStoredAwaitingVerifyWithoutVerdict_ReadsTargetThenAliveThenInventory()
+    {
+        Rig rig = Build(source: 6);
+        ThrowOnce(rig, e => IsStoredThrowPoint(rig, e));
+        Assert.Throws<InvalidOperationException>(() => rig.Runner.Tick(100));
+        rig.Gateway.Shelf(_src).IsAlive = false;
+        int callsAtThrow = rig.Gateway.Calls.Count;
+
+        rig.Runner.Abort(StopReason.GatewayError, "x");
+
+        Assert.Equal(new[] { "GetCount(dst)", "IsAlive(src)", "GetInventoryCount" }, CallsSince(rig.Gateway, callsAtThrow));
+        Assert.Equal(1, rig.Report.Moved);
+        Assert.Equal(5, rig.Report.Remaining);
+        rig.AssertAddsUp();
+    }
+
+    // Read-set table: Planning before a baseline -> IsAlive + source count, no inventory read
+    [Fact]
+    public void Abort_PlanningBeforeBaseline_RereadsExactlyAliveAndSourceCount()
+    {
+        Rig rig = Build(source: 6);
+        ThrowOnce(rig, ThrowPoint(rig, "planning-before-baseline"));
+        Assert.Throws<InvalidOperationException>(() => rig.Runner.Tick(100));
+        int callsAtThrow = rig.Gateway.Calls.Count;
+
+        rig.Runner.Abort(StopReason.GatewayError, "x");
+
+        Assert.Equal(new[] { "IsAlive(src)", "GetCount(src)" }, CallsSince(rig.Gateway, callsAtThrow));
+        Assert.Equal(6, rig.Report.Remaining);
+        rig.AssertAddsUp();
+    }
+
+    // Read-set table: already finished -> zero reads
+    [Fact]
+    public void Abort_AlreadyFinishedInVerdictState_MakesZeroReads()
+    {
+        Rig rig = Build(source: 6);
+        rig.Gateway.StoreBehavior = _ => GatewayOutcome.Ok;
+        rig.Runner.Tick(100);
+        int calls = rig.Gateway.Calls.Count;
+
+        rig.Runner.Abort(StopReason.GatewayError, "late");
+
+        Assert.Equal(calls, rig.Gateway.Calls.Count);
+        Assert.Equal(StopReason.TargetMismatch, rig.Report.Reason);
+    }
+
+    // Re-entrant Abort at every cycle-start and verify read: IsFinished is checked between reads, so no further read follows
+    [Theory]
+    [InlineData("cycle-start src", "GetCount(src)", 1, 1)]
+    [InlineData("cycle-start dst", "GetCount(dst)", 1, 1)]
+    [InlineData("cycle-start inventory", "GetInventoryCount", 1, 1)]
+    [InlineData("take-verify src", "GetCount(src)", 2, 1)]
+    [InlineData("take-verify inventory", "GetInventoryCount", 2, 1)]
+    [InlineData("store-verify dst", "GetCount(dst)", 2, 2)]
+    [InlineData("store-verify inventory", "GetInventoryCount", 2, 2)]
+    public void Tick_ReentrantAbortDuringReadGroup_MakesZeroFurtherCallsAndNoMutation(string label, string call, int takes, int stores)
+    {
+        Assert.NotEmpty(label);
+        Rig rig = Build(source: 6);
+        bool isFired = false;
+        int callsAfterAbort = -1;
+        rig.Gateway.OnCall = e =>
+        {
+            if (!isFired && e == call && rig.Gateway.TakeCalls == takes && rig.Gateway.StoreCalls == stores)
+            {
+                isFired = true;
+                rig.Runner.Abort(StopReason.Cancelled, "re-entrant");
+                callsAfterAbort = rig.Gateway.Calls.Count;
+            }
+        };
+
+        rig.Runner.Tick(100);
+
+        Assert.True(isFired);
+        Assert.Equal(StopReason.Cancelled, rig.Report.Reason);
+        Assert.Equal(callsAfterAbort, rig.Gateway.Calls.Count);
+        Assert.Equal(takes, rig.Gateway.TakeCalls);
+        Assert.Equal(stores, rig.Gateway.StoreCalls);
+        rig.AssertAddsUp();
         rig.AssertFrozen();
     }
 
