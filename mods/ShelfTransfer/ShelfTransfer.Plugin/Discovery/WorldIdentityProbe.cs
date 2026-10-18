@@ -2,9 +2,9 @@
 // owns:    WorldIdentityProbe
 // deps:    DiscoveryDump (TryRead, WriteMissing), ShelfTransfer.Core.Logging (IModLog, LogLevel), interop GameSetup, GameState, GameStateData
 // caution: read-only (I2): static auto-property backing fields and instance fields only, except the IsMpClient and
-//          IsSavedGame getters, which have no backing field and so run game code. A type's first touch runs its class
-//          constructor; on a key press in a loaded world the game has already run both. Game types appear only inside
-//          the read lambdas, so a member missing after a game update fails that one read, not the whole probe
+//          IsSavedGame getters, which have no backing field and so run game code. Nothing but the GameState instance
+//          check runs until a world is loaded, so no class constructor or getter runs first at the menu or during load.
+//          Game types appear only inside the read lambdas, so a member missing after a game update fails that one read
 
 using System;
 using System.Collections.Generic;
@@ -27,53 +27,54 @@ public static class WorldIdentityProbe
     // 32 bits: enough to tell two ids apart in a debug log without printing the id.
     private const int _userIdHashLength = 8;
 
-    private static readonly (string Key, Func<object?> Read)[] _gameSetupReads =
+    private static readonly (string Key, Func<object, object?> Read)[] _gameSetupReads =
     {
-        ("slot", () => GameSetup._Slot_k__BackingField),
-        ("save_user_hash", () => HashUserId(GameSetup._SaveUserId_k__BackingField)),
-        ("mp_type", () => GameSetup._MpType_k__BackingField),
-        ("game", () => GameSetup._Game_k__BackingField),
-        ("init", () => GameSetup._Init_k__BackingField),
+        ("slot", _ => GameSetup._Slot_k__BackingField),
+        ("save_user_hash", _ => HashUserId(GameSetup._SaveUserId_k__BackingField)),
+        ("mp_type", _ => GameSetup._MpType_k__BackingField),
+        ("game", _ => GameSetup._Game_k__BackingField),
+        ("init", _ => GameSetup._Init_k__BackingField),
         // MpTypes has only Server and Client, so mp_type alone cannot tell single-player from client; the getter can.
-        ("is_mp_client", () => GameSetup.IsMpClient),
-        ("is_saved_game", () => GameSetup.IsSavedGame),
+        ("is_mp_client", _ => GameSetup.IsMpClient),
+        ("is_saved_game", _ => GameSetup.IsSavedGame),
     };
 
-    private static readonly (string Key, Func<object?> Read)[] _gameStateReads =
+    // Read gets the per-press GameStateData snapshot, typed object so no game type reaches Write (see caution).
+    private static readonly (string Key, Func<object, object?> Read)[] _gameStateReads =
     {
-        ("game_name", () => ReadGameStateData()?.GameName),
-        ("game_id", () => ReadGameStateData()?.GameId),
-        ("game_type", () => ReadGameStateData()?.GameType),
-        ("seed", () => ReadGameStateData()?.ObjectRandomizerSeed),
-        ("crash_site", () => ReadGameStateData()?.CrashSite),
+        ("game_name", data => ((GameStateData)data).GameName),
+        ("game_id", data => ((GameStateData)data).GameId),
+        ("game_type", data => ((GameStateData)data).GameType),
+        ("seed", data => ((GameStateData)data).ObjectRandomizerSeed),
+        ("crash_site", data => ((GameStateData)data).CrashSite),
     };
 
     public static void Write(IModLog log)
     {
-        WriteSource(log, _gameSetupSource, _gameSetupReads);
-
-        if (!DiscoveryDump.TryRead(() => ReadGameStateData() is not null, out bool hasState, out string error))
+        // Loaded-world gate: one snapshot of the stored data per press, read before anything else game-side.
+        if (!DiscoveryDump.TryRead<object?>(() => ReadGameStateData(), out object? data, out string error))
         {
             DiscoveryDump.WriteMissing(log, "unreadable", new("source", _gameStateSource), new("name", "instance"), new("error", error));
             return;
         }
 
-        if (!hasState)
+        if (data is null)
         {
             DiscoveryDump.WriteMissing(log, "no_instance", new KeyValuePair<string, object?>("source", _gameStateSource));
             return;
         }
 
-        WriteSource(log, _gameStateSource, _gameStateReads);
+        WriteSource(log, _gameSetupSource, _gameSetupReads, data);
+        WriteSource(log, _gameStateSource, _gameStateReads, data);
     }
 
-    private static void WriteSource(IModLog log, string source, (string Key, Func<object?> Read)[] reads)
+    private static void WriteSource(IModLog log, string source, (string Key, Func<object, object?> Read)[] reads, object data)
     {
         List<KeyValuePair<string, object?>> line = new() { new("source", source) };
         List<(string Key, string Error)> failures = new();
-        foreach ((string key, Func<object?> read) in reads)
+        foreach ((string key, Func<object, object?> read) in reads)
         {
-            if (DiscoveryDump.TryRead(read, out object? value, out string error))
+            if (DiscoveryDump.TryRead(() => read(data), out object? value, out string error))
             {
                 line.Add(new(key, value));
             }
