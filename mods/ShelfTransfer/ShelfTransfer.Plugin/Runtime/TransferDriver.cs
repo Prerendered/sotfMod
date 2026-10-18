@@ -114,6 +114,8 @@ public sealed class TransferDriver : MonoBehaviour
             return;
         }
 
+        // Runner cleared before the callback, so a throw there cannot leave a finished runner blocking the next transfer;
+        // the command's callback guards its own console call.
         Action<TransferReport>? onFinished = _onFinished;
         _runner = null;
         _onFinished = null;

@@ -28,7 +28,7 @@ using ShelfTransfer.Plugin.Runtime;
 using Il2CppCommands = Il2CppSystem.Collections.Generic.Dictionary<Il2CppSystem.Object, TheForest.DynamicCommand>;
 using LogLevel = ShelfTransfer.Core.Logging.LogLevel;
 
-namespace ShelfTransfer.Plugin.Debug;
+namespace ShelfTransfer.Plugin.Commands;
 
 public sealed class TransferCommand : MonoBehaviour
 {
@@ -117,6 +117,7 @@ public sealed class TransferCommand : MonoBehaviour
             return false;
         }
 
+        bool hasFailed = false;
         try
         {
             Dispatch(arguments ?? "", _log, _registry, _gateway, _aimWatcher, _driver);
@@ -124,6 +125,11 @@ public sealed class TransferCommand : MonoBehaviour
         catch (Exception ex)
         {
             _log.WriteException("transfer.command", ex);
+            hasFailed = true;
+        }
+
+        if (hasFailed)
+        {
             Print("transfer failed, see the mod log");
         }
 
@@ -156,7 +162,7 @@ public sealed class TransferCommand : MonoBehaviour
         }
         else
         {
-            StartTransfer(log, gateway, aimWatcher.GetCurrent(), driver, parts, arguments);
+            StartTransfer(log, gateway, aimWatcher, driver, parts, arguments);
         }
     }
 
@@ -215,9 +221,10 @@ public sealed class TransferCommand : MonoBehaviour
     }
 
     [HideFromIl2Cpp]
-    private void StartTransfer(IModLog log, IShelfGateway gateway, AimTarget? aim, TransferDriver driver, string[] parts,
+    private void StartTransfer(IModLog log, IShelfGateway gateway, AimWatcher aimWatcher, TransferDriver driver, string[] parts,
         string arguments)
     {
+        AimTarget? aim = aimWatcher.GetCurrent();
         if (driver.IsRunning)
         {
             log.Write(LogLevel.Warn, "transfer.request", new KeyValuePair<string, object?>[]
@@ -259,6 +266,13 @@ public sealed class TransferCommand : MonoBehaviour
             return;
         }
 
+        // `transfer list` rescans and can map a duplicate key to the other twin; the source must be the looked-at shelf.
+        if (!aimWatcher.TrackCurrent())
+        {
+            Block(log, gateway, aim, "aim lost", arguments, "Could not confirm the aimed shelf; aim at the slot and try again.");
+            return;
+        }
+
         TransferRequest request = new(aim.Shelf, aim.Slot, target, aim.Item, amount);
         if (!driver.TryStart(request, report => Print(StopReasonText.Format(report).Text)))
         {
@@ -292,13 +306,22 @@ public sealed class TransferCommand : MonoBehaviour
 
     private static bool IsWord(string text, string word) => string.Equals(text, word, StringComparison.OrdinalIgnoreCase);
 
-    // The console may be gone (world unload) by the time a transfer finishes; the mod log still has the full report.
-    private static void Print(string message)
+    // Guarded here because it also runs from the driver's finish callback, outside any catch, and the console may be
+    // gone by then (world unload). Best effort: the mod log already has the full report.
+    [HideFromIl2Cpp]
+    private void Print(string message)
     {
-        DebugConsole? console = DebugConsole.Instance;
-        if (console != null)
+        try
         {
-            console.LogCommandInfo(message);
+            DebugConsole? console = DebugConsole.Instance;
+            if (console != null)
+            {
+                console.LogCommandInfo(message);
+            }
+        }
+        catch (Exception ex)
+        {
+            _log?.WriteException("console.print", ex);
         }
     }
 }

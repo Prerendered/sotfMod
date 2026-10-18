@@ -72,6 +72,31 @@ public sealed class AimWatcher : MonoBehaviour
     [HideFromIl2Cpp]
     public AimTarget? GetCurrent() => _current;
 
+    /// <summary>
+    /// Maps the current target's key to the storage aimed at right now, so gateway calls hit the looked-at shelf even
+    /// after a rescan picked a duplicate-key twin. False when nothing is aimed or the ray now resolves to another shelf.
+    /// </summary>
+    [HideFromIl2Cpp]
+    public bool TrackCurrent()
+    {
+        // Re-resolved rather than kept from Update: Il2Cpp objects never outlive the frame they were read in.
+        Camera camera = Camera.main;
+        if (_registry is null || _current is null || camera == null)
+        {
+            return false;
+        }
+
+        Collider? hit = FindAimedCollider(camera);
+        ItemStorageController? controller = hit == null ? null : FindInParent<ItemStorageController>(hit);
+        if (controller == null || GetShelf(controller).Key != _current.Shelf.Key)
+        {
+            return false;
+        }
+
+        _registry.Track(_current.Shelf.Key, controller);
+        return true;
+    }
+
     public void Update()
     {
         if (_log is null || _registry is null || _gateway is null || _isHalted)

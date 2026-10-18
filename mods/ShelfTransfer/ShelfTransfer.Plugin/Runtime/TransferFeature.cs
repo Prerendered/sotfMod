@@ -7,8 +7,8 @@ using System.Collections.Generic;
 using BepInEx.Unity.IL2CPP;
 
 using ShelfTransfer.Core.Logging;
+using ShelfTransfer.Plugin.Commands;
 using ShelfTransfer.Plugin.Config;
-using ShelfTransfer.Plugin.Debug;
 using ShelfTransfer.Plugin.Game;
 
 namespace ShelfTransfer.Plugin.Runtime;
