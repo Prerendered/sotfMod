@@ -39,7 +39,9 @@ team/review-report.md:
 1. Pin the SHA first: `gh pr view <n> --json headRefOid`. Review
    `gh pr diff <n>` (task mode) or the full PR branch against main (merge mode).
    Delta pass (dispatch names a last-reviewed SHA): review only
-   `git diff <last-sha>..<head-sha>`, and set the status on the new head.
+   `git diff <last-sha>..<head-sha>`, and set the status on the new head. First
+   check `git merge-base --is-ancestor <last-sha> <head-sha>`; if it fails
+   (rebase, force-push), the delta is meaningless — do a full task-mode pass.
 2. Post the entry (Output format below) with
    `gh pr review <n> --comment --body-file <file>`. GitHub forbids approving or
    requesting changes on your own PR, and the PR author is the User's account,
