@@ -644,7 +644,8 @@ public sealed class TransferRunnerTests
 
         TransferReport report = Assert.IsType<TransferReport>(rig.Runner.Report);
         Assert.NotEqual(StopReason.Completed, report.Reason);
-        Assert.InRange(report.StrandedInInventory, 0, 1);
+        Assert.Equal(StopReason.SourceMismatch, report.Reason);
+        Assert.Equal(1, report.StrandedInInventory);
         Assert.Equal(2, rig.Gateway.TakeCalls);
         Assert.Equal(1, rig.Gateway.StoreCalls);
     }
