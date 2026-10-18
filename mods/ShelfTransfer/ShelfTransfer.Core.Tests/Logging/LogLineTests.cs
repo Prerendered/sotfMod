@@ -5,6 +5,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.Linq;
 using System.Text;
 
 using ShelfTransfer.Core.Logging;
@@ -466,6 +467,247 @@ public sealed class LogLineTests
         Assert.DoesNotContain("forged", first);
     }
 
+    // ---- cards 31+32: null literal, control chars, caps ----
+
+    private const string _ellipsis = "\u2026";
+
+    [Fact]
+    public void Format_StringNull_IsQuotedAndDistinctFromRealNull()
+    {
+        Assert.Equal("\"null\"", ValueOf("null"));
+        Assert.Equal("null", ValueOf(null));
+        Assert.NotEqual(ValueOf("null"), ValueOf(null));
+        Assert.Equal("null", Unquote(ValueOf("null")));
+    }
+
+    [Theory]
+    [InlineData("NULL")]
+    [InlineData("Null")]
+    [InlineData("nullx")]
+    [InlineData("nul")]
+    public void Format_NullLookalikes_StayUnquoted(string value)
+    {
+        Assert.Equal(value, ValueOf(value));
+    }
+
+    [Fact]
+    public void Format_NonStringWhoseTextIsNull_IsQuoted()
+    {
+        Assert.Equal("\"null\"", ValueOf(new TextObject("null")));
+    }
+
+    [Theory]
+    [InlineData(0x0000, "\\u0000")]
+    [InlineData(0x0001, "\\u0001")]
+    [InlineData(0x0009, "\\u0009")]
+    [InlineData(0x000B, "\\u000B")]
+    [InlineData(0x000C, "\\u000C")]
+    [InlineData(0x001B, "\\u001B")]
+    [InlineData(0x001F, "\\u001F")]
+    [InlineData(0x007F, "\\u007F")]
+    [InlineData(0x0085, "\\u0085")]
+    [InlineData(0x009F, "\\u009F")]
+    [InlineData(0x2028, "\\u2028")]
+    [InlineData(0x2029, "\\u2029")]
+    public void Format_ControlOrSeparatorChar_QuotedAndEscapedAsUppercaseHex(int codePoint, string expectedEscape)
+    {
+        Assert.Equal("\"" + expectedEscape + "\"", ValueOf(((char)codePoint).ToString()));
+    }
+
+    [Fact]
+    public void Format_EscSequence_CannotReachFileRaw()
+    {
+        string line = FormatOne("a\u001B[31mred\u001B[0m");
+
+        Assert.Equal(_prefix + "INFO  t.e k=\"a\\u001B[31mred\\u001B[0m\"", line);
+        Assert.DoesNotContain('\u001B', line);
+    }
+
+    [Fact]
+    public void Format_NonBreakingSpace_QuotedButNotEscaped()
+    {
+        Assert.Equal("\"a\u00A0b\"", ValueOf("a\u00A0b"));
+    }
+
+    [Fact]
+    public void Format_LiteralBackslashUText_IsNotAnEscape()
+    {
+        Assert.Equal("\"\\\\u001B\"", ValueOf("\\u001B"));
+        Assert.Equal("\\u001B", Unquote(ValueOf("\\u001B")));
+    }
+
+    [Fact]
+    public void Format_EveryNonSurrogateChar_NoRawControlOrSeparatorAndRoundTrips()
+    {
+        for (int cp = 0; cp <= 0xFFFF; cp++)
+        {
+            char c = (char)cp;
+            if (char.IsSurrogate(c))
+            {
+                continue;
+            }
+
+            string line = FormatOne(c.ToString());
+            string value = line.Substring(_prefix.Length + "INFO  t.e k=".Length);
+
+            foreach (char o in line)
+            {
+                Assert.False(
+                    char.IsControl(o) || o == '\u2028' || o == '\u2029',
+                    "raw U+" + ((int)o).ToString("X4", CultureInfo.InvariantCulture) + " for input U+" + cp.ToString("X4", CultureInfo.InvariantCulture));
+            }
+
+            Assert.Equal(c.ToString(), Unquote(value));
+        }
+    }
+
+    [Theory]
+    [InlineData("a\tb\u001Bc\0d")]
+    [InlineData("\u0085\u2028\u2029\v\f\u007F")]
+    [InlineData("x\u001B[2Jy")]
+    [InlineData("\\u001B")]
+    [InlineData("\u2028=\"\\")]
+    public void Format_ControlValueRoundTripsThroughReferenceDecoder(string value)
+    {
+        Assert.Equal(value, Unquote(ValueOf(value)));
+    }
+
+    // ---- card 32: per-value cap ----
+
+    [Fact]
+    public void MaxValueLength_Is256()
+    {
+        Assert.Equal(256, LogLine.MaxValueLength);
+    }
+
+    [Fact]
+    public void Format_Unquoted256_NotTruncated()
+    {
+        string value = new('a', 256);
+
+        Assert.Equal(value, ValueOf(value));
+    }
+
+    [Fact]
+    public void Format_Unquoted257_TruncatedWithMarkerPlusOne()
+    {
+        Assert.Equal(new string('a', 256) + _ellipsis + "(+1)", ValueOf(new string('a', 257)));
+    }
+
+    [Fact]
+    public void Format_UnquotedHuge_MarkerCountsCutChars_AndStaysOneToken()
+    {
+        string value = ValueOf(new string('a', 1000));
+
+        Assert.Equal(new string('a', 256) + _ellipsis + "(+744)", value);
+        Assert.DoesNotContain(' ', value);
+        Assert.Equal(value, Unquote(value));
+    }
+
+    [Fact]
+    public void Format_Quoted256_NotTruncated_AndQuotesNotCounted()
+    {
+        string value = "a " + new string('b', 254);
+
+        Assert.Equal("\"" + value + "\"", ValueOf(value));
+    }
+
+    [Fact]
+    public void Format_Quoted257_MarkerInsideQuotes()
+    {
+        string value = "a " + new string('b', 255);
+
+        Assert.Equal("\"a " + new string('b', 254) + _ellipsis + "(+1)\"", ValueOf(value));
+    }
+
+    [Fact]
+    public void Format_EmptyAndShort_NeverTruncated()
+    {
+        Assert.Equal("\"\"", ValueOf(string.Empty));
+        Assert.Equal("a", ValueOf("a"));
+    }
+
+    [Fact]
+    public void Format_CapAppliedAfterEscaping_NewlinesCountTwo()
+    {
+        string value = ValueOf(new string('\n', 300));
+
+        Assert.Equal("\"" + string.Concat(Enumerable.Repeat("\\n", 128)) + _ellipsis + "(+172)\"", value);
+    }
+
+    [Theory]
+    [InlineData('\\', "\\\\")]
+    [InlineData('"', "\\\"")]
+    [InlineData('\n', "\\n")]
+    [InlineData('\r', "\\r")]
+    public void Format_TwoCharEscapeStraddlingBoundary_IsNotSplit(char c, string escaped)
+    {
+        // 255 kept + a 2-char escape would be 257: the escape is cut whole.
+        string cut = ValueOf(new string('a', 255) + c);
+        string fits = ValueOf(new string('a', 254) + c);
+
+        Assert.Equal("\"" + new string('a', 255) + _ellipsis + "(+1)\"", cut);
+        Assert.Equal("\"" + new string('a', 254) + escaped + "\"", fits);
+    }
+
+    [Fact]
+    public void Format_UnicodeEscapeStraddlingBoundary_IsNotSplit()
+    {
+        string cut = ValueOf(new string('a', 251) + "\u001B");
+        string fits = ValueOf(new string('a', 250) + "\u001B");
+
+        Assert.Equal("\"" + new string('a', 251) + _ellipsis + "(+1)\"", cut);
+        Assert.Equal("\"" + new string('a', 250) + "\\u001B\"", fits);
+    }
+
+    [Fact]
+    public void Format_SurrogatePairStraddlingBoundary_IsNotSplit()
+    {
+        string pair = "\U0001F600";
+        string cut = ValueOf(new string('a', 255) + pair);
+        string fits = ValueOf(new string('a', 254) + pair);
+
+        Assert.Equal(new string('a', 255) + _ellipsis + "(+2)", cut);
+        Assert.Equal(new string('a', 254) + pair, fits);
+    }
+
+    [Fact]
+    public void Format_TruncatedQuotedValue_StaysSingleLineAndFollowingFieldIntact()
+    {
+        string line = LogLine.Format(
+            _at,
+            LogLevel.Info,
+            "t.e",
+            new KeyValuePair<string, object?>[] { new("k", "x \" = \\ " + new string('z', 400)), new("n", 1) });
+
+        Assert.Single(line.Split('\n'));
+        Assert.EndsWith(_ellipsis + "(+154)\" n=1", line);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(255)]
+    [InlineData(256)]
+    public void Format_RoundTripUpToCap(int length)
+    {
+        string value = new string('q', length - (length > 0 ? 1 : 0)) + (length > 0 ? " " : string.Empty);
+
+        Assert.Equal(value, Unquote(ValueOf(value)));
+    }
+
+    private sealed class TextObject
+    {
+        private readonly string _text;
+
+        public TextObject(string text)
+        {
+            _text = text;
+        }
+
+        public override string ToString() => _text;
+    }
+
     private static string FormatOne(object? value) =>
         LogLine.Format(_at, LogLevel.Info, "t.e", new[] { new KeyValuePair<string, object?>("k", value) });
 
@@ -506,6 +748,15 @@ public sealed class LogLineTests
 
             i++;
             Assert.True(i < token.Length - 1, "dangling backslash: " + token);
+            if (token[i] == 'u')
+            {
+                Assert.True(i + 4 < token.Length, "short unicode escape: " + token);
+                string hex = token.Substring(i + 1, 4);
+                Assert.Matches("^[0-9A-F]{4}$", hex);
+                sb.Append((char)int.Parse(hex, NumberStyles.HexNumber, CultureInfo.InvariantCulture));
+                i += 4;
+                continue;
+            }
             sb.Append(token[i] switch
             {
                 '\\' => '\\',
