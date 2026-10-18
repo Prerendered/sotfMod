@@ -1,0 +1,26 @@
+# build output
+bin/
+obj/
+TestResults/
+*.binlog
+
+# machine-local overrides
+Directory.Build.local.props
+*.user
+*.suo
+.vs/
+.idea/
+.vscode/
+launchSettings.json
+
+# game-derived and third-party binaries: never committed, always referenced from GamePath
+*.dll
+*.pdb
+*.exe
+BepInEx/
+interop/
+libs/
+
+# scratch
+*.log
+*.tmp

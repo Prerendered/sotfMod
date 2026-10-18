@@ -1,0 +1,29 @@
+<Project>
+  <!-- Shared defaults for every project in the monorepo. Machine-specific values go in
+       Directory.Build.local.props (git-ignored), imported last so it wins. -->
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Deterministic>true</Deterministic>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <!-- IDE0005 (unused usings) only runs on build when the doc file is generated; CS1591 would then
+         demand an XML comment on every public member, which the file headers already cover. -->
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <IsPackable>false</IsPackable>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+
+    <!-- Plugin projects set this to true; Directory.Build.targets then adds the BepInEx and
+         interop references and the post-build copy. Core and test projects never do. -->
+    <IsBepInExPlugin>false</IsBepInExPlugin>
+
+    <!-- Default Steam install location. Override in Directory.Build.local.props, never here. -->
+    <GamePath>C:\Program Files (x86)\Steam\steamapps\common\Sons Of The Forest</GamePath>
+  </PropertyGroup>
+
+  <Import Project="$(MSBuildThisFileDirectory)Directory.Build.local.props"
+          Condition="Exists('$(MSBuildThisFileDirectory)Directory.Build.local.props')" />
+</Project>

@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- The BepInEx plugin. Builds only on a machine with the game, BepInEx and a generated
+       BepInEx/interop folder (Directory.Build.targets adds those references and the deploy step). -->
+  <PropertyGroup>
+    <RootNamespace>ShelfTransfer.Plugin</RootNamespace>
+    <AssemblyName>ShelfTransfer</AssemblyName>
+    <Version>0.1.0</Version>
+    <IsBepInExPlugin>true</IsBepInExPlugin>
+    <PluginFolderName>ShelfTransfer</PluginFolderName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ShelfTransfer.Core\ShelfTransfer.Core.csproj" />
+  </ItemGroup>
+</Project>
