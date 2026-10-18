@@ -248,18 +248,37 @@ public sealed class TransferRunner
 
         if (!areShelvesAlive)
         {
-            EndWait(itemNumber, step, false);
             Finish(StopReason.ShelfGone, $"shelf gone during {step} wait");
             return;
         }
 
         bool isCycleDone = State == TransferState.TakenAwaitingVerify
-            ? VerifyTake(itemNumber) && TryStore(itemNumber)
+            ? VerifyTake(itemNumber) && IsTargetUnchangedSinceCycleStart() && TryStore(itemNumber)
             : VerifyStore(itemNumber);
         if (isCycleDone)
         {
             CompleteCycle(itemNumber);
         }
+    }
+
+    // The target was last read at cycle start, ticks ago; drift during the take wait must stop before StoreOne, or an
+    // outside change would surface as a false store mismatch or mask an unapplied store (F2, I3).
+    // IsAlive(dst) was checked at the top of this same tick.
+    private bool IsTargetUnchangedSinceCycleStart()
+    {
+        int expectedTarget = _targetStart + Moved;
+        int target = _gateway.GetCount(_request.Target, _request.Item);
+        if (IsFinished)
+        {
+            return false;
+        }
+
+        if (target != expectedTarget)
+        {
+            Finish(StopReason.TargetMismatch, $"target changed during take wait: expected {expectedTarget} read {target}");
+        }
+
+        return !IsFinished;
     }
 
     private void CompleteCycle(int itemNumber)
@@ -336,15 +355,16 @@ public sealed class TransferRunner
             return false;
         }
 
+        string waitNote = GetNoConfirmNote(sourceAfter == sourceBefore && inventoryAfter == inventoryBefore);
         EndWait(itemNumber, "take", isVerified);
         LogStep("transfer.take", itemNumber, "src", sourceBefore, sourceAfter, inventoryBefore, inventoryAfter, isVerified);
         if (!isSourceVerified)
         {
-            Finish(StopReason.SourceMismatch, $"take: source expected {sourceBefore - 1} read {sourceAfter}");
+            Finish(StopReason.SourceMismatch, $"take: source expected {sourceBefore - 1} read {sourceAfter}{waitNote}");
         }
         else if (!isInventoryVerified)
         {
-            Finish(StopReason.InventoryMismatch, $"take: inventory expected {inventoryBefore + 1} read {inventoryAfter}");
+            Finish(StopReason.InventoryMismatch, $"take: inventory expected {inventoryBefore + 1} read {inventoryAfter}{waitNote}");
         }
 
         return !IsFinished;
@@ -397,6 +417,7 @@ public sealed class TransferRunner
         }
 
         _hasStoreVerdict = true;
+        string waitNote = GetNoConfirmNote(targetAfter == targetBefore && inventoryAfter == inventoryBefore + 1);
         EndWait(itemNumber, "store", isVerified);
         LogStep("transfer.store", itemNumber, "dst", targetBefore, targetAfter, inventoryBefore + 1, inventoryAfter, isVerified);
         if (isVerified)
@@ -407,11 +428,11 @@ public sealed class TransferRunner
         LogStoreMismatch(itemNumber, targetBefore, targetAfter, inventoryBefore + 1, inventoryAfter);
         if (!isTargetVerified)
         {
-            Finish(StopReason.TargetMismatch, $"store: target expected {targetBefore + 1} read {targetAfter}");
+            Finish(StopReason.TargetMismatch, $"store: target expected {targetBefore + 1} read {targetAfter}{waitNote}");
         }
         else
         {
-            Finish(StopReason.InventoryMismatch, $"store: inventory expected {inventoryBefore} read {inventoryAfter}");
+            Finish(StopReason.InventoryMismatch, $"store: inventory expected {inventoryBefore} read {inventoryAfter}{waitNote}");
         }
 
         return false;
@@ -431,6 +452,10 @@ public sealed class TransferRunner
         _isAwaitingConfirm = true;
         return true;
     }
+
+    // Nothing moved by the timeout; says so, so a host apply that lands after the stop is explainable from the log.
+    private string GetNoConfirmNote(bool isUnmoved) =>
+        _isAwaitingConfirm && isUnmoved ? $"; no host confirm after {_waitTicks} ticks" : "";
 
     private void EndWait(int itemNumber, string step, bool isVerified)
     {
@@ -462,6 +487,9 @@ public sealed class TransferRunner
         // Marked first so a re-entrant Abort during the re-reads below is a no-op; the first stop wins.
         TransferState stoppedIn = State;
         State = TransferState.Finished;
+
+        // A stop mid-wait (Abort after a throw or disconnect, a re-entrant stop, shelf gone) still records the wait.
+        EndWait(Moved + 1, stoppedIn == TransferState.TakenAwaitingVerify ? "take" : "store", false);
 
         bool isItemOffSource = stoppedIn is TransferState.TakenAwaitingVerify or TransferState.StoredAwaitingVerify;
         bool isStoreUnsettled = stoppedIn == TransferState.StoredAwaitingVerify && !_hasStoreVerdict;
