@@ -103,8 +103,10 @@ public sealed class FileModLog : IModLog
         try
         {
             // FileShare.ReadWrite so the log can be opened in an editor while the game runs. OpenOrCreate rather
-            // than Append, because an Append stream cannot be truncated.
-            stream = new(path, isAppend ? FileMode.OpenOrCreate : FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
+            // than Append, because an Append stream cannot be truncated. Read access only to check the last byte.
+            stream = isAppend
+                ? new(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.ReadWrite)
+                : new(path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
             if (!isAppend)
             {
                 action = "create";
@@ -114,7 +116,7 @@ public sealed class FileModLog : IModLog
             existingBytes = stream.Length;
             if (_sizeCap.IsAppendAllowed(existingBytes))
             {
-                stream.Seek(0, SeekOrigin.End);
+                TerminateLastLine(stream);
                 action = "append";
             }
             else
@@ -132,6 +134,23 @@ public sealed class FileModLog : IModLog
             action = "fallback";
             _fallback.LogError($"mod log unavailable, using BepInEx log only: {ex.GetType().Name}: {ex.Message}");
             return null;
+        }
+    }
+
+    // A crash can leave the last line unterminated, and the first new line would join it. The one LF goes straight
+    // to the stream, outside the session budget. Leaves the position at the end of the file.
+    private static void TerminateLastLine(FileStream stream)
+    {
+        if (stream.Length == 0)
+        {
+            stream.Seek(0, SeekOrigin.End);
+            return;
+        }
+
+        stream.Seek(-1, SeekOrigin.End);
+        if (stream.ReadByte() != '\n')
+        {
+            stream.WriteByte((byte)'\n');
         }
     }
 
