@@ -1,10 +1,12 @@
 // purpose: the label file on disk, <dir>/<worldId>.json via System.Text.Json, written temp-then-move (F3, invariant 5)
-// owns:    JsonLabelFileSystem, JsonLabelFileSystem.MaxFileBytes
+// owns:    JsonLabelFileSystem, JsonLabelFileSystem.MaxFileBytes, JsonLabelFileSystem.MaxBadCopies
 // deps:    ILabelFileSystem, LabelFile, WorldId, IModLog
 // caution: P4 catch site: every disk or JSON step runs through Guard once, never from inside another guarded step.
 //          Corrupt is returned only once a .bad with the same content exists (new copy, or an identical one already
 //          there, so a still-corrupt file is not copied again each launch); if neither, Failed keeps Save blocked.
 //          Exception text is reduced to type + path-stripped message before it reaches Detail or the log.
+//          A prune failure after that still returns Corrupt (logged step=bad_prune); the copy it made is never pruned.
+//          A link (reparse point) at <id>.json.tmp or at the chosen .bad name is refused (Failed), never written through.
 //          Main thread only: concurrent Read/Write for one world is unsupported (both share <id>.json.tmp).
 
 using System;
@@ -23,6 +25,9 @@ public sealed class JsonLabelFileSystem : ILabelFileSystem
 {
     /// <summary>A larger file is never deserialised; it is treated as Corrupt (and preserved as .bad).</summary>
     public const long MaxFileBytes = 1024 * 1024;
+
+    /// <summary>.bad copies kept per world, newest by the stamp in the name; older ones are pruned on each new copy.</summary>
+    public const int MaxBadCopies = 5;
 
     private const string _readEvent = "labels.read";
     private const string _writeEvent = "labels.write";
@@ -43,6 +48,12 @@ public sealed class JsonLabelFileSystem : ILabelFileSystem
     private static readonly string _shelvesProperty = JsonNamingPolicy.CamelCase.ConvertName(nameof(LabelFile.Shelves));
     private static readonly byte[] _utf8Bom = { 0xEF, 0xBB, 0xBF };
     private static readonly char[] _separators = { '\\', '/' };
+
+    // Only names this class writes; the enumeration pattern alone also matches 8.3 short names and other suffixes.
+    private static readonly Regex _badCopyName = new(
+        "^(?<world>[A-Za-z0-9_-]+)" + Regex.Escape(_extension) + @"\.(?<stamp>[0-9]{8}T[0-9]{6}Z)(?:-(?<n>[0-9]{1,9}))?"
+            + Regex.Escape(_badSuffix) + "$",
+        RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
 
     // IO messages quote the full path ('C:\Users\<name>\...'); the username must not reach the log or Detail.
     private static readonly Regex _quotedPath = new(@"'(?:[A-Za-z]:[\\/]|\\\\|/)[^']+'", RegexOptions.CultureInvariant);
@@ -146,7 +157,15 @@ public sealed class JsonLabelFileSystem : ILabelFileSystem
 
         string path = GetPath(worldId);
         string tempPath = path + _tempSuffix;
-        Exception? writeError = Guard(() => WriteAtomically(json, tempPath, path));
+        bool isRefused = false;
+        Exception? writeError = Guard(() => isRefused = !TryWriteAtomically(json, tempPath, path));
+        if (isRefused)
+        {
+            // The link is left in place: removing it is the user's call, and Save stays failed until then.
+            LogEvent(LogLevel.Error, _writeEvent, worldId, count, Field("reason", "reparse_point"), Field("step", "write"));
+            return LabelWriteResult.Failed("temp file is a link (reparse point); refused");
+        }
+
         if (writeError is null)
         {
             LogEvent(LogLevel.Info, _writeEvent, worldId, count);
@@ -237,21 +256,47 @@ public sealed class JsonLabelFileSystem : ILabelFileSystem
         }
     }
 
+    // Attributes describe the link itself, not its target; (FileAttributes)(-1) means nothing is there.
+    private static bool IsReparsePoint(string path)
+    {
+        FileAttributes attributes = new FileInfo(path).Attributes;
+        return (int)attributes != -1 && attributes.HasFlag(FileAttributes.ReparsePoint);
+    }
+
+    private static int CompareNewestFirst(BadEntry left, BadEntry right)
+    {
+        int byStamp = string.CompareOrdinal(right.Stamp, left.Stamp);
+        return byStamp != 0 ? byStamp : right.Sequence.CompareTo(left.Sequence);
+    }
+
+    private static string BuildBadPath(string stem, int sequence) =>
+        sequence == 1 ? stem + _badSuffix : $"{stem}-{sequence}{_badSuffix}";
+
     private static KeyValuePair<string, object?> Field(string key, object? value) => new(key, value);
 
     private string GetPath(string worldId) => Path.Combine(_directory, worldId + _extension);
 
-    // The temp file sits beside the target so the move is a same-volume rename, never a copy.
-    private void WriteAtomically(byte[] json, string tempPath, string path)
+    // The temp file sits beside the target so the move is a same-volume rename, never a copy. The rename replaces a
+    // link at <id>.json rather than writing through it. False = refused before anything was written.
+    private bool TryWriteAtomically(byte[] json, string tempPath, string path)
     {
         Directory.CreateDirectory(_directory);
-        using (var stream = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
+        if (IsReparsePoint(tempPath))
+        {
+            return false;
+        }
+
+        // Delete + CreateNew, not Create: a stale hard link is unlinked instead of written through, and a link
+        // planted after the check makes the open fail rather than follow it.
+        DeleteIfPresent(tempPath);
+        using (var stream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
         {
             stream.Write(json, 0, json.Length);
             stream.Flush(flushToDisk: true);
         }
 
         File.Move(tempPath, path, overwrite: true);
+        return true;
     }
 
     private LabelReadResult AcceptRead(string worldId, LabelFile file)
@@ -281,13 +326,34 @@ public sealed class JsonLabelFileSystem : ILabelFileSystem
     }
 
     // At Read time, never deferred: LabelStore allows Save after Corrupt, which would overwrite the only copy.
+    // Pruning shares the bad_copy step but runs after bad is set, so its failure cannot hide a copy that exists.
     private LabelReadResult PreserveCorrupt(string worldId, string path, string detail)
     {
         BadCopy? bad = null;
-        Exception? copyError = Guard(() => bad = PreserveAsBad(path, worldId));
-        if (copyError is not null || bad is null)
+        var pruned = new List<string>();
+        Exception? copyError = Guard(() =>
+        {
+            List<BadEntry> copies = ListBadCopies(worldId);
+            bad = PreserveAsBad(path, worldId, copies);
+            if (bad is { IsExisting: false })
+            {
+                PruneBadCopies(copies, pruned);
+            }
+        });
+        if (bad is null && copyError is null)
+        {
+            LogEvent(LogLevel.Error, _readEvent, worldId, 0, Field("reason", "reparse_point"), Field("step", "bad_copy"));
+            return LabelReadResult.Failed("bad copy target is a link (reparse point); refused");
+        }
+
+        if (bad is null)
         {
             return FailRead(worldId, copyError, "bad_copy");
+        }
+
+        if (copyError is not null)
+        {
+            LogError(_readEvent, worldId, copyError, "bad_prune");
         }
 
         LogEvent(
@@ -298,7 +364,8 @@ public sealed class JsonLabelFileSystem : ILabelFileSystem
             Field("reason", "corrupt"),
             Field("detail", detail),
             Field("bad", bad.Name),
-            Field("bad_copy", bad.IsExisting ? "existing" : "new"));
+            Field("bad_copy", bad.IsExisting ? "existing" : "new"),
+            Field("bad_pruned", pruned.Count));
         return LabelReadResult.Corrupt(detail);
     }
 
@@ -309,48 +376,103 @@ public sealed class JsonLabelFileSystem : ILabelFileSystem
         return sha.ComputeHash(stream);
     }
 
-    private BadCopy PreserveAsBad(string path, string worldId)
+    // Only the newest MaxBadCopies are compared, length before hash, so the cost per corrupt launch stays bounded.
+    private static string? FindIdenticalBad(string path, IReadOnlyList<BadEntry> copies)
     {
-        string? existing = FindIdenticalBad(path, worldId);
-        return existing is null ? new BadCopy(CopyToBad(path, worldId), false) : new BadCopy(existing, true);
-    }
-
-    // Length first, so the corrupt file is hashed only when a same-size copy exists.
-    private string? FindIdenticalBad(string path, string worldId)
-    {
-        string prefix = worldId + _extension + ".";
         long length = new FileInfo(path).Length;
         byte[]? hash = null;
-        foreach (string candidate in Directory.EnumerateFiles(_directory, prefix + "*" + _badSuffix))
+        for (int i = 0; i < copies.Count && i < MaxBadCopies; i++)
         {
-            // The pattern alone can also match 8.3 short names and longer extensions on Windows.
-            string name = Path.GetFileName(candidate);
-            bool isBadCopy = name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
-                && name.EndsWith(_badSuffix, StringComparison.OrdinalIgnoreCase);
-            if (!isBadCopy || new FileInfo(candidate).Length != length)
+            FileInfo candidate = copies[i].File;
+            if (candidate.Length != length)
             {
                 continue;
             }
 
             hash ??= HashFile(path);
-            if (HashFile(candidate).AsSpan().SequenceEqual(hash))
+            if (HashFile(candidate.FullName).AsSpan().SequenceEqual(hash))
             {
-                return name;
+                return candidate.Name;
             }
         }
 
         return null;
     }
 
+    // copies was listed before the new copy existed, so the new one is never among those deleted.
+    private static void PruneBadCopies(IReadOnlyList<BadEntry> copies, List<string> pruned)
+    {
+        for (int i = MaxBadCopies - 1; i < copies.Count; i++)
+        {
+            copies[i].File.Delete();
+            pruned.Add(copies[i].File.Name);
+        }
+    }
+
+    // Null = refused: the free .bad name is a link.
+    private BadCopy? PreserveAsBad(string path, string worldId, IReadOnlyList<BadEntry> copies)
+    {
+        string? existing = FindIdenticalBad(path, copies);
+        if (existing is not null)
+        {
+            return new BadCopy(existing, true);
+        }
+
+        string? created = CopyToBad(path, worldId, copies);
+        return created is null ? null : new BadCopy(created, false);
+    }
+
+    // Newest first by the stamp in the name. Links are left out so no hash reads, and no prune deletes, through to a
+    // file outside the folder.
+    private List<BadEntry> ListBadCopies(string worldId)
+    {
+        var copies = new List<BadEntry>();
+        string pattern = worldId + _extension + ".*" + _badSuffix;
+        foreach (FileInfo file in new DirectoryInfo(_directory).EnumerateFiles(pattern))
+        {
+            Match match = _badCopyName.Match(file.Name);
+            bool isOwnCopy = match.Success
+                && string.Equals(match.Groups["world"].Value, worldId, StringComparison.OrdinalIgnoreCase)
+                && !file.Attributes.HasFlag(FileAttributes.ReparsePoint);
+            if (!isOwnCopy)
+            {
+                continue;
+            }
+
+            Group sequence = match.Groups["n"];
+            int number = sequence.Success ? int.Parse(sequence.Value, NumberStyles.None, CultureInfo.InvariantCulture) : 1;
+            copies.Add(new BadEntry(file, match.Groups["stamp"].Value, number));
+        }
+
+        copies.Sort(CompareNewestFirst);
+        return copies;
+    }
+
     // No-clobber: a same-second name gets -2, -3, ...; File.Copy without overwrite still refuses a racing file.
-    private string CopyToBad(string path, string worldId)
+    // The suffix starts above the highest one already used for this stamp, so the new copy ranks newest and a name
+    // freed by a prune is never reused. File.Exists is false for a junction, so the chosen name is checked last.
+    private string? CopyToBad(string path, string worldId, IReadOnlyList<BadEntry> copies)
     {
         string stamp = DateTime.UtcNow.ToString(_badStampFormat, CultureInfo.InvariantCulture);
         string stem = Path.Combine(_directory, $"{worldId}{_extension}.{stamp}");
-        string badPath = stem + _badSuffix;
-        for (int suffix = 2; File.Exists(badPath); suffix++)
+        int sequence = 1;
+        foreach (BadEntry copy in copies)
         {
-            badPath = $"{stem}-{suffix}{_badSuffix}";
+            if (string.Equals(copy.Stamp, stamp, StringComparison.OrdinalIgnoreCase))
+            {
+                sequence = Math.Max(sequence, copy.Sequence + 1);
+            }
+        }
+
+        string badPath = BuildBadPath(stem, sequence);
+        while (File.Exists(badPath))
+        {
+            badPath = BuildBadPath(stem, ++sequence);
+        }
+
+        if (IsReparsePoint(badPath))
+        {
+            return null;
         }
 
         File.Copy(path, badPath, overwrite: false);
@@ -426,4 +548,6 @@ public sealed class JsonLabelFileSystem : ILabelFileSystem
     private sealed record ParsedFile(LabelFile? File, string? Problem);
 
     private sealed record BadCopy(string Name, bool IsExisting);
+
+    private sealed record BadEntry(FileInfo File, string Stamp, int Sequence);
 }
