@@ -1,6 +1,6 @@
-// purpose: resolves the aimed shelf slot (shelf, hook index, item, count) every frame and logs aim.change on change
+// purpose: resolves the aimed shelf slot (shelf, hook index, item, count) every frame and logs aim.change once it settles
 // owns:    AimWatcher
-// deps:    ShelfRegistry, AimTarget, IModLog, UnityEngine (Camera, Physics), Sons.Gameplay / Sons.Inventory (interop)
+// deps:    ShelfRegistry, AimTarget, AimChangeDebouncer, IModLog, UnityEngine (Camera, Physics), Sons.Gameplay / Sons.Inventory (interop)
 // caution: read-only (I2): field reads plus the getters GetCurrentCount, GetItemCount, StorageSlotIndex; no Harmony patch.
 //          Il2Cpp objects live in locals of one Update; only managed values (ints, the key string) survive a frame
 
@@ -39,7 +39,7 @@ public sealed class AimWatcher : MonoBehaviour
     private ShelfRegistry? _registry;
     private bool _isHalted;
     private bool _hasListedShelves;
-    private AimState? _lastState;
+    private readonly AimChangeDebouncer _debouncer = new();
 
     // Key cache: GetShelfKey formats a string, so it is rebuilt only when the aimed controller or its position changes.
     private int _cachedControllerId;
@@ -145,14 +145,11 @@ public sealed class AimWatcher : MonoBehaviour
         int slot = storage.StorageSlotIndex;
         ShelfRef shelf = GetShelf(controller);
         _current = new AimTarget(shelf, new SlotRef(slot), new ItemId(item), count);
-
-        AimState state = new(shelf.Key, slot, item, count, null);
-        if (state == _lastState)
+        if (!_debouncer.ShouldLog(_current, Time.unscaledTimeAsDouble))
         {
             return;
         }
 
-        _lastState = state;
         WriteTargetChange(log, shelf, slot, item, count, group._maxAmount, controller, storage);
         if (!_hasListedShelves)
         {
@@ -166,13 +163,12 @@ public sealed class AimWatcher : MonoBehaviour
     private void SetNoTarget(IModLog log, string reason)
     {
         _current = null;
-        AimState state = new(null, 0, 0, 0, reason);
-        if (state == _lastState)
+        // All reasons are one no-target state; the reason logged is the one current when that state settles.
+        if (!_debouncer.ShouldLog(null, Time.unscaledTimeAsDouble))
         {
             return;
         }
 
-        _lastState = state;
         log.Write(LogLevel.Info, "aim.change", new KeyValuePair<string, object?>[]
         {
             new("shelf", _noShelf),
@@ -290,7 +286,4 @@ public sealed class AimWatcher : MonoBehaviour
         Component? found = component.GetComponent(Il2CppType.Of<T>());
         return found == null ? null : found.TryCast<T>();
     }
-
-    // Debounce key: a line is written only when one of these changes (a count change while aiming counts).
-    private readonly record struct AimState(string? ShelfKey, int Slot, int Item, int Count, string? Reason);
 }
