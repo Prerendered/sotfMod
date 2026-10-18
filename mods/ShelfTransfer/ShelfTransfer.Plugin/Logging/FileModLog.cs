@@ -2,7 +2,8 @@
 // owns:    FileModLog
 // deps:    ShelfTransfer.Core.Logging (IModLog, LogLine, LogLevel, LogSizeCap), BepInEx ManualLogSource (fallback)
 // caution: never throws into the game; any failure goes to the BepInEx log instead. Past LogSizeCap.MaxSessionBytes
-//          one log.cap line goes to the active sink (file or BepInEx fallback) and later events are dropped
+//          one log.cap line goes to the active sink (file or BepInEx fallback) and later events are dropped. When the
+//          .prev rename fails the file is appended to, or truncated first once it already holds a full session budget
 
 using System;
 using System.Collections.Generic;
@@ -35,12 +36,15 @@ public sealed class FileModLog : IModLog
         string? rotationError = RotatePrevious(directory, current);
 
         // A failed rotation appends to last run's file rather than losing file logging for the session.
-        _writer = OpenWriter(current, isAppend: rotationError is not null);
+        _writer = OpenWriter(current, isAppend: rotationError is not null, out string action, out long existingBytes);
         if (rotationError is not null)
         {
             Write(LogLevel.Warn, "log.rotate", new KeyValuePair<string, object?>[]
             {
                 new("outcome", "failed"),
+                new("action", action),
+                new("existing_bytes", existingBytes),
+                new("limit_bytes", LogSizeCap.MaxSessionBytes),
                 new("error", rotationError),
             });
         }
@@ -90,16 +94,42 @@ public sealed class FileModLog : IModLog
         }
     }
 
-    private StreamWriter? OpenWriter(string path, bool isAppend)
+    // action: "create" after a rotation, "append" or "truncate" when appending, "fallback" when no file could be opened.
+    private StreamWriter? OpenWriter(string path, bool isAppend, out string action, out long existingBytes)
     {
+        action = "fallback";
+        existingBytes = 0;
+        FileStream? stream = null;
         try
         {
-            // FileShare.ReadWrite so the log can be opened in an editor while the game runs.
-            FileStream stream = new(path, isAppend ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
+            // FileShare.ReadWrite so the log can be opened in an editor while the game runs. OpenOrCreate rather
+            // than Append, because an Append stream cannot be truncated.
+            stream = new(path, isAppend ? FileMode.OpenOrCreate : FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
+            if (!isAppend)
+            {
+                action = "create";
+                return new StreamWriter(stream, _encoding);
+            }
+
+            existingBytes = stream.Length;
+            if (_sizeCap.IsAppendAllowed(existingBytes))
+            {
+                stream.Seek(0, SeekOrigin.End);
+                action = "append";
+            }
+            else
+            {
+                // Without this bound a persistently locked .prev.log lets every session add a full budget.
+                stream.SetLength(0);
+                action = "truncate";
+            }
+
             return new StreamWriter(stream, _encoding);
         }
         catch (Exception ex)
         {
+            stream?.Dispose();
+            action = "fallback";
             _fallback.LogError($"mod log unavailable, using BepInEx log only: {ex.GetType().Name}: {ex.Message}");
             return null;
         }

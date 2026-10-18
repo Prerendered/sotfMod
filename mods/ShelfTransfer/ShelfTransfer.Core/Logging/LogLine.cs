@@ -1,8 +1,9 @@
 // purpose: pure formatter for the D5 mod log line format, so the format is unit-testable without a file
-// owns:    LogLine.Format, LogLine.FormatException, LogLine.MaxValueLength
+// owns:    LogLine.Format, LogLine.FormatException, LogLine.MaxValueLength, LogLine.MaxFrameLength
 // deps:    LogLevel
-// caution: quoted values escape \ " LF CR as \\ \" \n \r and other control or line-separator chars as \uXXXX, so user
-//          text (labels) cannot forge a field, break a line or drive a terminal; each value is capped at MaxValueLength
+// caution: values and stack frames escape \ " LF CR as \\ \" \n \r and control, line-separator, Format-category and
+//          lone-surrogate chars as \uXXXX, so user text (labels) cannot forge a field or line, drive a terminal,
+//          reorder text in a viewer or decay to U+FFFD; values are capped at MaxValueLength, frames at MaxFrameLength
 
 using System;
 using System.Collections.Generic;
@@ -16,11 +17,15 @@ public static class LogLine
     /// <summary>Escaped characters of one value kept before the truncation marker; the quotes are not counted.</summary>
     public const int MaxValueLength = 256;
 
+    /// <summary>Escaped characters of one stack frame kept before the truncation marker; the indent is not counted.</summary>
+    public const int MaxFrameLength = 512;
+
     private const string _nullLiteral = "null";
     private const string _truncationMarkerStart = "\u2026(+";
     private const string _timestampFormat = "yyyy-MM-dd'T'HH:mm:ss.fffzzz";
     private const string _stackIndent = "    ";
     private const int _levelWidth = 5;
+    private const int _codePointEscapeLength = 6;
 
     public static string Format(
         DateTimeOffset timestamp,
@@ -59,13 +64,15 @@ public static class LogLine
         };
         StringBuilder text = new(Format(timestamp, LogLevel.Error, "error", fields));
 
+        // Frames are never quoted: the 4-space indent marks a continuation (event lines start with a digit),
+        // and escaping keeps every frame on its own line.
         string[] frames = (exception.StackTrace ?? string.Empty).Split('\n');
         foreach (string frame in frames)
         {
             string trimmed = frame.Trim();
             if (trimmed.Length > 0)
             {
-                text.Append('\n').Append(_stackIndent).Append(trimmed);
+                text.Append('\n').Append(_stackIndent).Append(EscapeAndTruncate(trimmed, MaxFrameLength));
             }
         }
 
@@ -115,10 +122,11 @@ public static class LogLine
 
         // Text "null" is quoted so a bare null always means a real null.
         bool isQuoted = raw == _nullLiteral || IsQuotingNeeded(raw);
-        string body = EscapeAndTruncate(raw);
+        string body = EscapeAndTruncate(raw, MaxValueLength);
         return isQuoted ? "\"" + body + "\"" : body;
     }
 
+    // Any char that escapes forces quoting, so an unquoted value passes through unchanged.
     private static bool IsQuotingNeeded(string raw)
     {
         if (raw.Length == 0)
@@ -126,43 +134,38 @@ public static class LogLine
             return true;
         }
 
-        foreach (char c in raw)
+        int index = 0;
+        while (index < raw.Length)
         {
-            if (char.IsWhiteSpace(c) || char.IsControl(c) || c == '=' || c == '"' || c == '\\')
+            char c = raw[index];
+            int unitCount = GetUnitCount(raw, index);
+            if (char.IsWhiteSpace(c) || c == '=' || GetEscapedLength(raw, index, unitCount) != unitCount)
             {
                 return true;
             }
+
+            index += unitCount;
         }
 
         return false;
     }
 
-    // Per-char mapping, so an escape is never re-escaped. An unquoted value holds no escapable char and
-    // passes through unchanged. Truncation stops before an escape or surrogate pair that would not fit
-    // whole, so the kept prefix always decodes; N counts the UTF-16 chars of the value that were cut.
-    private static string EscapeAndTruncate(string raw)
+    // Per-char mapping, so an escape is never re-escaped. Truncation stops before an escape or surrogate pair that
+    // would not fit whole, so the kept prefix always decodes; N counts the UTF-16 chars of the input that were cut.
+    private static string EscapeAndTruncate(string raw, int maxLength)
     {
-        StringBuilder body = new(Math.Min(raw.Length, MaxValueLength));
+        StringBuilder body = new(Math.Min(raw.Length, maxLength));
         int index = 0;
         while (index < raw.Length)
         {
-            bool isPair = IsSurrogatePairAt(raw, index);
-            int escapedLength = isPair ? 2 : GetEscapedLength(raw[index]);
-            if (body.Length + escapedLength > MaxValueLength)
+            int unitCount = GetUnitCount(raw, index);
+            if (body.Length + GetEscapedLength(raw, index, unitCount) > maxLength)
             {
                 break;
             }
 
-            if (isPair)
-            {
-                body.Append(raw, index, 2);
-                index += 2;
-            }
-            else
-            {
-                AppendEscaped(body, raw[index]);
-                index++;
-            }
+            AppendEscaped(body, raw, index, unitCount);
+            index += unitCount;
         }
 
         if (index < raw.Length)
@@ -175,21 +178,56 @@ public static class LogLine
         return body.ToString();
     }
 
-    private static bool IsSurrogatePairAt(string raw, int index) =>
-        index + 1 < raw.Length && char.IsHighSurrogate(raw[index]) && char.IsLowSurrogate(raw[index + 1]);
+    // A valid surrogate pair is one unit of 2 chars; a lone surrogate is a unit of 1.
+    private static int GetUnitCount(string raw, int index) =>
+        index + 1 < raw.Length && char.IsHighSurrogate(raw[index]) && char.IsLowSurrogate(raw[index + 1]) ? 2 : 1;
 
-    // U+0085 is already a control char; U+2028/U+2029 are not, but viewers split lines on all three.
-    private static bool IsEscapedAsCodePoint(char c) => char.IsControl(c) || c == '\u2028' || c == '\u2029';
+    // Supplementary Format chars (tag characters) hide text just like the BMP ones.
+    private static bool IsFormatPair(string raw, int index) =>
+        CharUnicodeInfo.GetUnicodeCategory(char.ConvertToUtf32(raw[index], raw[index + 1])) == UnicodeCategory.Format;
 
-    private static int GetEscapedLength(char c) => c switch
+    // U+0085 is already a control char; U+2028/U+2029 are not, but viewers split lines on all three. Format chars
+    // (bidi overrides and isolates, zero-width, BOM) reorder or hide text; a lone surrogate becomes U+FFFD in UTF-8.
+    private static bool IsEscapedAsCodePoint(char c) =>
+        char.IsControl(c)
+        || c == '\u2028'
+        || c == '\u2029'
+        || char.IsSurrogate(c)
+        || CharUnicodeInfo.GetUnicodeCategory(c) == UnicodeCategory.Format;
+
+    private static int GetEscapedLength(string raw, int index, int unitCount)
     {
-        '\\' or '"' or '\n' or '\r' => 2,
-        _ when IsEscapedAsCodePoint(c) => 6,
-        _ => 1,
-    };
+        if (unitCount == 2)
+        {
+            return IsFormatPair(raw, index) ? 2 * _codePointEscapeLength : 2;
+        }
 
-    private static void AppendEscaped(StringBuilder body, char c)
+        return raw[index] switch
+        {
+            '\\' or '"' or '\n' or '\r' => 2,
+            char c when IsEscapedAsCodePoint(c) => _codePointEscapeLength,
+            _ => 1,
+        };
+    }
+
+    private static void AppendEscaped(StringBuilder body, string raw, int index, int unitCount)
     {
+        if (unitCount == 2)
+        {
+            if (IsFormatPair(raw, index))
+            {
+                AppendCodePointEscape(body, raw[index]);
+                AppendCodePointEscape(body, raw[index + 1]);
+            }
+            else
+            {
+                body.Append(raw, index, 2);
+            }
+
+            return;
+        }
+
+        char c = raw[index];
         switch (c)
         {
             case '\\':
@@ -207,7 +245,7 @@ public static class LogLine
             default:
                 if (IsEscapedAsCodePoint(c))
                 {
-                    body.Append("\\u").Append(((int)c).ToString("X4", CultureInfo.InvariantCulture));
+                    AppendCodePointEscape(body, c);
                 }
                 else
                 {
@@ -217,4 +255,7 @@ public static class LogLine
                 break;
         }
     }
+
+    private static void AppendCodePointEscape(StringBuilder body, char c) =>
+        body.Append("\\u").Append(((int)c).ToString("X4", CultureInfo.InvariantCulture));
 }
