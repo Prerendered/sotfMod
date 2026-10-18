@@ -1,6 +1,6 @@
 // purpose: BepInEx entry point and composition root; opens the mod log, binds config, installs every feature
 // owns:    ShelfTransferPlugin
-// deps:    PluginInfo, ModConfig, FileModLog, TransferFeature, LabelsFeature, UiFeature, ShelfTransfer.Core (IModLog, ShelfKey — touched so the Core DLL is resolved at load)
+// deps:    PluginInfo, ModConfig, FileModLog, TransferFeature, LabelsFeature, UiFeature, DiscoveryDump, ShelfTransfer.Core (IModLog, ShelfKey; touched so the Core DLL is resolved at load)
 // caution: Load() runs before any scene; no UnityEngine object access here beyond AddComponent
 
 using System;
@@ -14,6 +14,7 @@ using BepInEx.Unity.IL2CPP;
 using ShelfTransfer.Core.Logging;
 using ShelfTransfer.Core.Shelves;
 using ShelfTransfer.Plugin.Config;
+using ShelfTransfer.Plugin.Discovery;
 using ShelfTransfer.Plugin.Labels;
 using ShelfTransfer.Plugin.Logging;
 using ShelfTransfer.Plugin.Runtime;
@@ -51,6 +52,9 @@ public sealed class ShelfTransferPlugin : BasePlugin
         TransferFeature.Install(modLog, config);
         LabelsFeature.Install(modLog, config);
         UiFeature.Install(modLog, config);
+
+        // Always added; Update reads Debug.DiscoveryEnabled each frame so a .cfg edit applies without a restart.
+        AddComponent<DiscoveryDump>().Init(modLog, config);
 
         RunErrorProbeIfRequested(logDirectory, modLog);
     }
