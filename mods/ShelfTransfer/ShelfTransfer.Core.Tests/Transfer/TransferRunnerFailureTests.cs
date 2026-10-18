@@ -28,7 +28,7 @@ public sealed class TransferRunnerFailureTests
         gateway.Add(_src, source);
         gateway.Add(_dst, target);
         FakeModLog log = new();
-        TransferRunner runner = new(gateway, log, new TransferRequest(_src, new SlotRef(null, null), _dst, _item, AmountClamp.All));
+        TransferRunner runner = new(gateway, log, new TransferRequest(_src, new SlotRef(null), _dst, _item, AmountClamp.All));
         return new Rig(gateway, log, runner, source);
     }
 
