@@ -1,4 +1,4 @@
-// purpose: the final accounting of a transfer; StrandedInInventory is the D4 disclosure (0 or 1, never more)
+// purpose: the final accounting of a transfer; StrandedInInventory is the D4 disclosure (0 up to one chunk, never more)
 // owns:    TransferReport
 // deps:    StopReason
 // caution: invariant 1 in numbers — Moved + Remaining + StrandedInInventory must equal the starting source count

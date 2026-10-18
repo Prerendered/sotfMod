@@ -373,6 +373,16 @@ public sealed class TransferCommand : MonoBehaviour
             return false;
         }
 
+        // The runner rounds to whole chunks itself; read here only so the player hears about it before the run.
+        int unit = gateway.GetTransferUnit(aim.Shelf, aim.Slot, aim.Item);
+        int planned = unit > 1 ? AmountClamp.RoundDownToChunk(amount, unit) : amount;
+        if (planned == 0)
+        {
+            output.Add(Block(log, gateway, aim, $"less than one chunk of {unit}", arguments,
+                $"Item {aim.Item.Value} moves in {unit}s; ask for at least {unit}."));
+            return false;
+        }
+
         TransferRequest request = new(aim.Shelf, aim.Slot, target, aim.Item, amount);
         if (!driver.TryStart(request, report => onFinished(StopReasonText.Format(report).Text)))
         {
@@ -380,7 +390,8 @@ public sealed class TransferCommand : MonoBehaviour
             return false;
         }
 
-        _runningText = $"Moving up to {amount} of item {aim.Item.Value} to #{index} {GetShelfName(target)}...";
+        string rounding = planned < amount ? $" ({amount} rounded down: item {aim.Item.Value} moves in {unit}s)" : "";
+        _runningText = $"Moving up to {planned} of item {aim.Item.Value} to #{index} {GetShelfName(target)}{rounding}...";
         output.Add(_runningText);
         return true;
     }

@@ -1,5 +1,5 @@
 // purpose: the one clamp both the runner's Planning and the overlay stepper call, so UI and runner cannot disagree (invariant 4)
-// owns:    AmountClamp.Clamp, AmountClamp.All, ClampResult, ClampReason
+// owns:    AmountClamp.Clamp, AmountClamp.RoundDownToChunk, AmountClamp.All, ClampResult, ClampReason
 // deps:    none
 
 using System;
@@ -9,11 +9,11 @@ namespace ShelfTransfer.Core.Transfer;
 public enum ClampReason
 {
     Ok,
-    /// <summary>Requested amount was zero or negative.</summary>
+    /// <summary>Requested amount was zero or negative, or less than one chunk.</summary>
     InvalidAmount,
-    /// <summary>Source holds none of the item.</summary>
+    /// <summary>Source holds none of the item, or less than one chunk.</summary>
     NothingToMove,
-    /// <summary>Target has no free capacity for the item, or cannot hold it at all.</summary>
+    /// <summary>Target has no free capacity for the item (or not a whole chunk), or cannot hold it at all.</summary>
     TargetFull,
 }
 
@@ -44,4 +44,34 @@ public static class AmountClamp
 
         return new ClampResult(Math.Min(requested, Math.Min(sourceCount, targetFree)), ClampReason.Ok);
     }
+
+    /// <summary>As <see cref="Clamp(int, int, int)"/>, rounded down to whole chunks of <paramref name="unit"/> (I1/I4 amended:
+    /// the game takes a chunk at once, so a target must fit a whole chunk before a take).</summary>
+    public static ClampResult Clamp(int requested, int sourceCount, int targetFree, int unit)
+    {
+        if (unit < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(unit), unit, "must be at least 1");
+        }
+
+        ClampResult clamp = Clamp(requested, sourceCount, targetFree);
+        if (clamp.Reason != ClampReason.Ok || unit == 1)
+        {
+            return clamp;
+        }
+
+        int whole = RoundDownToChunk(clamp.Amount, unit);
+        if (whole > 0)
+        {
+            return new ClampResult(whole, ClampReason.Ok);
+        }
+
+        // The target side first: "target cannot fit a chunk" is the one the player can fix by choosing another shelf.
+        ClampReason reason = targetFree < unit ? ClampReason.TargetFull
+            : sourceCount < unit ? ClampReason.NothingToMove
+            : ClampReason.InvalidAmount;
+        return new ClampResult(0, reason);
+    }
+
+    public static int RoundDownToChunk(int amount, int unit) => amount / unit * unit;
 }

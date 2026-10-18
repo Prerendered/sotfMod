@@ -1,8 +1,9 @@
 // purpose: IShelfGateway over the game's own calls; the only code that changes shelf state (I2)
 // owns:    InteropShelfGateway
 // deps:    ShelfRegistry, IShelfGateway, GatewayOutcome, IModLog, Sons.Gameplay / Sons.Inventory / TheForest (interop)
-// caution: side effects only in TakeOne (InWorldLayoutItemGroup.RemoveItem) and StoreOne (ItemStorageController.TryAddItem
-//          then PlayerInventory.RemoveItem, the vanilla pair); all else is field reads and count getters. On a client the
+// caution: side effects only in TakeOne (InWorldLayoutItemGroup.RemoveItem, one whole chunk of _transferAmount) and StoreOne
+//          (ItemStorageController.TryAddItem then PlayerInventory.RemoveItem, the vanilla pair, one item); all else is field reads
+//          and count getters. On a client the
 //          host applies shelf changes later (card 46). Never ItemInstanceManager writes, Host* or *FromClient calls.
 
 using System;
@@ -80,6 +81,37 @@ public sealed class InteropShelfGateway : IShelfGateway
         Guard("get_inventory_count", _ => 0, () =>
             TryGetInventory(out PlayerInventory? inventory) ? inventory.AmountOf(item.Value, true, false) : 0);
 
+    // The same hook TakeOne would take from, so the runner plans with the chunk the take really moves.
+    public int GetTransferUnit(ShelfRef shelf, SlotRef slot, ItemId item) =>
+        Guard("get_transfer_unit", _ => 0, () =>
+        {
+            if (!TryGetShelf(shelf, out ItemStorageController? controller))
+            {
+                return 0;
+            }
+
+            foreach (ItemStorageHookPoint hook in CopyHooks(controller))
+            {
+                InWorldLayoutItemGroup? group = FindActiveGroup(hook);
+                int unit = group != null && group._itemId == item.Value && group.GetCurrentCount() > 0
+                    ? Math.Max(0, group._transferAmount)
+                    : 0;
+                if (slot.Index is int index)
+                {
+                    if (IsSlot(hook, group, index))
+                    {
+                        return unit;
+                    }
+                }
+                else if (unit > 0)
+                {
+                    return unit;
+                }
+            }
+
+            return 0;
+        });
+
     public GatewayOutcome TakeOne(ShelfRef shelf, SlotRef slot, ItemId item) =>
         Guard("take_one", GatewayOutcome.Failed, () =>
         {
@@ -94,11 +126,7 @@ public sealed class InteropShelfGateway : IShelfGateway
                 InWorldLayoutItemGroup? group = FindActiveGroup(hook);
                 if (slot.Index is int index)
                 {
-                    // AimWatcher's resolution (the stocked group's _storage); the hook's own component only for an empty slot.
-                    StructureStorage? storage = group != null && group._storage != null
-                        ? group._storage
-                        : FindOnObject<StructureStorage>(hook);
-                    if (storage == null || storage.StorageSlotIndex != index)
+                    if (!IsSlot(hook, group, index))
                     {
                         continue;
                     }
@@ -109,7 +137,7 @@ public sealed class InteropShelfGateway : IShelfGateway
 
                 if (group != null && group._itemId == item.Value && group.GetCurrentCount() > 0)
                 {
-                    // Any matching hook will do; one the take must refuse (e.g. transfer unit) falls through to the next.
+                    // Any matching hook will do; one the take must refuse (e.g. a partial chunk) falls through to the next.
                     lastRefusal = TakeFrom(group, item);
                     if (lastRefusal is null)
                     {
@@ -183,15 +211,31 @@ public sealed class InteropShelfGateway : IShelfGateway
             return "slot holds item " + group._itemId;
         }
 
-        // RemoveItem moves the group's whole transfer unit; anything but 1 would put more than one item in hand (I1).
+        // RemoveItem moves min(_transferAmount, count) (Sons.dll disassembly); a short slot would hand over a partial chunk
+        // the runner cannot verify as one (I1/I3 amended), so only a whole chunk is taken.
         int unit = group._transferAmount;
-        if (unit != 1)
+        if (unit < 1)
         {
             return "transfer unit " + unit;
         }
 
+        int count = group.GetCurrentCount();
+        if (count < unit)
+        {
+            return $"partial chunk {count} of {unit}";
+        }
+
         group.RemoveItem(false);
         return null;
+    }
+
+    // AimWatcher's resolution (the stocked group's _storage); the hook's own component only for an empty slot.
+    private static bool IsSlot(ItemStorageHookPoint hook, InWorldLayoutItemGroup? group, int index)
+    {
+        StructureStorage? storage = group != null && group._storage != null
+            ? group._storage
+            : FindOnObject<StructureStorage>(hook);
+        return storage != null && storage.StorageSlotIndex == index;
     }
 
     // A stocked hook takes more only of its own item; an empty hook takes any item it has a layout template for,

@@ -8,11 +8,12 @@ public enum TransferState
 {
     /// <summary>Clamp amount, read starting counts. Nothing has moved.</summary>
     Planning,
-    /// <summary>Between items: cancel is checked here and only here.</summary>
+    /// <summary>Between chunks: cancel is checked here and only here.</summary>
     ReadyForNext,
-    /// <summary>TakeOne issued; verify source-1 and inventory+1 before storing, re-reading once per tick while the counts have not moved yet.</summary>
+    /// <summary>TakeOne issued; verify source-N and inventory+N before storing, re-reading once per tick while the counts have not moved yet.
+    /// Also the state between the single stores of a verified chunk, while its items are still in the inventory.</summary>
     TakenAwaitingVerify,
-    /// <summary>StoreOne issued; verify target+1 and inventory-1 before the next cycle, re-reading once per tick while the counts have not moved yet.</summary>
+    /// <summary>StoreOne issued; verify target+1 and inventory-1 before the next store or cycle, re-reading once per tick while the counts have not moved yet.</summary>
     StoredAwaitingVerify,
     Finished,
 }
