@@ -121,14 +121,21 @@ the Invariant check on the card's flow (see above) and size its ceremony
      `skipped — not security-sensitive: <reason>`, so the skip is visible, never
      disguised as a review. Never skip on a merge-mode PR (Gate 2): security
      always runs there.
-   All three — CI `check`, `review/code`, `review/security` — are required checks
-   on main. GitHub forbids self-approval and every PR is authored by the User's
-   account, so these statuses — not PR approvals — are the agents' approval gate.
-   Merging stays with the User.
+   Four required checks on main: CI `check`, `review/code`, `review/security`, and
+   `review/criteria` (seer, step 5). GitHub forbids self-approval and every PR is
+   authored by the User's account, so these statuses — not PR approvals — are the
+   agents' approval gate. Merging stays with the User.
    **Any push after step 4 restarts step 4 on the new head** — a fix for a
    security high/critical, for tests the tester left failing, or for a defect
    found in steps 5–6. A status set on an earlier SHA never covers it.
-5. Dispatch seer (validate mode) → criteria vs evidence.
+5. Dispatch seer (validate mode) on the PR → criteria vs evidence; posts its
+   verdict and sets `review/criteria` on the final head (see seer "On a PR"):
+   success = every criterion evidenced; pending = only human legs outstanding;
+   failure = a criterion fails (card returns to the builder). After step 6, pass
+   the User's in-game results verbatim and re-dispatch seer to flip pending.
+   Trivial card, or a PR with no board card (process/infra) → the Overseer sets
+   `review/criteria` = success with `skipped — <trivial card | no board card>: <reason>`.
+   Never skipped for a card with Plugin/in-game criteria.
 6. End-to-end gate: drive what is automatable (the verify/run skill). Rebuild the
    binaries/tools the flow depends on first (never a stale artifact), then smoke
    the commands and the browser/CLI paths against real state. Some legs can't be
@@ -140,7 +147,7 @@ the Invariant check on the card's flow (see above) and size its ceremony
    card, not a ship; an undriveable path is a flagged manual test, not a pass.
 7. All green — and every "green" verified against its artifact, not a proxy
    (senior-protocol rule 5: file on the branch, command exit 0 unpiped, flow
-   actually ran) and all three required statuses green on the PR's current head —
+   actually ran) and all four required statuses green on the PR's current head —
    card Done, PR ready for the User to merge, update state.md. No commit after the
    final gate (see step 4 restart rule). A signal unreachable from here (e.g.
    remote CI) is recorded `unverified — confirm`, never Done.
