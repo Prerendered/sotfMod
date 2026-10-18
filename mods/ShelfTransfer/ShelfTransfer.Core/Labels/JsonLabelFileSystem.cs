@@ -269,6 +269,9 @@ public sealed class JsonLabelFileSystem : ILabelFileSystem
         return byStamp != 0 ? byStamp : right.Sequence.CompareTo(left.Sequence);
     }
 
+    private static string BuildBadPath(string stem, int sequence) =>
+        sequence == 1 ? stem + _badSuffix : $"{stem}-{sequence}{_badSuffix}";
+
     private static KeyValuePair<string, object?> Field(string key, object? value) => new(key, value);
 
     private string GetPath(string worldId) => Path.Combine(_directory, worldId + _extension);
@@ -415,7 +418,7 @@ public sealed class JsonLabelFileSystem : ILabelFileSystem
             return new BadCopy(existing, true);
         }
 
-        string? created = CopyToBad(path, worldId);
+        string? created = CopyToBad(path, worldId, copies);
         return created is null ? null : new BadCopy(created, false);
     }
 
@@ -446,15 +449,25 @@ public sealed class JsonLabelFileSystem : ILabelFileSystem
     }
 
     // No-clobber: a same-second name gets -2, -3, ...; File.Copy without overwrite still refuses a racing file.
-    // File.Exists is false for a junction or directory link, so the chosen name is checked before copying to it.
-    private string? CopyToBad(string path, string worldId)
+    // The suffix starts above the highest one already used for this stamp, so the new copy ranks newest and a name
+    // freed by a prune is never reused. File.Exists is false for a junction, so the chosen name is checked last.
+    private string? CopyToBad(string path, string worldId, IReadOnlyList<BadEntry> copies)
     {
         string stamp = DateTime.UtcNow.ToString(_badStampFormat, CultureInfo.InvariantCulture);
         string stem = Path.Combine(_directory, $"{worldId}{_extension}.{stamp}");
-        string badPath = stem + _badSuffix;
-        for (int suffix = 2; File.Exists(badPath); suffix++)
+        int sequence = 1;
+        foreach (BadEntry copy in copies)
         {
-            badPath = $"{stem}-{suffix}{_badSuffix}";
+            if (string.Equals(copy.Stamp, stamp, StringComparison.OrdinalIgnoreCase))
+            {
+                sequence = Math.Max(sequence, copy.Sequence + 1);
+            }
+        }
+
+        string badPath = BuildBadPath(stem, sequence);
+        while (File.Exists(badPath))
+        {
+            badPath = BuildBadPath(stem, ++sequence);
         }
 
         if (IsReparsePoint(badPath))
