@@ -1,7 +1,8 @@
 // purpose: the transfer state machine (flow F2): plan, then take -> verify -> store -> verify one item per cycle; any fault stops, never retries
 // owns:    TransferRunner
 // deps:    IShelfGateway, IModLog, AmountClamp, TransferRequest, TransferReport, TransferState, StopReason
-// caution: a cycle never splits across ticks (D7); only TakeOne/StoreOne mutate (I2); Tick never catches; after a throw, Abort or the next Tick finishes (P2)
+// caution: a cycle splits across ticks only while awaiting a host confirm, and then only re-reads (I1, D7); only TakeOne/StoreOne mutate (I2);
+//          Tick never catches; after a throw, Abort or the next Tick finishes (P2)
 
 using System;
 using System.Collections.Generic;
@@ -16,6 +17,7 @@ public sealed class TransferRunner
     private readonly IShelfGateway _gateway;
     private readonly IModLog _log;
     private readonly TransferRequest _request;
+    private readonly int _confirmTicks;
     private bool _hasBaseline;
     private int _sourceStart;
     private int _targetStart;
@@ -24,12 +26,22 @@ public sealed class TransferRunner
     private bool _isTickInFlight;
     private bool _isTickOnStack;
     private bool _hasStoreVerdict;
+    private bool _isAwaitingConfirm;
+    private int _waitTicks;
 
-    public TransferRunner(IShelfGateway gateway, IModLog log, TransferRequest request)
+    /// <summary><paramref name="confirmTicks"/>: ticks to keep re-reading after an Ok take or store whose counts have not moved yet
+    /// (a friend-hosted client sees them only once the host applies it); 0 verifies immediately.</summary>
+    public TransferRunner(IShelfGateway gateway, IModLog log, TransferRequest request, int confirmTicks = 0)
     {
+        if (confirmTicks < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(confirmTicks), confirmTicks, "must not be negative");
+        }
+
         _gateway = gateway;
         _log = log;
         _request = request;
+        _confirmTicks = confirmTicks;
     }
 
     public TransferState State { get; private set; } = TransferState.Planning;
@@ -50,7 +62,7 @@ public sealed class TransferRunner
     /// <summary>Finishes from any state with a freshly read report; the driver calls it after a throw (P2). No-op once finished.</summary>
     public void Abort(StopReason reason, string? detail) => Finish(reason, detail);
 
-    /// <summary>Runs Planning if pending, then at most <paramref name="maxCycles"/> full cycles.</summary>
+    /// <summary>Runs Planning if pending, then works on at most <paramref name="maxCycles"/> cycles; a cycle resumed from a confirm wait is one of them.</summary>
     public void Tick(int maxCycles)
     {
         if (maxCycles < 1)
@@ -100,7 +112,15 @@ public sealed class TransferRunner
             Plan();
         }
 
-        for (int cycle = 0; State == TransferState.ReadyForNext; cycle++)
+        int cycle = 0;
+        if (_isAwaitingConfirm)
+        {
+            // The resumed cycle spends one unit of the budget, so a tick still ends at most maxCycles cycles.
+            cycle = 1;
+            ResumeWait();
+        }
+
+        for (; State == TransferState.ReadyForNext; cycle++)
         {
             // Exits are checked before the budget so the tick that moves the last item also finishes.
             FinishIfDue();
@@ -208,11 +228,42 @@ public sealed class TransferRunner
             return;
         }
 
-        if (!TryTake(itemNumber, sourceBefore, inventoryBefore) || !TryStore(itemNumber, targetBefore, inventoryBefore))
+        if (TryTake(itemNumber) && TryStore(itemNumber))
+        {
+            CompleteCycle(itemNumber);
+        }
+    }
+
+    // A wait spans frames, so the shelves are re-checked as at ReadyForNext; the wait only re-reads, never takes or stores again (I1).
+    private void ResumeWait()
+    {
+        int itemNumber = Moved + 1;
+        string step = State == TransferState.TakenAwaitingVerify ? "take" : "store";
+        _waitTicks++;
+        bool areShelvesAlive = _gateway.IsAlive(_request.Source) && _gateway.IsAlive(_request.Target);
+        if (IsFinished)
         {
             return;
         }
 
+        if (!areShelvesAlive)
+        {
+            EndWait(itemNumber, step, false);
+            Finish(StopReason.ShelfGone, $"shelf gone during {step} wait");
+            return;
+        }
+
+        bool isCycleDone = State == TransferState.TakenAwaitingVerify
+            ? VerifyTake(itemNumber) && TryStore(itemNumber)
+            : VerifyStore(itemNumber);
+        if (isCycleDone)
+        {
+            CompleteCycle(itemNumber);
+        }
+    }
+
+    private void CompleteCycle(int itemNumber)
+    {
         Moved = itemNumber;
         State = TransferState.ReadyForNext;
     }
@@ -239,7 +290,7 @@ public sealed class TransferRunner
         return !IsFinished;
     }
 
-    private bool TryTake(int itemNumber, int sourceBefore, int inventoryBefore)
+    private bool TryTake(int itemNumber)
     {
         GatewayOutcome take = _gateway.TakeOne(_request.Source, _request.SourceSlot, _request.Item);
         if (IsFinished)
@@ -254,6 +305,15 @@ public sealed class TransferRunner
         }
 
         State = TransferState.TakenAwaitingVerify;
+        return VerifyTake(itemNumber);
+    }
+
+    // Before-counts are the tracked totals, which IsCycleStartAsTracked proved equal to this cycle's start reads.
+    // True once the take is verified; false while awaiting the host's confirm or after a stop.
+    private bool VerifyTake(int itemNumber)
+    {
+        int sourceBefore = _sourceStart - Moved;
+        int inventoryBefore = _inventoryStart;
         int sourceAfter = _gateway.GetCount(_request.Source, _request.Item);
         if (IsFinished)
         {
@@ -268,7 +328,16 @@ public sealed class TransferRunner
 
         bool isSourceVerified = sourceAfter == sourceBefore - 1;
         bool isInventoryVerified = inventoryAfter == inventoryBefore + 1;
-        LogStep("transfer.take", itemNumber, "src", sourceBefore, sourceAfter, inventoryBefore, inventoryAfter, isSourceVerified && isInventoryVerified);
+        bool isVerified = isSourceVerified && isInventoryVerified;
+        bool isAwaitable = IsAwaitable(sourceAfter, sourceBefore, isSourceVerified)
+            && IsAwaitable(inventoryAfter, inventoryBefore, isInventoryVerified);
+        if (TryAwaitConfirm(isVerified, isAwaitable))
+        {
+            return false;
+        }
+
+        EndWait(itemNumber, "take", isVerified);
+        LogStep("transfer.take", itemNumber, "src", sourceBefore, sourceAfter, inventoryBefore, inventoryAfter, isVerified);
         if (!isSourceVerified)
         {
             Finish(StopReason.SourceMismatch, $"take: source expected {sourceBefore - 1} read {sourceAfter}");
@@ -281,7 +350,7 @@ public sealed class TransferRunner
         return !IsFinished;
     }
 
-    private bool TryStore(int itemNumber, int targetBefore, int inventoryBefore)
+    private bool TryStore(int itemNumber)
     {
         GatewayOutcome store = _gateway.StoreOne(_request.Target, _request.Item);
         if (IsFinished)
@@ -297,6 +366,14 @@ public sealed class TransferRunner
 
         State = TransferState.StoredAwaitingVerify;
         _hasStoreVerdict = false;
+        return VerifyStore(itemNumber);
+    }
+
+    // Same as VerifyTake. While awaiting, the verdict stays out so Finish settles the item from fresh reads.
+    private bool VerifyStore(int itemNumber)
+    {
+        int targetBefore = _targetStart + Moved;
+        int inventoryBefore = _inventoryStart;
         int targetAfter = _gateway.GetCount(_request.Target, _request.Item);
         if (IsFinished)
         {
@@ -309,11 +386,20 @@ public sealed class TransferRunner
             return false;
         }
 
-        _hasStoreVerdict = true;
         bool isTargetVerified = targetAfter == targetBefore + 1;
         bool isInventoryVerified = inventoryAfter == inventoryBefore;
-        LogStep("transfer.store", itemNumber, "dst", targetBefore, targetAfter, inventoryBefore + 1, inventoryAfter, isTargetVerified && isInventoryVerified);
-        if (isTargetVerified && isInventoryVerified)
+        bool isVerified = isTargetVerified && isInventoryVerified;
+        bool isAwaitable = IsAwaitable(targetAfter, targetBefore, isTargetVerified)
+            && IsAwaitable(inventoryAfter, inventoryBefore + 1, isInventoryVerified);
+        if (TryAwaitConfirm(isVerified, isAwaitable))
+        {
+            return false;
+        }
+
+        _hasStoreVerdict = true;
+        EndWait(itemNumber, "store", isVerified);
+        LogStep("transfer.store", itemNumber, "dst", targetBefore, targetAfter, inventoryBefore + 1, inventoryAfter, isVerified);
+        if (isVerified)
         {
             return true;
         }
@@ -329,6 +415,38 @@ public sealed class TransferRunner
         }
 
         return false;
+    }
+
+    // A count still at its before value is one the host has not applied yet; any value but before or expected is drift
+    // and stops at once. The wait decides only when the verdict lands, never which reason it gives.
+    private static bool IsAwaitable(int read, int before, bool isVerified) => isVerified || read == before;
+
+    private bool TryAwaitConfirm(bool isVerified, bool isAwaitable)
+    {
+        if (isVerified || !isAwaitable || _waitTicks >= _confirmTicks)
+        {
+            return false;
+        }
+
+        _isAwaitingConfirm = true;
+        return true;
+    }
+
+    private void EndWait(int itemNumber, string step, bool isVerified)
+    {
+        if (!_isAwaitingConfirm)
+        {
+            return;
+        }
+
+        _log.Write(isVerified ? LogLevel.Info : LogLevel.Warn, "transfer.wait", new KeyValuePair<string, object?>[]
+        {
+            new("n", itemNumber),
+            new("step", step),
+            new("ticks", _waitTicks),
+        });
+        _isAwaitingConfirm = false;
+        _waitTicks = 0;
     }
 
     private static StopReason GetFaultReason(GatewayStatus status, StopReason refusedReason) =>
