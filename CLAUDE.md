@@ -96,25 +96,46 @@ the Invariant check on the card's flow (see above) and size its ceremony
 1. Dispatch the builder for the card type:
    - feature card → dev (the story, architecture.md, design.md if UI, standards).
    - refactor card → refactor. If the target has no passing test, dispatch tester
-     for characterization tests first.
+     for characterization tests first: the tester creates the card's branch,
+     pushes the tests and opens the PR; refactor then pushes to that same PR.
    Story in unfamiliar code → dispatch scout (brief mode) first; pass its brief to
    the builder.
-2. Builder pushes the feature branch and opens a PR. Dispatch reviewer (task mode)
+2. Builder pushes the feature branch and opens a PR (refactor after tester-first:
+   pushes to the PR the tester already opened). Dispatch reviewer (task mode)
    on the PR number: it posts its verdict as a PR review comment and sets the
    `review/code` commit status on the reviewed head SHA (see reviewer "On a PR").
    - fail → builder fixes on the same PR; re-review the new SHA. Max 2
      iterations, then escalate to User.
-3. Security-sensitive card (auth, input, data, dependencies) → dispatch security
-   (card mode) on the PR: it sets `review/security`. A high or critical returns the
-   card to the builder. Not security-sensitive (Proportionality) → the Overseer sets
-   `review/security` = success on the head SHA with description
-   `skipped — not security-sensitive: <reason>`, so the skip is visible, never
-   disguised as a review.
-   Both statuses are required checks on main alongside CI `check`. GitHub forbids
-   self-approval and every PR is authored by the User's account, so these statuses
-   — not PR approvals — are the agents' approval gate. Merging stays with the User.
-4. Dispatch tester → tests + test-report.md. New bugs → cards on board.
-5. Dispatch seer (validate mode) → criteria vs evidence.
+3. Dispatch tester → tests pushed to the same PR + test-report.md. New bugs →
+   cards on board. This moves the head SHA, so the gates in step 4 run after it.
+4. Final gate on the final head SHA (statuses never carry forward to a SHA nobody
+   reviewed):
+   - reviewer delta pass over the commits since its last reviewed SHA → sets
+     `review/code` on the final head. If the head has not moved since the step-2
+     review (trivial card, tester skipped), that status already covers it — no
+     delta pass; `check` and `review/security` are then set on that same head.
+   - Security-sensitive card (auth, input, data, dependencies) → dispatch security
+     (card mode) on the PR → sets `review/security`. A high or critical returns
+     the card to the builder. Not security-sensitive (Proportionality) → the
+     Overseer sets `review/security` = success on the final head with description
+     `skipped — not security-sensitive: <reason>`, so the skip is visible, never
+     disguised as a review. Never skip on a merge-mode PR (Gate 2): security
+     always runs there.
+   Four required checks on main: CI `check`, `review/code`, `review/security`, and
+   `review/criteria` (seer, step 5). GitHub forbids self-approval and every PR is
+   authored by the User's account, so these statuses — not PR approvals — are the
+   agents' approval gate. Merging stays with the User.
+   **Any push after step 4 restarts step 4 on the new head** — a fix for a
+   security high/critical, for tests the tester left failing, or for a defect
+   found in steps 5–6. A status set on an earlier SHA never covers it.
+5. Dispatch seer (validate mode) on the PR → criteria vs evidence; posts its
+   verdict and sets `review/criteria` on the final head (see seer "On a PR"):
+   success = every criterion evidenced; pending = only human legs outstanding;
+   failure = a criterion fails (card returns to the builder). After step 6, pass
+   the User's in-game results verbatim and re-dispatch seer to flip pending.
+   Trivial card, or a PR with no board card (process/infra) → the Overseer sets
+   `review/criteria` = success with `skipped — <trivial card | no board card>: <reason>`.
+   Never skipped for a card with Plugin/in-game criteria.
 6. End-to-end gate: drive what is automatable (the verify/run skill). Rebuild the
    binaries/tools the flow depends on first (never a stale artifact), then smoke
    the commands and the browser/CLI paths against real state. Some legs can't be
@@ -126,9 +147,10 @@ the Invariant check on the card's flow (see above) and size its ceremony
    card, not a ship; an undriveable path is a flagged manual test, not a pass.
 7. All green — and every "green" verified against its artifact, not a proxy
    (senior-protocol rule 5: file on the branch, command exit 0 unpiped, flow
-   actually ran) — card Done, commit on feature branch, update state.md. A signal
-   unreachable from here (e.g. remote CI) is recorded `unverified — confirm`,
-   never Done.
+   actually ran) and all four required statuses green on the PR's current head —
+   card Done, PR ready for the User to merge, update state.md. No commit after the
+   final gate (see step 4 restart rule). A signal unreachable from here (e.g.
+   remote CI) is recorded `unverified — confirm`, never Done.
 Stories with no shared files may run parallel builder dispatches — under the
 worktree-isolation rule below.
 
@@ -138,6 +160,7 @@ Agents receive only their contract inputs, never conversation history:
 Task: <story title + acceptance criteria verbatim>
 Context files: team/architecture.md, .claude/skills/standards/
 Branch: <feature-name>
+PR: <number, once it exists> · last reviewed SHA: <sha, for a delta pass>
 Return: summary + files touched + self-check result
 ```
 If an agent needs something not in its reads:, that is an Overseer bug —

@@ -38,6 +38,10 @@ When the dispatch names a PR number, the PR is the record instead of
 team/review-report.md:
 1. Pin the SHA first: `gh pr view <n> --json headRefOid`. Review
    `gh pr diff <n>` (task mode) or the full PR branch against main (merge mode).
+   Delta pass (dispatch names a last-reviewed SHA): review only
+   `git diff <last-sha>..<head-sha>`, and set the status on the new head. First
+   check `git merge-base --is-ancestor <last-sha> <head-sha>`; if it fails
+   (rebase, force-push), the delta is meaningless — do a full task-mode pass.
 2. Post the entry (Output format below) with
    `gh pr review <n> --comment --body-file <file>`. GitHub forbids approving or
    requesting changes on your own PR, and the PR author is the User's account,
@@ -53,7 +57,7 @@ team/review-report.md:
 - The entry is appended in the fixed log format with a verdict — or, on a PR,
   posted as a PR review comment with `review/code` set on the reviewed SHA.
 
-## Output format (appended to team/review-report.md)
+## Output format (appended to team/review-report.md, or posted as the PR review body)
 ```
 ## [date] — [story] — [task|merge] — PASS|FAIL
 - [blocker|should-fix|nit] <violation> — cites <rule> — fix: <suggestion>

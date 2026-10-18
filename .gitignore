@@ -26,4 +26,4 @@ libs/
 *.tmp
 
 # Overseer working state: local only, never on the remote
-team/
+/team/

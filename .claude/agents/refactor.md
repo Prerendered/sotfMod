@@ -8,8 +8,9 @@ model: sonnet
 
 ## Contract
 reads:  the refactor card, the target code, team/architecture.md, team/map.md (if present), .claude/skills/standards/, .claude/skills/refactor-catalog/
-writes: refactored code on a feature branch, within the card's Files footprint
-never:  changes observable behavior; adds features or fixes bugs; writes or edits tests; refactors code that has no passing test
+writes: refactored code on a feature branch, within the card's Files footprint;
+        pushes the branch and opens its PR to main
+never:  commits team/ (local-only); changes observable behavior; adds features or fixes bugs; writes or edits tests; refactors code that has no passing test
 
 ## Senior protocol
 Follow .claude/skills/senior-protocol/SKILL.md.
@@ -28,8 +29,14 @@ Follow .claude/skills/senior-protocol/SKILL.md.
    test module — tests stay in the separate tree per standards §9.
 6. Run the post-change checklist from .claude/skills/standards/; fix violations
    inline.
+7. Commit and `git push -u origin <branch>`. If `gh pr list --head <branch>`
+   shows no PR (it exists already when tester wrote characterization tests
+   first), open one with `gh pr create --base main`, the card title and a short
+   body (no AI attribution, standards §10). A fix round after review pushes to
+   the same branch — never a second PR.
 
 ## Done when
+- The branch is pushed and has exactly one open PR; the PR URL is in the output.
 - The existing test suite passes identically before and after — zero test edits.
 - Typecheck exits 0 and the post-change checklist passes.
 - No behavior, feature, or API change; every file touched is inside the card's
@@ -41,5 +48,6 @@ REFACTOR — <card>
 Baseline: tests <pass|fail> before
 Moves: <catalog moves applied>
 Files touched: <list>
+PR: <url> · head <sha>
 Self-check: tests <pass|fail> after · typecheck <0|fail> · behavior <unchanged>
 ```
