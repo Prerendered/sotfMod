@@ -1,8 +1,8 @@
 // purpose: the transfer prompt: the transfer key opens a small IMGUI text box that runs the `transfer` commands (list,
-//          <count> <index>, cancel) and shows their output, because the game's debug console is not reachable
+//          <count> <index or label>, cancel) and shows their output, because the game's debug console is not reachable
 // owns:    TransferPromptUi
-// deps:    TransferCommand (CaptureAim, ReleaseAim, RunCaptured, GetRunningText, IsCapturedShelfGone), InputBlocker, Styles,
-//          ModConfig (TransferKey, TransferAltKey), IModLog, UnityEngine IMGUI
+// deps:    TransferCommand (CaptureAim, ReleaseAim, RunCaptured, GetRunningText, IsCapturedShelfGone, GetShelfName),
+//          InputBlocker, Styles, ModConfig (TransferKey, TransferAltKey), LabelsFeature.MaxNameLength, IModLog, UnityEngine IMGUI
 // caution: I1/I2 - never touches the gateway; a start goes through TransferCommand to the runner (TransferDriver). The aimed
 //          slot is captured on open, not on Enter. Update and OnGUI are P2 boundaries: a throw logs error event=ui.prompt,
 //          gives input back at once and halts the prompt for the session
@@ -18,6 +18,7 @@ using ShelfTransfer.Core.Gateway;
 using ShelfTransfer.Core.Logging;
 using ShelfTransfer.Plugin.Commands;
 using ShelfTransfer.Plugin.Config;
+using ShelfTransfer.Plugin.Labels;
 
 using LogLevel = ShelfTransfer.Core.Logging.LogLevel;
 
@@ -26,7 +27,8 @@ namespace ShelfTransfer.Plugin.Ui;
 public sealed class TransferPromptUi : MonoBehaviour
 {
     private const int _maxOutputLines = 40;
-    private const int _maxInputLength = 32;
+    // Room for a count, a space and the longest label.
+    private const int _maxInputLength = LabelsFeature.MaxNameLength + 16;
     private const float _toastSeconds = 5f;
     private const string _inputControl = "ShelfTransfer.TransferInput";
     private const string _inputBlockName = "ShelfTransfer.TransferPromptInput";
@@ -44,7 +46,7 @@ public sealed class TransferPromptUi : MonoBehaviour
     private const float _toastTop = 40f;
 
     private const string _titleText = "Transfer";
-    private const string _hintText = "list  |  <count> <index>  |  cancel          Enter runs, Esc closes";
+    private const string _hintText = "list  |  <count> <index or label>  |  cancel      Enter runs, Esc closes";
     private const string _runText = "Run";
     private const string _closeText = "Close";
     private const string _noAimText = "No aimed slot. Aim at a shelf slot that holds items, then press + to move them.";
@@ -171,7 +173,9 @@ public sealed class TransferPromptUi : MonoBehaviour
         AimTarget? aim = command.CaptureAim();
         string? running = command.GetRunningText();
         _output.Clear();
-        _output.Add(aim is null ? _noAimText : $"Source: {aim.Count} of item {aim.Item.Value} on {aim.Shelf.TypeName}");
+        _output.Add(aim is null
+            ? _noAimText
+            : $"Source: {aim.Count} of item {aim.Item.Value} on {command.GetShelfName(aim.Shelf)}");
         if (running is not null)
         {
             _output.Add(_runningPrefix + running);

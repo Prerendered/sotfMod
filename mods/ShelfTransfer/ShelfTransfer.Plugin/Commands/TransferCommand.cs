@@ -1,10 +1,11 @@
-// purpose: the `transfer` command (debug console and the transfer prompt): list target shelves by index, start a transfer
-//          of the aimed item, cancel it
+// purpose: the `transfer` command (debug console and the transfer prompt): list target shelves by index and label, start
+//          a transfer of the aimed item to an index or a label, cancel it
 // owns:    TransferCommand
-// deps:    TransferDriver, AimWatcher, ShelfRegistry, IShelfGateway, ShelfListBuilder, StopReasonText, IModLog,
+// deps:    TransferDriver, AimWatcher, ShelfRegistry, IShelfGateway, ShelfListBuilder, TargetQuery, StopReasonText, IModLog,
 //          TheForest.DebugConsole (interop: RegisterCommand, TryGetDynamicCommands, LogCommandInfo), UnityEngine
-// caution: indexes refer to the last list snapshot, never a fresh scan, so the number typed is the row printed. I2 - never
-//          calls TakeOne/StoreOne; only the runner does, through TransferDriver.
+// caution: indexes refer to the last list snapshot, never a fresh scan, so the number typed is the row printed; a label
+//          rescans and replaces that snapshot. I5 - labels are only read. I2 - never calls TakeOne/StoreOne; only the
+//          runner does, through TransferDriver.
 //          The game keeps the sender behind a WeakReference; this component is the sender and lives on BepInEx's manager object
 
 using System;
@@ -38,7 +39,7 @@ public sealed class TransferCommand : MonoBehaviour
     private const string _commandName = "transfer";
     private const string _listArgument = "list";
     private const string _cancelArgument = "cancel";
-    private const string _usage = "Usage: transfer list | transfer <count> <index> | transfer cancel";
+    private const string _usage = "Usage: transfer list | transfer <count> <index or label> | transfer cancel";
     private const string _failedText = "transfer failed, see the mod log";
 
     // The console can drop dynamic commands (ClearDynamicCommands); a cheap lookup once a second re-adds ours.
@@ -52,6 +53,7 @@ public sealed class TransferCommand : MonoBehaviour
     private IShelfGateway? _gateway;
     private AimWatcher? _aimWatcher;
     private TransferDriver? _driver;
+    private Func<IReadOnlyDictionary<string, ShelfLabel>?>? _getLabels;
     private bool _isHalted;
     private double _nextRegisterCheckAt;
 
@@ -75,14 +77,20 @@ public sealed class TransferCommand : MonoBehaviour
 
     // Managed parameters cannot cross into Il2Cpp; hidden so ClassInjector does not try to expose it.
     [HideFromIl2Cpp]
-    public void Init(IModLog log, ShelfRegistry registry, IShelfGateway gateway, AimWatcher aimWatcher, TransferDriver driver)
+    public void Init(IModLog log, ShelfRegistry registry, IShelfGateway gateway, AimWatcher aimWatcher, TransferDriver driver,
+        Func<IReadOnlyDictionary<string, ShelfLabel>?> getLabels)
     {
         _log = log;
         _registry = registry;
         _gateway = gateway;
         _aimWatcher = aimWatcher;
         _driver = driver;
+        _getLabels = getLabels;
     }
+
+    /// <summary>The shelf's label, or its type name when it has none.</summary>
+    [HideFromIl2Cpp]
+    public string GetShelfName(ShelfRef shelf) => FormatName(shelf, GetLabels(), withGroup: false);
 
     /// <summary>Takes the slot aimed at right now for RunCaptured; null when none is aimed.</summary>
     [HideFromIl2Cpp]
@@ -216,12 +224,10 @@ public sealed class TransferCommand : MonoBehaviour
     private bool Dispatch(string arguments, AimTarget? aim, Func<bool> trackSource, List<string> output,
         Action<string> onFinished, IModLog log, ShelfRegistry registry, IShelfGateway gateway, TransferDriver driver)
     {
-        string[] parts = arguments.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
         // Whether the console passes the whole line or only what follows the command is unverified; accept both.
-        if (parts.Length > 0 && IsWord(parts[0], _commandName))
-        {
-            parts = parts[1..];
-        }
+        (string first, string afterFirst) = TargetQuery.SplitFirstWord(arguments);
+        string line = IsWord(first, _commandName) ? afterFirst : arguments.Trim();
+        string[] parts = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
 
         if (parts.Length == 0)
         {
@@ -237,7 +243,7 @@ public sealed class TransferCommand : MonoBehaviour
         }
         else
         {
-            return StartTransfer(log, gateway, driver, aim, trackSource, parts, arguments, output, onFinished);
+            return StartTransfer(log, registry, gateway, driver, aim, trackSource, line, arguments, output, onFinished);
         }
 
         return false;
@@ -246,11 +252,54 @@ public sealed class TransferCommand : MonoBehaviour
     [HideFromIl2Cpp]
     private void ListTargets(IModLog log, ShelfRegistry registry, IShelfGateway gateway, AimTarget? aim, List<string> output)
     {
-        Camera camera = Camera.main;
-        if (camera == null)
+        if (!TryScanTargets(registry, gateway, aim, out int sourceCount))
         {
             output.Add("No world loaded.");
             return;
+        }
+
+        IReadOnlyDictionary<string, ShelfLabel> labels = GetLabels();
+        output.Add(aim is null
+            ? $"{_indexedTargets.Count} shelves by distance (aim at a stocked slot to see how many fit):"
+            : $"{_indexedTargets.Count} targets for item {aim.Item.Value} by distance (fits = how many of the {sourceCount} go there):");
+        for (int i = 0; i < _indexedTargets.Count; i++)
+        {
+            ShelfRow row = _indexedTargets[i];
+            int index = i + 1;
+            labels.TryGetValue(row.Shelf.Key, out ShelfLabel? stored);
+            log.Write(LogLevel.Info, "shelves.index", new KeyValuePair<string, object?>[]
+            {
+                new("index", index),
+                new("shelf", row.Shelf.Key),
+                new("distance", Math.Round(row.Distance, 1)),
+                new("bearing", row.Bearing),
+                new("item", aim?.Item.Value),
+                new("fits", row.Fits),
+                new("label", string.IsNullOrWhiteSpace(stored?.Label) ? null : stored.Label),
+                new("group", stored?.Group),
+            });
+            if (i < _maxPrintedRows)
+            {
+                output.Add(FormatRow(index, row, labels));
+            }
+        }
+
+        if (_indexedTargets.Count > _maxPrintedRows)
+        {
+            output.Add($"... {_indexedTargets.Count - _maxPrintedRows} more in the mod log (shelves.index lines).");
+        }
+    }
+
+    // Replaces the index snapshot. Labels are left out of the build so rows stay in plain distance order (card 10's index
+    // order) rather than grouped. False when no world is loaded.
+    [HideFromIl2Cpp]
+    private bool TryScanTargets(ShelfRegistry registry, IShelfGateway gateway, AimTarget? aim, out int sourceCount)
+    {
+        sourceCount = 0;
+        Camera camera = Camera.main;
+        if (camera == null)
+        {
+            return false;
         }
 
         Vector3 player = camera.transform.position;
@@ -263,43 +312,16 @@ public sealed class TransferCommand : MonoBehaviour
             candidates.Add(new ShelfCandidate(shelf, free, canHold));
         }
 
-        int sourceCount = aim is null ? 0 : gateway.GetCount(aim.Shelf, aim.Item);
+        sourceCount = aim is null ? 0 : gateway.GetCount(aim.Shelf, aim.Item);
         ShelfList list = ShelfListBuilder.Build(candidates, aim?.Shelf.Key ?? "", sourceCount,
             new WorldPosition(player.x, player.y, player.z), _noLabels);
         _indexedTargets = list.Groups.SelectMany(group => group.Rows).ToList();
-
-        output.Add(aim is null
-            ? $"{_indexedTargets.Count} shelves by distance (aim at a stocked slot to see how many fit):"
-            : $"{_indexedTargets.Count} targets for item {aim.Item.Value} by distance (fits = how many of the {sourceCount} go there):");
-        for (int i = 0; i < _indexedTargets.Count; i++)
-        {
-            ShelfRow row = _indexedTargets[i];
-            int index = i + 1;
-            log.Write(LogLevel.Info, "shelves.index", new KeyValuePair<string, object?>[]
-            {
-                new("index", index),
-                new("shelf", row.Shelf.Key),
-                new("distance", Math.Round(row.Distance, 1)),
-                new("bearing", row.Bearing),
-                new("item", aim?.Item.Value),
-                new("fits", row.Fits),
-            });
-            if (i < _maxPrintedRows)
-            {
-                output.Add(string.Format(CultureInfo.InvariantCulture, "{0}. {1}  {2:0} m {3}  fits {4}",
-                    index, row.Shelf.TypeName, row.Distance, row.Bearing, row.Fits));
-            }
-        }
-
-        if (_indexedTargets.Count > _maxPrintedRows)
-        {
-            output.Add($"... {_indexedTargets.Count - _maxPrintedRows} more in the mod log (shelves.index lines).");
-        }
+        return true;
     }
 
     [HideFromIl2Cpp]
-    private bool StartTransfer(IModLog log, IShelfGateway gateway, TransferDriver driver, AimTarget? aim,
-        Func<bool> trackSource, string[] parts, string arguments, List<string> output, Action<string> onFinished)
+    private bool StartTransfer(IModLog log, ShelfRegistry registry, IShelfGateway gateway, TransferDriver driver,
+        AimTarget? aim, Func<bool> trackSource, string line, string arguments, List<string> output, Action<string> onFinished)
     {
         if (driver.IsRunning)
         {
@@ -313,7 +335,9 @@ public sealed class TransferCommand : MonoBehaviour
             return false;
         }
 
-        if (parts.Length != 2 || !TryParsePositive(parts[0], out int amount))
+        // Everything after the count is the target, so a label may contain spaces.
+        (string countText, string targetText) = TargetQuery.SplitFirstWord(line);
+        if (targetText.Length == 0 || !TryParsePositive(countText, out int amount))
         {
             output.Add(Block(log, gateway, aim, "usage", arguments, _usage));
             return false;
@@ -326,13 +350,11 @@ public sealed class TransferCommand : MonoBehaviour
             return false;
         }
 
-        if (!TryParsePositive(parts[1], out int index) || index > _indexedTargets.Count)
+        bool isResolved = TargetQuery.IsIndex(targetText)
+            ? TryResolveIndex(log, gateway, aim, targetText, arguments, output, out int index)
+            : TryResolveLabel(log, registry, gateway, aim, targetText, arguments, output, out index);
+        if (!isResolved)
         {
-            string detail = _indexedTargets.Count == 0 ? "no shelf list" : $"index outside 1..{_indexedTargets.Count}";
-            string message = _indexedTargets.Count == 0
-                ? "No shelf list yet; run: transfer list"
-                : $"Index must be 1 to {_indexedTargets.Count}; run transfer list to refresh.";
-            output.Add(Block(log, gateway, aim, detail, arguments, message));
             return false;
         }
 
@@ -358,9 +380,84 @@ public sealed class TransferCommand : MonoBehaviour
             return false;
         }
 
-        _runningText = $"Moving up to {amount} of item {aim.Item.Value} to #{index} {target.TypeName}...";
+        _runningText = $"Moving up to {amount} of item {aim.Item.Value} to #{index} {GetShelfName(target)}...";
         output.Add(_runningText);
         return true;
+    }
+
+    [HideFromIl2Cpp]
+    private bool TryResolveIndex(IModLog log, IShelfGateway gateway, AimTarget aim, string targetText, string arguments,
+        List<string> output, out int index)
+    {
+        if (TryParsePositive(targetText, out index) && index <= _indexedTargets.Count)
+        {
+            return true;
+        }
+
+        string detail = _indexedTargets.Count == 0 ? "no shelf list" : $"index outside 1..{_indexedTargets.Count}";
+        string message = _indexedTargets.Count == 0
+            ? "No shelf list yet; run: transfer list"
+            : $"Index must be 1 to {_indexedTargets.Count}; run transfer list to refresh.";
+        output.Add(Block(log, gateway, aim, detail, arguments, message));
+        return false;
+    }
+
+    // A fresh scan, not the last list, so no list is needed first; the source is left out by the scan.
+    [HideFromIl2Cpp]
+    private bool TryResolveLabel(IModLog log, ShelfRegistry registry, IShelfGateway gateway, AimTarget aim, string label,
+        string arguments, List<string> output, out int index)
+    {
+        index = 0;
+        if (!TryScanTargets(registry, gateway, aim, out _))
+        {
+            output.Add(Block(log, gateway, aim, "no world", arguments, "No world loaded."));
+            return false;
+        }
+
+        IReadOnlyDictionary<string, ShelfLabel> labels = GetLabels();
+        IReadOnlyList<int> matches = TargetQuery.FindByLabel(_indexedTargets, labels, label);
+        if (matches.Count == 1)
+        {
+            index = matches[0];
+            return true;
+        }
+
+        if (matches.Count == 0)
+        {
+            output.Add(Block(log, gateway, aim, "label not found", arguments,
+                $"No other shelf is labelled \"{label}\"; run list to see the labels."));
+            return false;
+        }
+
+        output.Add(Block(log, gateway, aim, "label ambiguous", arguments,
+            $"{matches.Count} shelves are labelled \"{label}\"; nothing moved. Type <count> <index> to pick one:"));
+        foreach (int match in matches.Take(_maxPrintedRows))
+        {
+            output.Add(FormatRow(match, _indexedTargets[match - 1], labels));
+        }
+
+        return false;
+    }
+
+    [HideFromIl2Cpp]
+    private IReadOnlyDictionary<string, ShelfLabel> GetLabels() => _getLabels?.Invoke() ?? _noLabels;
+
+    [HideFromIl2Cpp]
+    private static string FormatRow(int index, ShelfRow row, IReadOnlyDictionary<string, ShelfLabel> labels) =>
+        string.Format(CultureInfo.InvariantCulture, "{0}. {1}  {2:0} m {3}  fits {4}",
+            index, FormatName(row.Shelf, labels, withGroup: true), row.Distance, row.Bearing, row.Fits);
+
+    // A group-only entry stores an empty label, so the type name stands in for it.
+    [HideFromIl2Cpp]
+    private static string FormatName(ShelfRef shelf, IReadOnlyDictionary<string, ShelfLabel> labels, bool withGroup)
+    {
+        if (!labels.TryGetValue(shelf.Key, out ShelfLabel? stored))
+        {
+            return shelf.TypeName;
+        }
+
+        string name = string.IsNullOrWhiteSpace(stored.Label) ? shelf.TypeName : stored.Label;
+        return withGroup && !string.IsNullOrWhiteSpace(stored.Group) ? $"{name} [{stored.Group}]" : name;
     }
 
     // Mirrors the runner's own transfer.stop fields, so a refused command reads the same in the log as a refused plan.
