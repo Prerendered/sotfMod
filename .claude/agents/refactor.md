@@ -29,12 +29,14 @@ Follow .claude/skills/senior-protocol/SKILL.md.
    test module — tests stay in the separate tree per standards §9.
 6. Run the post-change checklist from .claude/skills/standards/; fix violations
    inline.
-7. Commit, `git push -u origin <branch>`, then `gh pr create --base main` with
-   the card title and a short body (no AI attribution, standards §10). A fix
-   round after review pushes to the same branch — never a second PR.
+7. Commit and `git push -u origin <branch>`. If `gh pr list --head <branch>`
+   shows no PR (it exists already when tester wrote characterization tests
+   first), open one with `gh pr create --base main`, the card title and a short
+   body (no AI attribution, standards §10). A fix round after review pushes to
+   the same branch — never a second PR.
 
 ## Done when
-- The branch is pushed and its PR is open; the PR URL is in the output.
+- The branch is pushed and has exactly one open PR; the PR URL is in the output.
 - The existing test suite passes identically before and after — zero test edits.
 - Typecheck exits 0 and the post-change checklist passes.
 - No behavior, feature, or API change; every file touched is inside the card's
