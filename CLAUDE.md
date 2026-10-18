@@ -96,7 +96,8 @@ the Invariant check on the card's flow (see above) and size its ceremony
 1. Dispatch the builder for the card type:
    - feature card → dev (the story, architecture.md, design.md if UI, standards).
    - refactor card → refactor. If the target has no passing test, dispatch tester
-     for characterization tests first.
+     for characterization tests first: the tester creates the card's branch,
+     pushes the tests and opens the PR; refactor then pushes to that same PR.
    Story in unfamiliar code → dispatch scout (brief mode) first; pass its brief to
    the builder.
 2. Builder pushes the feature branch and opens a PR. Dispatch reviewer (task mode)
@@ -109,7 +110,9 @@ the Invariant check on the card's flow (see above) and size its ceremony
 4. Final gate on the final head SHA (statuses never carry forward to a SHA nobody
    reviewed):
    - reviewer delta pass over the commits since its last reviewed SHA → sets
-     `review/code` on the final head.
+     `review/code` on the final head. If the head has not moved since the step-2
+     review (trivial card, tester skipped), that status already covers it — no
+     delta pass.
    - Security-sensitive card (auth, input, data, dependencies) → dispatch security
      (card mode) on the PR → sets `review/security`. A high or critical returns
      the card to the builder. Not security-sensitive (Proportionality) → the
@@ -121,6 +124,9 @@ the Invariant check on the card's flow (see above) and size its ceremony
    on main. GitHub forbids self-approval and every PR is authored by the User's
    account, so these statuses — not PR approvals — are the agents' approval gate.
    Merging stays with the User.
+   **Any push after step 4 restarts step 4 on the new head** — a fix for a
+   security high/critical, for tests the tester left failing, or for a defect
+   found in steps 5–6. A status set on an earlier SHA never covers it.
 5. Dispatch seer (validate mode) → criteria vs evidence.
 6. End-to-end gate: drive what is automatable (the verify/run skill). Rebuild the
    binaries/tools the flow depends on first (never a stale artifact), then smoke
@@ -133,7 +139,9 @@ the Invariant check on the card's flow (see above) and size its ceremony
    card, not a ship; an undriveable path is a flagged manual test, not a pass.
 7. All green — and every "green" verified against its artifact, not a proxy
    (senior-protocol rule 5: file on the branch, command exit 0 unpiped, flow
-   actually ran) — card Done, commit on feature branch, update state.md. A signal
+   actually ran) and all three required statuses green on the PR's current head —
+   card Done, PR ready for the User to merge, update state.md. No commit after the
+   final gate (see step 4 restart rule). A signal
    unreachable from here (e.g. remote CI) is recorded `unverified — confirm`,
    never Done.
 Stories with no shared files may run parallel builder dispatches — under the
@@ -145,6 +153,7 @@ Agents receive only their contract inputs, never conversation history:
 Task: <story title + acceptance criteria verbatim>
 Context files: team/architecture.md, .claude/skills/standards/
 Branch: <feature-name>
+PR: <number, once it exists> · last reviewed SHA: <sha, for a delta pass>
 Return: summary + files touched + self-check result
 ```
 If an agent needs something not in its reads:, that is an Overseer bug —

@@ -35,6 +35,8 @@ Follow .claude/skills/senior-protocol/SKILL.md.
 6. Append the entry to team/test-report.md in the fixed format.
 7. Commit the tests and push to the card's PR branch (no AI attribution,
    standards §10). Report the new head SHA — the final review gate runs on it.
+   Characterization tests for a refactor card come before any PR exists: create
+   the branch named in the dispatch, push, and open the PR with `gh pr create`.
 
 ## Done when
 - Tests are pushed to the card's PR; the new head SHA is in the output.
@@ -47,6 +49,7 @@ Follow .claude/skills/senior-protocol/SKILL.md.
 ## Output format (appended to team/test-report.md)
 ```
 ## [date] — [story]
+PR: <url> · head <sha after push>
 ### Criteria coverage
 - [✓|✗] <criterion> — <test file::case>
 ### Risk assessment
