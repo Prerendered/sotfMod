@@ -1046,4 +1046,196 @@ public sealed class TransferRunnerFailureTests
         Assert.False(rig.HasReportMismatchWarn);
         rig.AssertFrozen();
     }
+
+    // Card 35 criterion 1: the exact repro, re-entrant Tick from OnCall on the 2nd TakeOne(src)
+    [Fact]
+    public void Tick_ReentrantOnSecondTake_DetailSaysReentrantWithZeroFurtherMutations()
+    {
+        Rig rig = Build(source: 6);
+        int mutationsAtStop = -1;
+        rig.Gateway.OnCall = e =>
+        {
+            if (e == "TakeOne(src)" && rig.Gateway.TakeCalls == 2)
+            {
+                rig.Runner.Tick(100);
+                mutationsAtStop = rig.Gateway.Mutations;
+            }
+        };
+
+        rig.Runner.Tick(100);
+
+        TransferReport r = rig.Report;
+        Assert.Equal(StopReason.GatewayError, r.Reason);
+        Assert.StartsWith("re-entrant tick during ReadyForNext", r.Detail);
+        Assert.DoesNotContain("previous tick threw", r.Detail);
+        Assert.Equal(1, r.Moved);
+        Assert.Equal(2, rig.Gateway.TakeCalls);
+        Assert.Equal(1, rig.Gateway.StoreCalls);
+        Assert.Equal(3, mutationsAtStop); // take, store, and the take whose call is in flight
+        Assert.Equal(3, rig.Gateway.Mutations);
+        Assert.Single(rig.Log.Named("transfer.stop"));
+        rig.AssertFrozen();
+    }
+
+    // Card 35 criterion 2: re-entrant Tick at every other reachable state names that state
+    [Theory]
+    [InlineData(TransferState.Planning, "IsAlive(src)", 0, 0)]
+    [InlineData(TransferState.ReadyForNext, "GetCount(src)", 1, 1)]
+    [InlineData(TransferState.TakenAwaitingVerify, "GetInventoryCount", 1, 0)]
+    [InlineData(TransferState.StoredAwaitingVerify, "GetCount(dst)", 1, 1)]
+    public void Tick_ReentrantAtState_DetailNamesStateAndNothingMutatesAfter(TransferState state, string call, int takes, int stores)
+    {
+        Rig rig = Build(source: 6);
+        bool isFired = false;
+        rig.Gateway.OnCall = e =>
+        {
+            if (!isFired && e == call && rig.Runner.State == state && rig.Gateway.TakeCalls == takes && rig.Gateway.StoreCalls == stores)
+            {
+                isFired = true;
+                rig.Runner.Tick(100);
+            }
+        };
+
+        rig.Runner.Tick(100);
+
+        Assert.True(isFired);
+        TransferReport r = rig.Report;
+        Assert.Equal(StopReason.GatewayError, r.Reason);
+        Assert.StartsWith($"re-entrant tick during {state}", r.Detail);
+        Assert.Equal(takes, rig.Gateway.TakeCalls);
+        Assert.Equal(stores, rig.Gateway.StoreCalls);
+        Assert.Single(rig.Log.Named("transfer.stop"));
+        rig.AssertFrozen();
+    }
+
+    // Card 35: first stop wins when a re-entrant Tick is followed by Abort
+    [Fact]
+    public void Abort_AfterReentrantTickStop_FirstStopWins()
+    {
+        Rig rig = Build(source: 6);
+        rig.Gateway.OnCall = e =>
+        {
+            if (e == "TakeOne(src)" && rig.Gateway.TakeCalls == 2)
+            {
+                rig.Runner.Tick(100);
+                rig.Runner.Abort(StopReason.Cancelled, "late");
+            }
+        };
+
+        rig.Runner.Tick(100);
+
+        Assert.Equal(StopReason.GatewayError, rig.Report.Reason);
+        Assert.StartsWith("re-entrant tick during", rig.Report.Detail);
+        Assert.Single(rig.Log.Named("transfer.stop"));
+    }
+
+    // Card 35: an escaped throw then a later Tick stays distinct from re-entrancy
+    [Fact]
+    public void Tick_EscapedThrowThenTick_SaysPreviousTickThrewNotReentrant()
+    {
+        Rig rig = Build(source: 6);
+        ThrowOnce(rig, e => e == "TakeOne(src)" && rig.Gateway.TakeCalls == 2);
+        Assert.Throws<InvalidOperationException>(() => rig.Runner.Tick(100));
+
+        rig.Runner.Tick(100);
+
+        Assert.StartsWith("previous tick threw during ReadyForNext", rig.Report.Detail);
+        Assert.DoesNotContain("re-entrant", rig.Report.Detail);
+        Assert.Equal(2, rig.Gateway.TakeCalls);
+        rig.AssertFrozen();
+    }
+
+    // Card 35: throw then driver Abort keeps the driver's detail; later Tick is a no-op
+    [Fact]
+    public void Tick_ThrowThenAbortThenTick_KeepsAbortDetail()
+    {
+        Rig rig = Build(source: 6);
+        ThrowOnce(rig, e => e == "TakeOne(src)" && rig.Gateway.TakeCalls == 2);
+        Assert.Throws<InvalidOperationException>(() => rig.Runner.Tick(100));
+        rig.Runner.Abort(StopReason.GatewayError, "driver");
+
+        Assert.StartsWith("driver", rig.Report.Detail);
+        rig.AssertFrozen();
+    }
+
+    // Card 35 criterion 1, second half: source dead at Planning, Remaining 0, detail says unknown
+    [Fact]
+    public void Tick_SourceDeadAtPlanning_RemainingZeroWithSourceNeverReadNote()
+    {
+        Rig rig = Build(source: 6);
+        rig.Gateway.Shelf(_src).IsAlive = false;
+
+        rig.Runner.Tick(100);
+
+        TransferReport r = rig.Report;
+        Assert.Equal(StopReason.ShelfGone, r.Reason);
+        Assert.Equal(0, r.Remaining);
+        Assert.Equal(0, r.Moved);
+        Assert.Equal("shelf gone before start; source never read, remaining unknown", r.Detail);
+        Assert.Equal(0, rig.Gateway.Mutations);
+        rig.AssertFrozen();
+    }
+
+    // Card 35: both shelves dead at Planning behaves like source dead
+    [Fact]
+    public void Tick_BothDeadAtPlanning_SourceNeverReadNote()
+    {
+        Rig rig = Build(source: 6);
+        rig.Gateway.Shelf(_src).IsAlive = false;
+        rig.Gateway.Shelf(_dst).IsAlive = false;
+
+        rig.Runner.Tick(100);
+
+        Assert.Equal(0, rig.Report.Remaining);
+        Assert.EndsWith("source never read, remaining unknown", rig.Report.Detail);
+    }
+
+    // Card 35: target dead at Planning, source alive: real count and no note
+    [Fact]
+    public void Tick_TargetDeadAtPlanning_RemainingIsRealCountWithNoNote()
+    {
+        Rig rig = Build(source: 6);
+        rig.Gateway.Shelf(_dst).IsAlive = false;
+
+        rig.Runner.Tick(100);
+
+        TransferReport r = rig.Report;
+        Assert.Equal(StopReason.ShelfGone, r.Reason);
+        Assert.Equal(6, r.Remaining);
+        Assert.Equal("shelf gone before start", r.Detail);
+        Assert.Equal(0, rig.Gateway.Mutations);
+        rig.AssertFrozen();
+    }
+
+    // Card 35: once a baseline exists the older note still applies and the new one does not
+    [Fact]
+    public void Tick_SourceGoneMidRun_KeepsTrackedNoteNotNeverReadNote()
+    {
+        Rig rig = Build(source: 6);
+        rig.Gateway.OnCall = e =>
+        {
+            if (e == "IsAlive(src)" && rig.Gateway.StoreCalls == 1)
+            {
+                rig.Gateway.Shelf(_src).IsAlive = false;
+            }
+        };
+
+        rig.Runner.Tick(100);
+
+        Assert.DoesNotContain("never read", rig.Report.Detail);
+        Assert.EndsWith("source gone, remaining tracked", rig.Report.Detail);
+    }
+
+    // Card 35: Abort before the first Tick with a dead source also cannot claim a counted 0
+    [Fact]
+    public void Abort_BeforeFirstTickWithSourceDead_SaysSourceNeverRead()
+    {
+        Rig rig = Build(source: 6);
+        rig.Gateway.Shelf(_src).IsAlive = false;
+
+        rig.Runner.Abort(StopReason.GatewayError, "early");
+
+        Assert.Equal(0, rig.Report.Remaining);
+        Assert.Contains("source never read, remaining unknown", rig.Report.Detail);
+    }
 }
