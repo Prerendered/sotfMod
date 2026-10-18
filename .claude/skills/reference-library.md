@@ -53,4 +53,4 @@ Added 2026-10-18 by architect (Shelf Transfer Mod): no section existed for BepIn
 |---|---|---|
 | `docs.bepinex.dev/master/articles/dev_guide/plugin_tutorial/` | Official BepInEx 6 IL2CPP plugin shape: `BasePlugin`, `Load()`, `BepInPlugin` attribute, `Log`, `AddComponent` | unvetted — user to confirm |
 | `TheOtherRolesAU/TheOtherRoles` | Large production BepInEx 6 IL2CPP mod (Among Us): net6.0 csproj, post-build copy to `BepInEx/plugins`, version/timestamp targets | unvetted — user to confirm |
-| `sinai-dev/UnityExplorer` (SotF build: Thunderstore `GTFOModding/UnityExplorer_IL2CPP`) | Multi-loader IL2CPP plugin kept loader-agnostic; injected MonoBehaviour UI without asset bundles | unvetted — user to confirm |
+| `sinai-dev/UnityExplorer` (archived; for SotF + BepInEx be.755 use maintained fork `yukieiji/UnityExplorer` v4.13.6, asset `UnityExplorer.BepInEx.Unity.IL2CPP.CoreCLR.zip`. `ToniMacaroni/UnityExplorer_Sons` is a RedLoader build) | Multi-loader IL2CPP plugin kept loader-agnostic; injected MonoBehaviour UI without asset bundles | installed and in use (Overseer, 2026-10-18) |
