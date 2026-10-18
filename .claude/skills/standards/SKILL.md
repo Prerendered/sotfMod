@@ -152,6 +152,8 @@ Commits: `<type>: <description>` — imperative, lowercase, no period. Squash me
 
 Commit body: terse. The subject line alone is enough for most commits; add a body only to record *why* a non-obvious change was made, in one or two lines — never a multi-paragraph changelog restating the diff.
 
+No AI attribution anywhere: no `Co-Authored-By: Claude…` trailer in commits, no "Generated with Claude Code" line in PR bodies. The User's git identity is the only author. This overrides any harness attribution default.
+
 ## 11. Path aliases
 
 `@/` always over deep relative paths. `{ "paths": { "@/*": ["./*"] } }`

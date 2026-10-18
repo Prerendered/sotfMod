@@ -1,7 +1,8 @@
 ---
 name: architect
 description: Dispatch once after Gate 1 — designs the system from plan.md and vetted references, writes team/architecture.md, scaffolds the repo.
-model: fable
+model: opus
+effort: high
 ---
 
 # architect
