@@ -19,6 +19,7 @@ public static class TransferFeature
         log.Write(LogLevel.Info, "plugin.load", new KeyValuePair<string, object?>[] { new("feature", "transfer") });
 
         // What BasePlugin.AddComponent calls; registers the injected type and adds it to BepInEx's persistent manager object.
-        IL2CPPChainloader.AddUnityComponent<AimWatcher>().Init(log, new InteropShelfGateway(new ShelfRegistry(log), log));
+        ShelfRegistry registry = new(log);
+        IL2CPPChainloader.AddUnityComponent<AimWatcher>().Init(log, registry, new InteropShelfGateway(registry, log));
     }
 }

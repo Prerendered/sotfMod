@@ -37,6 +37,7 @@ public sealed class AimWatcher : MonoBehaviour
     private const string _reasonEmptySlot = "empty_slot";
 
     private IModLog? _log;
+    private ShelfRegistry? _registry;
     private IShelfGateway? _gateway;
     private bool _isHalted;
     private readonly AimChangeDebouncer _debouncer = new();
@@ -60,9 +61,10 @@ public sealed class AimWatcher : MonoBehaviour
 
     // Managed parameters cannot cross into Il2Cpp; hidden so ClassInjector does not try to expose it.
     [HideFromIl2Cpp]
-    public void Init(IModLog log, IShelfGateway gateway)
+    public void Init(IModLog log, ShelfRegistry registry, IShelfGateway gateway)
     {
         _log = log;
+        _registry = registry;
         _gateway = gateway;
     }
 
@@ -72,15 +74,15 @@ public sealed class AimWatcher : MonoBehaviour
 
     public void Update()
     {
-        if (_log is null || _gateway is null || _isHalted)
+        if (_log is null || _registry is null || _gateway is null || _isHalted)
         {
             return;
         }
 
         try
         {
-            ItemStorageController? unstocked = Tick(_log, _gateway);
-            UpdateEmptyProbe(_log, _gateway, unstocked);
+            ItemStorageController? unstocked = Tick(_log, _registry, _gateway);
+            UpdateEmptyProbe(_log, _registry, _gateway, unstocked);
         }
         catch (Exception ex)
         {
@@ -93,7 +95,7 @@ public sealed class AimWatcher : MonoBehaviour
 
     // Returns the aimed storage when the ray is on it but on no stocked slot (the empty-storage probe's input), else null.
     [HideFromIl2Cpp]
-    private ItemStorageController? Tick(IModLog log, IShelfGateway gateway)
+    private ItemStorageController? Tick(IModLog log, ShelfRegistry registry, IShelfGateway gateway)
     {
         Camera camera = Camera.main;
         if (camera == null)
@@ -158,6 +160,8 @@ public sealed class AimWatcher : MonoBehaviour
             return null;
         }
 
+        // The live controller in hand: gateway reads hit this shelf without a rescan, never a duplicate-key twin.
+        registry.Track(shelf.Key, controller);
         WriteTargetChange(log, gateway, _current, group._maxAmount, controller, storage);
         if (_lastLoggedShelfKey is not null && _lastLoggedShelfKey != shelf.Key && _lastLoggedItem != item)
         {
@@ -171,7 +175,8 @@ public sealed class AimWatcher : MonoBehaviour
 
     // An empty storage never writes a target line, so it is probed here, settled by its own debouncer like aim.change.
     [HideFromIl2Cpp]
-    private void UpdateEmptyProbe(IModLog log, IShelfGateway gateway, ItemStorageController? unstocked)
+    private void UpdateEmptyProbe(IModLog log, ShelfRegistry registry, IShelfGateway gateway,
+        ItemStorageController? unstocked)
     {
         AimTarget? candidate = null;
         if (unstocked != null && _lastLoggedShelfKey is not null)
@@ -183,8 +188,9 @@ public sealed class AimWatcher : MonoBehaviour
             }
         }
 
-        if (_probeDebouncer.ShouldLog(candidate, Time.unscaledTimeAsDouble) && candidate is not null)
+        if (_probeDebouncer.ShouldLog(candidate, Time.unscaledTimeAsDouble) && candidate is not null && unstocked != null)
         {
+            registry.Track(candidate.Shelf.Key, unstocked);
             WriteProbe(log, gateway, candidate.Shelf, candidate.Item);
         }
     }

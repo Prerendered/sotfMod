@@ -47,7 +47,7 @@ public sealed class InteropShelfGateway : IShelfGateway
     }
 
     public bool IsAlive(ShelfRef shelf) =>
-        Guard("is_alive", _ => false, () => _registry.TryResolve(shelf.Key, out _));
+        Guard("is_alive", _ => false, () => TryGetShelf(shelf, out _));
 
     public int GetCount(ShelfRef shelf, ItemId item) =>
         Guard("get_count", _ => 0, () =>
@@ -88,27 +88,39 @@ public sealed class InteropShelfGateway : IShelfGateway
                 return GatewayOutcome.Failed(_shelfGone);
             }
 
+            string? lastRefusal = null;
             foreach (ItemStorageHookPoint hook in CopyHooks(controller))
             {
+                InWorldLayoutItemGroup? group = FindActiveGroup(hook);
                 if (slot.Index is int index)
                 {
-                    StructureStorage? storage = FindOnObject<StructureStorage>(hook);
-                    if (storage != null && storage.StorageSlotIndex == index)
+                    // AimWatcher's resolution (the stocked group's _storage); the hook's own component only for an empty slot.
+                    StructureStorage? storage = group != null && group._storage != null
+                        ? group._storage
+                        : FindOnObject<StructureStorage>(hook);
+                    if (storage == null || storage.StorageSlotIndex != index)
                     {
-                        return TakeFrom(FindActiveGroup(hook), item);
+                        continue;
                     }
 
-                    continue;
+                    string? refusal = TakeFrom(group, item);
+                    return refusal is null ? GatewayOutcome.Ok : GatewayOutcome.Refused(refusal);
                 }
 
-                InWorldLayoutItemGroup? group = FindActiveGroup(hook);
                 if (group != null && group._itemId == item.Value && group.GetCurrentCount() > 0)
                 {
-                    return TakeFrom(group, item);
+                    // Any matching hook will do; one the take must refuse (e.g. transfer unit) falls through to the next.
+                    lastRefusal = TakeFrom(group, item);
+                    if (lastRefusal is null)
+                    {
+                        return GatewayOutcome.Ok;
+                    }
                 }
             }
 
-            return slot.Index is null ? GatewayOutcome.Refused("no slot holds the item") : GatewayOutcome.Failed("slot gone");
+            return slot.Index is null
+                ? GatewayOutcome.Refused(lastRefusal ?? "no slot holds the item")
+                : GatewayOutcome.Failed("slot gone");
         });
 
     public GatewayOutcome StoreOne(ShelfRef shelf, ItemId item) =>
@@ -135,27 +147,28 @@ public sealed class InteropShelfGateway : IShelfGateway
         });
 
     // Card 4 candidate for the vanilla take (E); bypassPlayerInventoryUpdate=false so the item goes to the player.
-    private static GatewayOutcome TakeFrom(InWorldLayoutItemGroup? group, ItemId item)
+    // Null when taken, else the refusal detail (nothing called).
+    private static string? TakeFrom(InWorldLayoutItemGroup? group, ItemId item)
     {
         if (group == null || group.GetCurrentCount() <= 0)
         {
-            return GatewayOutcome.Refused("slot empty");
+            return "slot empty";
         }
 
         if (group._itemId != item.Value)
         {
-            return GatewayOutcome.Refused("slot holds item " + group._itemId);
+            return "slot holds item " + group._itemId;
         }
 
         // RemoveItem moves the group's whole transfer unit; anything but 1 would put more than one item in hand (I1).
         int unit = group._transferAmount;
         if (unit != 1)
         {
-            return GatewayOutcome.Refused("transfer unit " + unit);
+            return "transfer unit " + unit;
         }
 
         group.RemoveItem(false);
-        return GatewayOutcome.Ok;
+        return null;
     }
 
     // A stocked hook takes more only of its own item; an empty hook takes any item it has a layout template for,

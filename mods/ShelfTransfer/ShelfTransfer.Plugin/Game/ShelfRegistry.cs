@@ -34,10 +34,20 @@ public sealed class ShelfRegistry
     private readonly Dictionary<string, ItemStorageController> _byKey = new(StringComparer.Ordinal);
     private bool _hasListed;
     private double _lastListAt;
+    private int _loggedCount = -1;
+    private int _loggedDuplicateKeys = -1;
 
     public ShelfRegistry(IModLog log) => _log = log;
 
-    public IReadOnlyList<ShelfRef> List()
+    public IReadOnlyList<ShelfRef> List() => Scan(isRescan: false);
+
+    /// <summary>
+    /// Maps <paramref name="key"/> to a controller the caller holds live (the aimed one), replacing any entry: the aim
+    /// path never waits for a rescan, and for a duplicate key the shelf being looked at is the one read.
+    /// </summary>
+    public void Track(string key, ItemStorageController controller) => _byKey[key] = controller;
+
+    private IReadOnlyList<ShelfRef> Scan(bool isRescan)
     {
         _hasListed = true;
         _lastListAt = Time.unscaledTimeAsDouble;
@@ -63,6 +73,15 @@ public sealed class ShelfRegistry
             shelves.Add(shelf);
         }
 
+        // A gone shelf polled every tick rescans every 5 s; an unchanged rescan result is not worth a line each time.
+        bool isUnchanged = shelves.Count == _loggedCount && duplicateKeys == _loggedDuplicateKeys;
+        if (isRescan && isUnchanged)
+        {
+            return shelves;
+        }
+
+        _loggedCount = shelves.Count;
+        _loggedDuplicateKeys = duplicateKeys;
         _log.Write(LogLevel.Info, "shelves.list", new KeyValuePair<string, object?>[]
         {
             new("count", shelves.Count),
@@ -88,7 +107,7 @@ public sealed class ShelfRegistry
             return false;
         }
 
-        List();
+        Scan(isRescan: true);
         return TryGetLive(key, out controller);
     }
 
