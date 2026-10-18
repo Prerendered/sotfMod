@@ -1,9 +1,9 @@
 // purpose: IShelfGateway over the game's own calls; the only code that changes shelf state (I2)
 // owns:    InteropShelfGateway
 // deps:    ShelfRegistry, IShelfGateway, GatewayOutcome, IModLog, Sons.Gameplay / Sons.Inventory / TheForest (interop)
-// caution: side effects only in TakeOne (InWorldLayoutItemGroup.RemoveItem) and StoreOne (ItemStorageController.TryAddItem);
-//          all else is field reads and count getters. Both are discovery candidates until card 12 runs them; on a client
-//          the host applies them later (card 46). Never ItemInstanceManager writes, Host* or *FromClient calls.
+// caution: side effects only in TakeOne (InWorldLayoutItemGroup.RemoveItem) and StoreOne (ItemStorageController.TryAddItem
+//          then PlayerInventory.RemoveItem, the vanilla pair); all else is field reads and count getters. On a client the
+//          host applies shelf changes later (card 46). Never ItemInstanceManager writes, Host* or *FromClient calls.
 
 using System;
 using System.Collections.Generic;
@@ -123,28 +123,51 @@ public sealed class InteropShelfGateway : IShelfGateway
                 : GatewayOutcome.Failed("slot gone");
         });
 
-    public GatewayOutcome StoreOne(ShelfRef shelf, ItemId item) =>
-        Guard("store_one", GatewayOutcome.Failed, () =>
-        {
-            if (!TryGetShelf(shelf, out ItemStorageController? controller))
+    // The game's store pair in its own order (I2 amended): TryAddItem never touches the inventory (session 6 duplicated),
+    // so every vanilla caller follows it with RemoveItem; the args are InWorldLayoutItemGroup.AddItem's.
+    public GatewayOutcome StoreOne(ShelfRef shelf, ItemId item)
+    {
+        // Once the add went through, any throw has stored without consuming: Failed with its own detail so the runner stops.
+        bool isAdded = false;
+        return Guard("store_one",
+            detail => GatewayOutcome.Failed(isAdded ? "stored, consume threw: " + detail : detail),
+            () =>
             {
-                return GatewayOutcome.Failed(_shelfGone);
-            }
+                if (!TryGetShelf(shelf, out ItemStorageController? controller))
+                {
+                    return GatewayOutcome.Failed(_shelfGone);
+                }
 
-            if (!TryGetInventory(out PlayerInventory? inventory))
-            {
-                return GatewayOutcome.Failed(_noInventory);
-            }
+                if (!TryGetInventory(out PlayerInventory? inventory))
+                {
+                    return GatewayOutcome.Failed(_noInventory);
+                }
 
-            ItemInstance? instance = inventory.GetItemInstanceOfType(item.Value);
-            if (instance == null)
-            {
-                return GatewayOutcome.Refused("none in inventory");
-            }
+                // Backpack only: an item held in hand alone is not found and refuses here.
+                ItemInstance? instance = inventory.GetItemInstanceOfType(item.Value);
+                if (instance == null)
+                {
+                    return GatewayOutcome.Refused("none in inventory");
+                }
 
-            // Card 4 candidate for the vanilla store (C); the controller picks the hook, so no SlotRef.
-            return controller.TryAddItem(instance) ? GatewayOutcome.Ok : GatewayOutcome.Refused("store declined");
-        });
+                // On a client the host applies the add later and may still reject it, after the item is consumed;
+                // a fresh capacity read narrows that window to what changed since.
+                if (ReadCapacity(controller, item).Free <= 0)
+                {
+                    return GatewayOutcome.Refused("target full");
+                }
+
+                if (!controller.TryAddItem(instance))
+                {
+                    return GatewayOutcome.Refused("store declined");
+                }
+
+                isAdded = true;
+                bool isConsumed = inventory.RemoveItem(item.Value, amount: 1, allowAmountOverflow: false,
+                    shouldEquipPrevious: true, removeFromQuickSelect: true, itemInstance: instance, instantDestroy: false);
+                return isConsumed ? GatewayOutcome.Ok : GatewayOutcome.Failed("stored but not consumed");
+            });
+    }
 
     // Card 4 candidate for the vanilla take (E); bypassPlayerInventoryUpdate=false so the item goes to the player.
     // Null when taken, else the refusal detail (nothing called).
@@ -184,18 +207,13 @@ public sealed class InteropShelfGateway : IShelfGateway
             return last.Value;
         }
 
-        Capacity value = ReadCapacity(shelf, item);
+        Capacity value = TryGetShelf(shelf, out ItemStorageController? controller) ? ReadCapacity(controller, item) : default;
         _lastCapacity = new CapacityRead(shelf.Key, item, frame, value);
         return value;
     }
 
-    private Capacity ReadCapacity(ShelfRef shelf, ItemId item)
+    private static Capacity ReadCapacity(ItemStorageController controller, ItemId item)
     {
-        if (!TryGetShelf(shelf, out ItemStorageController? controller))
-        {
-            return default;
-        }
-
         List<InWorldLayoutItemGroup> shelfTemplates = CopyList(controller._itemLayoutGroups);
         bool canHold = false;
         int free = 0;
