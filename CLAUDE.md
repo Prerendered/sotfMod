@@ -100,7 +100,8 @@ the Invariant check on the card's flow (see above) and size its ceremony
      pushes the tests and opens the PR; refactor then pushes to that same PR.
    Story in unfamiliar code → dispatch scout (brief mode) first; pass its brief to
    the builder.
-2. Builder pushes the feature branch and opens a PR. Dispatch reviewer (task mode)
+2. Builder pushes the feature branch and opens a PR (refactor after tester-first:
+   pushes to the PR the tester already opened). Dispatch reviewer (task mode)
    on the PR number: it posts its verdict as a PR review comment and sets the
    `review/code` commit status on the reviewed head SHA (see reviewer "On a PR").
    - fail → builder fixes on the same PR; re-review the new SHA. Max 2
@@ -112,7 +113,7 @@ the Invariant check on the card's flow (see above) and size its ceremony
    - reviewer delta pass over the commits since its last reviewed SHA → sets
      `review/code` on the final head. If the head has not moved since the step-2
      review (trivial card, tester skipped), that status already covers it — no
-     delta pass.
+     delta pass; `check` and `review/security` are then set on that same head.
    - Security-sensitive card (auth, input, data, dependencies) → dispatch security
      (card mode) on the PR → sets `review/security`. A high or critical returns
      the card to the builder. Not security-sensitive (Proportionality) → the
@@ -141,9 +142,8 @@ the Invariant check on the card's flow (see above) and size its ceremony
    (senior-protocol rule 5: file on the branch, command exit 0 unpiped, flow
    actually ran) and all three required statuses green on the PR's current head —
    card Done, PR ready for the User to merge, update state.md. No commit after the
-   final gate (see step 4 restart rule). A signal
-   unreachable from here (e.g. remote CI) is recorded `unverified — confirm`,
-   never Done.
+   final gate (see step 4 restart rule). A signal unreachable from here (e.g.
+   remote CI) is recorded `unverified — confirm`, never Done.
 Stories with no shared files may run parallel builder dispatches — under the
 worktree-isolation rule below.
 
