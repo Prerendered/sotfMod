@@ -1,4 +1,4 @@
-// purpose: the runner's state machine positions; one full cycle per tick, Esc honoured only at ReadyForNext (D7)
+// purpose: the runner's state machine positions; whole cycles only per tick, Esc honoured only at ReadyForNext (D7)
 // owns:    TransferState
 // deps:    none
 
