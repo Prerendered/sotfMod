@@ -1,7 +1,8 @@
 // purpose: IModLog that appends LogLine output to shelftransfer.log, keeping the previous run as .prev.log (D5)
 // owns:    FileModLog
-// deps:    ShelfTransfer.Core.Logging (IModLog, LogLine, LogLevel), BepInEx ManualLogSource (fallback)
-// caution: never throws into the game; any failure goes to the BepInEx log instead
+// deps:    ShelfTransfer.Core.Logging (IModLog, LogLine, LogLevel, LogSizeCap), BepInEx ManualLogSource (fallback)
+// caution: never throws into the game; any failure goes to the BepInEx log instead. Past LogSizeCap.MaxSessionBytes
+//          one log.cap line goes to the active sink (file or BepInEx fallback) and later events are dropped
 
 using System;
 using System.Collections.Generic;
@@ -23,6 +24,8 @@ public sealed class FileModLog : IModLog
 
     private readonly ManualLogSource _fallback;
     private readonly object _gate = new();
+    private readonly UTF8Encoding _encoding = new(encoderShouldEmitUTF8Identifier: false);
+    private readonly LogSizeCap _sizeCap = new(LogSizeCap.MaxSessionBytes);
     private readonly StreamWriter? _writer;
 
     public FileModLog(string directory, ManualLogSource fallback)
@@ -93,7 +96,7 @@ public sealed class FileModLog : IModLog
         {
             // FileShare.ReadWrite so the log can be opened in an editor while the game runs.
             FileStream stream = new(path, isAppend ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
-            return new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            return new StreamWriter(stream, _encoding);
         }
         catch (Exception ex)
         {
@@ -103,7 +106,32 @@ public sealed class FileModLog : IModLog
     }
 
     // Flushed per event so the file is complete even if the game crashes or is killed.
+    // The budget is checked before choosing the sink, so the BepInEx fallback cannot fill the disk either.
     private void Append(LogLevel level, string text)
+    {
+        lock (_gate)
+        {
+            // +1 for the '\n' terminator.
+            switch (_sizeCap.Admit(_encoding.GetByteCount(text) + 1L))
+            {
+                case LogSizeCap.Admission.Write:
+                    WriteToSink(level, text);
+                    break;
+                case LogSizeCap.Admission.WriteCapNotice:
+                    WriteToSink(LogLevel.Warn, LogLine.Format(DateTimeOffset.Now, LogLevel.Warn, "log.cap", new KeyValuePair<string, object?>[]
+                    {
+                        new("limit_bytes", LogSizeCap.MaxSessionBytes),
+                        new("written_bytes", _sizeCap.WrittenBytes),
+                        new("action", "drop"),
+                    }));
+                    break;
+                case LogSizeCap.Admission.Drop:
+                    break;
+            }
+        }
+    }
+
+    private void WriteToSink(LogLevel level, string text)
     {
         if (_writer is null)
         {
@@ -111,12 +139,9 @@ public sealed class FileModLog : IModLog
             return;
         }
 
-        lock (_gate)
-        {
-            _writer.Write(text);
-            _writer.Write('\n');
-            _writer.Flush();
-        }
+        _writer.Write(text);
+        _writer.Write('\n');
+        _writer.Flush();
     }
 
     private void WriteFallback(LogLevel level, string text)
