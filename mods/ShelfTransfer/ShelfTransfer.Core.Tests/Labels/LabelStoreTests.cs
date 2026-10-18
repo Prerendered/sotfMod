@@ -7,7 +7,9 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 
+using ShelfTransfer.Core.Gateway;
 using ShelfTransfer.Core.Labels;
+using ShelfTransfer.Core.Shelves;
 using ShelfTransfer.Core.Tests.Fakes;
 
 using Xunit;
@@ -724,6 +726,282 @@ public class LabelStoreTests
                 r.Namespace?.StartsWith("ShelfTransfer.Core.Gateway", StringComparison.Ordinal) ?? false,
                 $"Labels references Gateway type {r.FullName}");
         }
+    }
+
+    // ---- card 38: Entries read-only live view ----
+
+    [Fact]
+    public void Entries_EmptyStore_IsEmpty() => Assert.Empty(NewStore().Entries);
+
+    [Fact]
+    public void Entries_ReflectsSetAddUpdateAndClear()
+    {
+        LabelStore store = NewStore();
+        IReadOnlyDictionary<string, ShelfLabel> entries = store.Entries;
+
+        store.Set("k1", "Logs", "Wood");
+        store.Set("k2", "Rocks", null);
+        Assert.Equal(2, entries.Count);
+        Assert.Equal(new ShelfLabel("Logs", "Wood"), entries["k1"]);
+
+        store.Set("k1", "Planks", "Wood");
+        Assert.Equal(new ShelfLabel("Planks", "Wood"), entries["k1"]);
+        Assert.Equal(2, entries.Count);
+
+        store.Set("k1", null, null);
+        Assert.False(entries.ContainsKey("k1"));
+        Assert.Equal(new[] { "k2" }, entries.Keys.ToArray());
+    }
+
+    [Fact]
+    public void Entries_ReflectsPrune()
+    {
+        LabelStore store = NewStore();
+        store.Set("a", "A", null);
+        store.Set("b", "B", null);
+        store.Set("c", "C", null);
+        IReadOnlyDictionary<string, ShelfLabel> entries = store.Entries;
+
+        store.Prune(new[] { "b" });
+
+        Assert.Equal(new[] { "b" }, entries.Keys.ToArray());
+    }
+
+    [Fact]
+    public void Entries_ReflectsLoad_ReplacesContents()
+    {
+        var fs = new FakeLabelFileSystem();
+        fs.Store(FileWith(LabelFile.CurrentVersion, ("f1", new ShelfLabel("File", "G"))));
+        LabelStore store = NewStore(fs);
+        store.Set("mem", "Memory", null);
+        IReadOnlyDictionary<string, ShelfLabel> entries = store.Entries;
+
+        store.Load();
+
+        Assert.Equal(new[] { "f1" }, entries.Keys.ToArray());
+        Assert.Equal(new ShelfLabel("File", "G"), entries["f1"]);
+    }
+
+    [Theory]
+    [InlineData(EntriesLoadFailure.NoFile)]
+    [InlineData(EntriesLoadFailure.Corrupt)]
+    [InlineData(EntriesLoadFailure.Version)]
+    [InlineData(EntriesLoadFailure.ReadThrows)]
+    public void Entries_AfterNonLoadedLoad_IsEmpty_PinsLoadClearsFirst(EntriesLoadFailure failure)
+    {
+        var fs = new FakeLabelFileSystem();
+        LabelStore store = NewStore(fs);
+        store.Set("mem", "Memory", "G");
+        IReadOnlyDictionary<string, ShelfLabel> entries = store.Entries;
+
+        switch (failure)
+        {
+            case EntriesLoadFailure.NoFile:
+                fs.ReadResult = LabelReadResult.NoFile;
+                break;
+            case EntriesLoadFailure.Corrupt:
+                fs.ReadResult = LabelReadResult.Corrupt("bad");
+                break;
+            case EntriesLoadFailure.Version:
+                fs.Store(FileWith(99, ("f1", new ShelfLabel("File", null))));
+                break;
+            default:
+                fs.ThrowOnRead = new InvalidOperationException("boom");
+                break;
+        }
+
+        store.Load();
+
+        Assert.Empty(entries);
+        Assert.Same(entries, store.Entries);
+    }
+
+    [Fact]
+    public void Entries_BlockedSave_DoesNotChangeEntries()
+    {
+        LabelStore store = NewStore();
+        store.Set("k", "L", null);
+
+        LabelSaveResult result = store.Save();
+
+        Assert.Equal(LabelSaveStatus.Blocked, result.Status);
+        Assert.Equal(new[] { "k" }, store.Entries.Keys.ToArray());
+    }
+
+    [Fact]
+    public void Entries_ReturnsSameInstanceAcrossReadsAndMutations()
+    {
+        LabelStore store = NewStore();
+        IReadOnlyDictionary<string, ShelfLabel> first = store.Entries;
+
+        store.Set("k", "L", null);
+        store.Load();
+        store.Prune(Array.Empty<string>());
+
+        Assert.Same(first, store.Entries);
+        Assert.Same(store.Entries, store.Entries);
+    }
+
+    [Fact]
+    public void Entries_SeparateStores_DoNotShareView()
+    {
+        LabelStore a = NewStore();
+        LabelStore b = NewStore();
+        a.Set("k", "L", null);
+
+        Assert.NotSame(a.Entries, b.Entries);
+        Assert.Empty(b.Entries);
+    }
+
+    // ---- card 38 criterion 2: no mutation through the view (live view; IDictionary writes throw) ----
+
+    [Fact]
+    public void Entries_CastToIDictionary_AddThrows_StoreUnchanged()
+    {
+        LabelStore store = NewStore();
+        store.Set("k", "L", "G");
+        var dict = Assert.IsAssignableFrom<IDictionary<string, ShelfLabel>>(store.Entries);
+
+        Assert.Throws<NotSupportedException>(() => dict.Add("x", new ShelfLabel("X", null)));
+
+        AssertUnchanged(store);
+    }
+
+    [Fact]
+    public void Entries_CastToIDictionary_IndexerSetThrows_ForNewAndExistingKey()
+    {
+        LabelStore store = NewStore();
+        store.Set("k", "L", "G");
+        var dict = Assert.IsAssignableFrom<IDictionary<string, ShelfLabel>>(store.Entries);
+
+        Assert.Throws<NotSupportedException>(() => dict["x"] = new ShelfLabel("X", null));
+        Assert.Throws<NotSupportedException>(() => dict["k"] = new ShelfLabel("Hijack", null));
+
+        AssertUnchanged(store);
+    }
+
+    [Fact]
+    public void Entries_CastToIDictionary_RemoveThrows_StoreUnchanged()
+    {
+        LabelStore store = NewStore();
+        store.Set("k", "L", "G");
+        var dict = Assert.IsAssignableFrom<IDictionary<string, ShelfLabel>>(store.Entries);
+
+        Assert.Throws<NotSupportedException>(() => dict.Remove("k"));
+        Assert.Throws<NotSupportedException>(() => dict.Remove("absent"));
+
+        AssertUnchanged(store);
+    }
+
+    [Fact]
+    public void Entries_CastToIDictionary_ClearThrows_StoreUnchanged()
+    {
+        LabelStore store = NewStore();
+        store.Set("k", "L", "G");
+        var dict = Assert.IsAssignableFrom<IDictionary<string, ShelfLabel>>(store.Entries);
+
+        Assert.Throws<NotSupportedException>(() => dict.Clear());
+
+        AssertUnchanged(store);
+    }
+
+    [Fact]
+    public void Entries_CastToICollectionKeyValuePair_WritesThrow_StoreUnchanged()
+    {
+        LabelStore store = NewStore();
+        store.Set("k", "L", "G");
+        var coll = Assert.IsAssignableFrom<ICollection<KeyValuePair<string, ShelfLabel>>>(store.Entries);
+
+        Assert.True(coll.IsReadOnly);
+        Assert.Throws<NotSupportedException>(() => coll.Add(new KeyValuePair<string, ShelfLabel>("x", new ShelfLabel("X", null))));
+        Assert.Throws<NotSupportedException>(() => coll.Remove(new KeyValuePair<string, ShelfLabel>("k", new ShelfLabel("L", "G"))));
+
+        AssertUnchanged(store);
+    }
+
+    [Fact]
+    public void Entries_KeysAndValues_AreReadOnly()
+    {
+        LabelStore store = NewStore();
+        store.Set("k", "L", "G");
+        var keys = Assert.IsAssignableFrom<ICollection<string>>(store.Entries.Keys);
+        var values = Assert.IsAssignableFrom<ICollection<ShelfLabel>>(store.Entries.Values);
+
+        Assert.Throws<NotSupportedException>(() => keys.Clear());
+        Assert.Throws<NotSupportedException>(() => values.Add(new ShelfLabel("X", null)));
+
+        AssertUnchanged(store);
+    }
+
+    [Fact]
+    public void Entries_RecordValues_AreImmutable_SoNoMutationViaValue()
+    {
+        LabelStore store = NewStore();
+        store.Set("k", "L", "G");
+        ShelfLabel viaView = store.Entries["k"];
+
+        ShelfLabel changed = viaView with { Label = "Changed" };
+
+        Assert.Equal("Changed", changed.Label);
+        AssertUnchanged(store);
+    }
+
+    // ---- card 38 criterion 3: Entries is the labels input for ShelfListBuilder.Build ----
+
+    [Fact]
+    public void Entries_PassedToShelfListBuilder_ShowsLabelsAndReportsStaleKeys()
+    {
+        LabelStore store = NewStore();
+        store.Set("live", "Logs", "Wood");
+        store.Set("gone", "Old", "Wood");
+        store.Set("ungrouped", "Misc", null);
+        var shelves = new[]
+        {
+            new ShelfCandidate(new ShelfRef("live", "StorageShelf", new WorldPosition(1f, 0f, 0f)), 100, true),
+            new ShelfCandidate(new ShelfRef("ungrouped", "StorageShelf", new WorldPosition(5f, 0f, 0f)), 100, true),
+            new ShelfCandidate(new ShelfRef("unlabelled", "StorageShelf", new WorldPosition(9f, 0f, 0f)), 100, true),
+        };
+
+        ShelfList list = ShelfListBuilder.Build(shelves, "src", 10, new WorldPosition(0f, 0f, 0f), store.Entries);
+
+        Dictionary<string, ShelfRow> rows = list.Groups.SelectMany(g => g.Rows).ToDictionary(r => r.Shelf.Key);
+        Assert.Equal("Logs", rows["live"].Label);
+        Assert.Equal("Misc", rows["ungrouped"].Label);
+        Assert.Equal(ShelfListBuilder.DefaultLabel, rows["unlabelled"].Label);
+        Assert.Contains(list.Groups, g => g.Name == "Wood" && g.Rows.Single().Shelf.Key == "live");
+        Assert.Equal(new[] { "gone" }, list.StaleLabelKeys);
+        Assert.Equal(3, store.Count);
+    }
+
+    [Fact]
+    public void Entries_PassedToBuilderThenPruned_StaleKeysDropFromStore()
+    {
+        LabelStore store = NewStore();
+        store.Set("live", "Logs", null);
+        store.Set("gone", "Old", null);
+        var shelves = new[] { new ShelfCandidate(new ShelfRef("live", "StorageShelf", new WorldPosition(1f, 0f, 0f)), 100, true) };
+
+        ShelfList first = ShelfListBuilder.Build(shelves, "src", 10, new WorldPosition(0f, 0f, 0f), store.Entries);
+        store.Prune(shelves.Select(s => s.Shelf.Key));
+        ShelfList second = ShelfListBuilder.Build(shelves, "src", 10, new WorldPosition(0f, 0f, 0f), store.Entries);
+
+        Assert.Equal(new[] { "gone" }, first.StaleLabelKeys);
+        Assert.Empty(second.StaleLabelKeys);
+    }
+
+    public enum EntriesLoadFailure
+    {
+        NoFile,
+        Corrupt,
+        Version,
+        ReadThrows,
+    }
+
+    private static void AssertUnchanged(LabelStore store)
+    {
+        Assert.Equal(1, store.Count);
+        Assert.Equal(new ShelfLabel("L", "G"), store.Get("k"));
+        Assert.Equal(new[] { "k" }, store.Entries.Keys.ToArray());
     }
 
     private static IEnumerable<Type> Flatten(Type t)
