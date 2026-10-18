@@ -100,6 +100,8 @@ public sealed class LabelEditorUi : MonoBehaviour
     private Vector2 _groupScroll;
     private string? _note;
     private int _focusFrame = -1;
+    private int _counterLength = -1;
+    private string _counterText = string.Empty;
 
     private string? _toast;
     private bool _isToastError;
@@ -165,8 +167,9 @@ public sealed class LabelEditorUi : MonoBehaviour
 
         if (!_isOpen)
         {
-            // Not checked while open: the label key is then just a letter typed into the name.
-            if (Input.GetKeyDown(config.LabelKey.Value))
+            // Not checked while open: the label key is then just a letter typed into the name. Not while releasing
+            // either: the cursor is still the editor's, so BlockInput would record it as the state to restore.
+            if (!_isReleasing && Input.GetKeyDown(config.LabelKey.Value))
             {
                 TryOpen(log);
             }
@@ -256,6 +259,14 @@ public sealed class LabelEditorUi : MonoBehaviour
     [HideFromIl2Cpp]
     private void Submit(IModLog log)
     {
+        // Re-checked here for the Save button, which runs in OnGUI after this frame's Update check.
+        string? lostReason = GetLostReason();
+        if (lostReason is not null)
+        {
+            Cancel(log, lostReason);
+            return;
+        }
+
         string name = _name.Trim();
         string? group = GetChosenGroup();
         if (!LabelsFeature.IsValidName(name) || !LabelsFeature.IsValidName(group))
@@ -460,7 +471,7 @@ public sealed class LabelEditorUi : MonoBehaviour
 
         GUI.Label(new Rect(x, y, width, _lineHeight), _nameText, styles.Body);
         GUI.Label(new Rect(x + width - _counterWidth, y, _counterWidth, _lineHeight),
-            $"{_name.Length}/{LabelsFeature.MaxNameLength}", styles.CounterRight);
+            GetCounterText(), styles.CounterRight);
         y += _lineHeight + _gap;
         GUI.SetNextControlName(_nameControl);
         _name = GUI.TextField(new Rect(x, y, width, _fieldHeight), _name, LabelsFeature.MaxNameLength, styles.TextField);
@@ -523,6 +534,19 @@ public sealed class LabelEditorUi : MonoBehaviour
 
         GUI.backgroundColor = background;
         GUI.EndScrollView();
+    }
+
+    // OnGUI runs several times a frame; the text is rebuilt only when the length changes.
+    [HideFromIl2Cpp]
+    private string GetCounterText()
+    {
+        if (_name.Length != _counterLength)
+        {
+            _counterLength = _name.Length;
+            _counterText = $"{_counterLength}/{LabelsFeature.MaxNameLength}";
+        }
+
+        return _counterText;
     }
 
     [HideFromIl2Cpp]
