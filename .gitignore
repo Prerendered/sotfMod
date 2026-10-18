@@ -24,3 +24,6 @@ libs/
 # scratch
 *.log
 *.tmp
+
+# Overseer working state: local only, never on the remote
+team/
