@@ -1,9 +1,10 @@
-// purpose: D6 debug dump; on the Discovery key, logs the components, fields and methods of the aimed object and its parents
+// purpose: D6 debug dump; on the Discovery key, logs the world identity, then the components, fields and methods of the aimed object and its parents
 // owns:    DiscoveryDump
-// deps:    ModConfig, ShelfTransfer.Core.Logging (IModLog, LogLevel), UnityEngine (Camera, Physics, Input), Il2CppSystem reflection
+// deps:    ModConfig, WorldIdentityProbe, ShelfTransfer.Core.Logging (IModLog, LogLevel), UnityEngine (Camera, Physics, Input), Il2CppSystem reflection
 // caution: read-only (I2): no game method invoked, no field written. Static field values are never read (that can run
-//          a class constructor). Il2Cpp objects live in locals of one Update only. Only managed values reach the log,
-//          never an Il2Cpp object (its ToString could be a game override)
+//          a class constructor); WorldIdentityProbe's named reads are the one exception, see its header. Il2Cpp objects
+//          live in locals of one Update only. Only managed values reach the log, never an Il2Cpp object (its ToString
+//          could be a game override)
 
 using System;
 using System.Collections.Generic;
@@ -71,6 +72,7 @@ public sealed class DiscoveryDump : MonoBehaviour
         {
             if (Input.GetKeyDown(_config.DiscoveryKey.Value))
             {
+                WorldIdentityProbe.Write(_log);
                 WriteDump(_log);
             }
         }
@@ -425,7 +427,7 @@ public sealed class DiscoveryDump : MonoBehaviour
 
     // The one guarded read: interop throws on unreadable metadata or values, and the dump must log that as
     // discovery.missing (criterion 3) instead of losing the rest of the dump. Debug path, not per-frame.
-    private static bool TryRead<T>(Func<T> read, [MaybeNullWhen(false)] out T value, out string error)
+    internal static bool TryRead<T>(Func<T> read, [MaybeNullWhen(false)] out T value, out string error)
     {
         try
         {
@@ -441,7 +443,7 @@ public sealed class DiscoveryDump : MonoBehaviour
         }
     }
 
-    private static void WriteMissing(IModLog log, string reason, params KeyValuePair<string, object?>[] details)
+    internal static void WriteMissing(IModLog log, string reason, params KeyValuePair<string, object?>[] details)
     {
         List<KeyValuePair<string, object?>> line = new() { new("reason", reason) };
         line.AddRange(details);
