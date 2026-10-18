@@ -1,13 +1,15 @@
 // purpose: one world's shelf labels and groups in memory, loaded from and saved to ILabelFileSystem (flow F3, invariant 5)
 // owns:    LabelStore, LabelLoadResult, LabelLoadStatus, LabelSaveResult, LabelSaveStatus
 // deps:    ILabelFileSystem, LabelFile, ShelfLabel, WorldId
-// caution: keys are opaque ShelfKey strings — never reference Core/Gateway here. Not thread-safe (main thread only).
+// caution: keys are opaque ShelfKey strings - never reference Core/Gateway here. Not thread-safe (main thread only).
 //          Prune trusts its caller: an empty live set from a registry that has not populated yet drops every label.
 //          Save is allowed after a Corrupt load, so the file system must preserve the corrupt file (e.g. .bad) at Read
-//          time when it returns Corrupt — never defer it to Write — or the first Save overwrites the only copy.
+//          time when it returns Corrupt - never defer it to Write - or the first Save overwrites the only copy.
+//          Entries wraps _labels live, so _labels must never be reassigned (Load clears and refills it).
 
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.Linq;
 
 namespace ShelfTransfer.Core.Labels;
@@ -40,11 +42,13 @@ public sealed class LabelStore
 {
     private readonly ILabelFileSystem _fileSystem;
     private readonly Dictionary<string, ShelfLabel> _labels = new(StringComparer.Ordinal);
+    private readonly ReadOnlyDictionary<string, ShelfLabel> _entries;
     private LabelLoadStatus? _lastLoad;
 
     public LabelStore(ILabelFileSystem fileSystem, string? worldId)
     {
         _fileSystem = fileSystem;
+        _entries = new ReadOnlyDictionary<string, ShelfLabel>(_labels);
         SanitisedWorldId = WorldId.Sanitise(worldId);
     }
 
@@ -52,6 +56,12 @@ public sealed class LabelStore
     public string SanitisedWorldId { get; }
 
     public int Count => _labels.Count;
+
+    /// <summary>
+    /// Live read-only view of every entry: reflects later Set/Prune/Load without a copy. Writes through an
+    /// IDictionary cast throw NotSupportedException. Do not mutate the store while enumerating it.
+    /// </summary>
+    public IReadOnlyDictionary<string, ShelfLabel> Entries => _entries;
 
     /// <summary>Null when the shelf has no label and no group.</summary>
     public ShelfLabel? Get(string key) => _labels.TryGetValue(key, out ShelfLabel? label) ? label : null;
