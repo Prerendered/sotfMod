@@ -2,7 +2,7 @@
 // owns:    FileModLog
 // deps:    ShelfTransfer.Core.Logging (IModLog, LogLine, LogLevel, LogSizeCap), BepInEx ManualLogSource (fallback)
 // caution: never throws into the game; any failure goes to the BepInEx log instead. Past LogSizeCap.MaxSessionBytes
-//          one log.cap line is written and later events are dropped; the BepInEx fallback is not capped
+//          one log.cap line goes to the active sink (file or BepInEx fallback) and later events are dropped
 
 using System;
 using System.Collections.Generic;
@@ -106,24 +106,19 @@ public sealed class FileModLog : IModLog
     }
 
     // Flushed per event so the file is complete even if the game crashes or is killed.
+    // The budget is checked before choosing the sink, so the BepInEx fallback cannot fill the disk either.
     private void Append(LogLevel level, string text)
     {
-        if (_writer is null)
-        {
-            WriteFallback(level, text);
-            return;
-        }
-
         lock (_gate)
         {
             // +1 for the '\n' terminator.
             switch (_sizeCap.Admit(_encoding.GetByteCount(text) + 1L))
             {
                 case LogSizeCap.Admission.Write:
-                    WriteLine(_writer, text);
+                    WriteToSink(level, text);
                     break;
                 case LogSizeCap.Admission.WriteCapNotice:
-                    WriteLine(_writer, LogLine.Format(DateTimeOffset.Now, LogLevel.Warn, "log.cap", new KeyValuePair<string, object?>[]
+                    WriteToSink(LogLevel.Warn, LogLine.Format(DateTimeOffset.Now, LogLevel.Warn, "log.cap", new KeyValuePair<string, object?>[]
                     {
                         new("limit_bytes", LogSizeCap.MaxSessionBytes),
                         new("written_bytes", _sizeCap.WrittenBytes),
@@ -136,11 +131,17 @@ public sealed class FileModLog : IModLog
         }
     }
 
-    private static void WriteLine(StreamWriter writer, string text)
+    private void WriteToSink(LogLevel level, string text)
     {
-        writer.Write(text);
-        writer.Write('\n');
-        writer.Flush();
+        if (_writer is null)
+        {
+            WriteFallback(level, text);
+            return;
+        }
+
+        _writer.Write(text);
+        _writer.Write('\n');
+        _writer.Flush();
     }
 
     private void WriteFallback(LogLevel level, string text)
