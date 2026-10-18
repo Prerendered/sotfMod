@@ -1,8 +1,10 @@
-// purpose: the `transfer` debug-console command: list target shelves by index, start a transfer of the aimed item, cancel it
+// purpose: the `transfer` command (debug console and the transfer prompt): list target shelves by index, start a transfer
+//          of the aimed item, cancel it
 // owns:    TransferCommand
 // deps:    TransferDriver, AimWatcher, ShelfRegistry, IShelfGateway, ShelfListBuilder, StopReasonText, IModLog,
 //          TheForest.DebugConsole (interop: RegisterCommand, TryGetDynamicCommands, LogCommandInfo), UnityEngine
-// caution: indexes refer to the last `transfer list` snapshot, never a fresh scan, so the number typed is the row printed.
+// caution: indexes refer to the last list snapshot, never a fresh scan, so the number typed is the row printed. I2 - never
+//          calls TakeOne/StoreOne; only the runner does, through TransferDriver.
 //          The game keeps the sender behind a WeakReference; this component is the sender and lives on BepInEx's manager object
 
 using System;
@@ -12,6 +14,7 @@ using System.Linq;
 
 using Il2CppInterop.Runtime.Attributes;
 
+using Sons.Gameplay;
 using TheForest;
 
 using UnityEngine;
@@ -36,6 +39,7 @@ public sealed class TransferCommand : MonoBehaviour
     private const string _listArgument = "list";
     private const string _cancelArgument = "cancel";
     private const string _usage = "Usage: transfer list | transfer <count> <index> | transfer cancel";
+    private const string _failedText = "transfer failed, see the mod log";
 
     // The console can drop dynamic commands (ClearDynamicCommands); a cheap lookup once a second re-adds ours.
     private const double _registerCheckSeconds = 1.0;
@@ -55,7 +59,19 @@ public sealed class TransferCommand : MonoBehaviour
     private Il2CppSystem.Func<string, bool>? _handler;
     private IReadOnlyList<ShelfRow> _indexedTargets = Array.Empty<ShelfRow>();
 
+    // The prompt's aim, taken when it opens: the camera may move while the player types. The controller is the looked-at
+    // one, re-tracked before a start because a list rescan in between can map a duplicate key to its twin.
+    private AimTarget? _capturedAim;
+    private ItemStorageController? _capturedShelf;
+    private bool _hasCapturedShelf;
+    private string _runningText = string.Empty;
+
     public TransferCommand(IntPtr ptr) : base(ptr) { }
+
+    public bool IsRunning => _driver is not null && _driver.IsRunning;
+
+    /// <summary>True when the shelf captured by CaptureAim has been destroyed since.</summary>
+    public bool IsCapturedShelfGone => _hasCapturedShelf && _capturedShelf == null;
 
     // Managed parameters cannot cross into Il2Cpp; hidden so ClassInjector does not try to expose it.
     [HideFromIl2Cpp]
@@ -67,6 +83,35 @@ public sealed class TransferCommand : MonoBehaviour
         _aimWatcher = aimWatcher;
         _driver = driver;
     }
+
+    /// <summary>Takes the slot aimed at right now for RunCaptured; null when none is aimed.</summary>
+    [HideFromIl2Cpp]
+    public AimTarget? CaptureAim()
+    {
+        _capturedAim = _aimWatcher?.GetCurrent();
+        _capturedShelf = null;
+        _hasCapturedShelf = false;
+        if (_capturedAim is not null && _aimWatcher is not null && _registry is not null && _aimWatcher.TrackCurrent()
+            && _registry.TryGetLive(_capturedAim.Shelf.Key, out ItemStorageController? shelf))
+        {
+            _capturedShelf = shelf;
+            _hasCapturedShelf = true;
+        }
+
+        return _capturedAim;
+    }
+
+    /// <summary>
+    /// Runs one command line against the CaptureAim slot. Lines go to <paramref name="output"/>, the finished run's result
+    /// line to <paramref name="onFinished"/>. True when a transfer started.
+    /// </summary>
+    [HideFromIl2Cpp]
+    public bool RunCaptured(string arguments, List<string> output, Action<string> onFinished) =>
+        Run(arguments, _capturedAim, TrackCaptured, output, onFinished);
+
+    /// <summary>The running transfer's start line, or null when none runs.</summary>
+    [HideFromIl2Cpp]
+    public string? GetRunningText() => IsRunning ? _runningText : null;
 
     public void Update()
     {
@@ -108,19 +153,41 @@ public sealed class TransferCommand : MonoBehaviour
         });
     }
 
-    // Called by the game's console; a throw must not cross back into Il2Cpp, so this is the command's one boundary.
+    // Called by the game's console with the live aim; Run is the boundary, so no throw crosses back into Il2Cpp.
     [HideFromIl2Cpp]
     private bool HandleCommand(string? arguments)
     {
-        if (_log is null || _registry is null || _gateway is null || _aimWatcher is null || _driver is null)
+        if (_aimWatcher is null)
         {
             return false;
         }
 
+        List<string> output = new();
+        Run(arguments ?? "", _aimWatcher.GetCurrent(), _aimWatcher.TrackCurrent, output, Print);
+        foreach (string line in output)
+        {
+            Print(line);
+        }
+
+        // The command always answers with its own console line, so the game's failure text would only add noise.
+        return true;
+    }
+
+    // The one boundary for both callers (console callback, prompt frame); a throw becomes the failed line.
+    [HideFromIl2Cpp]
+    private bool Run(string arguments, AimTarget? aim, Func<bool> trackSource, List<string> output, Action<string> onFinished)
+    {
+        if (_log is null || _registry is null || _gateway is null || _driver is null)
+        {
+            output.Add(_failedText);
+            return false;
+        }
+
+        bool hasStarted = false;
         bool hasFailed = false;
         try
         {
-            Dispatch(arguments ?? "", _log, _registry, _gateway, _aimWatcher, _driver);
+            hasStarted = Dispatch(arguments, aim, trackSource, output, onFinished, _log, _registry, _gateway, _driver);
         }
         catch (Exception ex)
         {
@@ -130,16 +197,15 @@ public sealed class TransferCommand : MonoBehaviour
 
         if (hasFailed)
         {
-            Print("transfer failed, see the mod log");
+            output.Add(_failedText);
         }
 
-        // The command always answers with its own console line, so the game's failure text would only add noise.
-        return true;
+        return hasStarted;
     }
 
     [HideFromIl2Cpp]
-    private void Dispatch(string arguments, IModLog log, ShelfRegistry registry, IShelfGateway gateway, AimWatcher aimWatcher,
-        TransferDriver driver)
+    private bool Dispatch(string arguments, AimTarget? aim, Func<bool> trackSource, List<string> output,
+        Action<string> onFinished, IModLog log, ShelfRegistry registry, IShelfGateway gateway, TransferDriver driver)
     {
         string[] parts = arguments.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
         // Whether the console passes the whole line or only what follows the command is unverified; accept both.
@@ -150,29 +216,31 @@ public sealed class TransferCommand : MonoBehaviour
 
         if (parts.Length == 0)
         {
-            Print(_usage);
+            output.Add(_usage);
         }
         else if (parts.Length == 1 && IsWord(parts[0], _listArgument))
         {
-            ListTargets(log, registry, gateway, aimWatcher.GetCurrent());
+            ListTargets(log, registry, gateway, aim, output);
         }
         else if (parts.Length == 1 && IsWord(parts[0], _cancelArgument))
         {
-            Print(driver.RequestCancel() ? "Cancel requested; stops after the current item." : "No transfer is running.");
+            output.Add(driver.RequestCancel() ? "Cancel requested; stops after the current item." : "No transfer is running.");
         }
         else
         {
-            StartTransfer(log, gateway, aimWatcher, driver, parts, arguments);
+            return StartTransfer(log, gateway, driver, aim, trackSource, parts, arguments, output, onFinished);
         }
+
+        return false;
     }
 
     [HideFromIl2Cpp]
-    private void ListTargets(IModLog log, ShelfRegistry registry, IShelfGateway gateway, AimTarget? aim)
+    private void ListTargets(IModLog log, ShelfRegistry registry, IShelfGateway gateway, AimTarget? aim, List<string> output)
     {
         Camera camera = Camera.main;
         if (camera == null)
         {
-            Print("No world loaded.");
+            output.Add("No world loaded.");
             return;
         }
 
@@ -191,7 +259,7 @@ public sealed class TransferCommand : MonoBehaviour
             new WorldPosition(player.x, player.y, player.z), _noLabels);
         _indexedTargets = list.Groups.SelectMany(group => group.Rows).ToList();
 
-        Print(aim is null
+        output.Add(aim is null
             ? $"{_indexedTargets.Count} shelves by distance (aim at a stocked slot to see how many fit):"
             : $"{_indexedTargets.Count} targets for item {aim.Item.Value} by distance (fits = how many of the {sourceCount} go there):");
         for (int i = 0; i < _indexedTargets.Count; i++)
@@ -209,22 +277,21 @@ public sealed class TransferCommand : MonoBehaviour
             });
             if (i < _maxPrintedRows)
             {
-                Print(string.Format(CultureInfo.InvariantCulture, "{0}. {1}  {2:0} m {3}  fits {4}",
+                output.Add(string.Format(CultureInfo.InvariantCulture, "{0}. {1}  {2:0} m {3}  fits {4}",
                     index, row.Shelf.TypeName, row.Distance, row.Bearing, row.Fits));
             }
         }
 
         if (_indexedTargets.Count > _maxPrintedRows)
         {
-            Print($"... {_indexedTargets.Count - _maxPrintedRows} more in the mod log (shelves.index lines).");
+            output.Add($"... {_indexedTargets.Count - _maxPrintedRows} more in the mod log (shelves.index lines).");
         }
     }
 
     [HideFromIl2Cpp]
-    private void StartTransfer(IModLog log, IShelfGateway gateway, AimWatcher aimWatcher, TransferDriver driver, string[] parts,
-        string arguments)
+    private bool StartTransfer(IModLog log, IShelfGateway gateway, TransferDriver driver, AimTarget? aim,
+        Func<bool> trackSource, string[] parts, string arguments, List<string> output, Action<string> onFinished)
     {
-        AimTarget? aim = aimWatcher.GetCurrent();
         if (driver.IsRunning)
         {
             log.Write(LogLevel.Warn, "transfer.request", new KeyValuePair<string, object?>[]
@@ -233,20 +300,21 @@ public sealed class TransferCommand : MonoBehaviour
                 new("reason", "busy"),
                 new("args", arguments),
             });
-            Print("A transfer is already running; wait for it or type: transfer cancel");
-            return;
+            output.Add("A transfer is already running; wait for it or type: transfer cancel");
+            return false;
         }
 
         if (parts.Length != 2 || !TryParsePositive(parts[0], out int amount))
         {
-            Block(log, gateway, aim, "usage", arguments, _usage);
-            return;
+            output.Add(Block(log, gateway, aim, "usage", arguments, _usage));
+            return false;
         }
 
         if (aim is null)
         {
-            Block(log, gateway, null, "no aimed slot", arguments, "Aim at a shelf slot that holds items, then run the command.");
-            return;
+            output.Add(Block(log, gateway, null, "no aimed slot", arguments,
+                "Aim at a shelf slot that holds items, then run the command."));
+            return false;
         }
 
         if (!TryParsePositive(parts[1], out int index) || index > _indexedTargets.Count)
@@ -255,37 +323,42 @@ public sealed class TransferCommand : MonoBehaviour
             string message = _indexedTargets.Count == 0
                 ? "No shelf list yet; run: transfer list"
                 : $"Index must be 1 to {_indexedTargets.Count}; run transfer list to refresh.";
-            Block(log, gateway, aim, detail, arguments, message);
-            return;
+            output.Add(Block(log, gateway, aim, detail, arguments, message));
+            return false;
         }
 
         ShelfRef target = _indexedTargets[index - 1].Shelf;
         if (target.Key == aim.Shelf.Key)
         {
-            Block(log, gateway, aim, "target is the source", arguments, "That index is the shelf you are aiming at.");
-            return;
+            output.Add(Block(log, gateway, aim, "target is the source", arguments, "That index is the shelf you are aiming at."));
+            return false;
         }
 
-        // `transfer list` rescans and can map a duplicate key to the other twin; the source must be the looked-at shelf.
-        if (!aimWatcher.TrackCurrent())
+        // A list rescans and can map a duplicate key to the other twin; the source must be the looked-at shelf.
+        if (!trackSource())
         {
-            Block(log, gateway, aim, "aim lost", arguments, "Could not confirm the aimed shelf; aim at the slot and try again.");
-            return;
+            output.Add(Block(log, gateway, aim, "aim lost", arguments,
+                "Could not confirm the aimed shelf; aim at the slot and try again."));
+            return false;
         }
 
         TransferRequest request = new(aim.Shelf, aim.Slot, target, aim.Item, amount);
-        if (!driver.TryStart(request, report => Print(StopReasonText.Format(report).Text)))
+        if (!driver.TryStart(request, report => onFinished(StopReasonText.Format(report).Text)))
         {
-            Block(log, gateway, aim, "driver not ready", arguments, "Transfer could not start, see the mod log.");
-            return;
+            output.Add(Block(log, gateway, aim, "driver not ready", arguments, "Transfer could not start, see the mod log."));
+            return false;
         }
 
-        Print($"Moving up to {amount} of item {aim.Item.Value} to #{index} {target.TypeName}...");
+        _runningText = $"Moving up to {amount} of item {aim.Item.Value} to #{index} {target.TypeName}...";
+        output.Add(_runningText);
+        return true;
     }
 
     // Mirrors the runner's own transfer.stop fields, so a refused command reads the same in the log as a refused plan.
+    // Returns the player-facing message.
     [HideFromIl2Cpp]
-    private void Block(IModLog log, IShelfGateway gateway, AimTarget? aim, string detail, string arguments, string message)
+    private static string Block(IModLog log, IShelfGateway gateway, AimTarget? aim, string detail, string arguments,
+        string message)
     {
         int? sourceCount = aim is null ? null : gateway.GetCount(aim.Shelf, aim.Item);
         log.Write(LogLevel.Info, "transfer.stop", new KeyValuePair<string, object?>[]
@@ -298,7 +371,20 @@ public sealed class TransferCommand : MonoBehaviour
             new("detail", detail),
             new("args", arguments),
         });
-        Print(message);
+        return message;
+    }
+
+    // The prompt's counterpart of AimWatcher.TrackCurrent: the controller captured at open instead of a fresh ray.
+    [HideFromIl2Cpp]
+    private bool TrackCaptured()
+    {
+        if (_capturedAim is null || _registry is null || !_hasCapturedShelf || _capturedShelf == null)
+        {
+            return false;
+        }
+
+        _registry.Track(_capturedAim.Shelf.Key, _capturedShelf);
+        return true;
     }
 
     private static bool TryParsePositive(string text, out int value) =>

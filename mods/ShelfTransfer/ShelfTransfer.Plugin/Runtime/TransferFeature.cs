@@ -1,6 +1,7 @@
-// purpose: installs the transfer feature from the composition root: registry, gateway, aim watcher, driver and console command
+// purpose: installs the transfer feature from the composition root: registry, gateway, aim watcher, driver, console command
+//          and the transfer prompt
 // owns:    TransferFeature
-// deps:    ModConfig, ShelfRegistry, InteropShelfGateway, AimWatcher, TransferDriver, TransferCommand, ShelfTransfer.Core.Logging (IModLog, LogLevel), BepInEx IL2CPPChainloader
+// deps:    ModConfig, ShelfRegistry, InteropShelfGateway, AimWatcher, TransferDriver, TransferCommand, TransferPromptUi, ShelfTransfer.Core.Logging (IModLog, LogLevel), BepInEx IL2CPPChainloader
 
 using System.Collections.Generic;
 
@@ -10,6 +11,7 @@ using ShelfTransfer.Core.Logging;
 using ShelfTransfer.Plugin.Commands;
 using ShelfTransfer.Plugin.Config;
 using ShelfTransfer.Plugin.Game;
+using ShelfTransfer.Plugin.Ui;
 
 namespace ShelfTransfer.Plugin.Runtime;
 
@@ -26,6 +28,9 @@ public static class TransferFeature
         aimWatcher.Init(log, registry, gateway);
         TransferDriver driver = IL2CPPChainloader.AddUnityComponent<TransferDriver>();
         driver.Init(log, config, gateway);
-        IL2CPPChainloader.AddUnityComponent<TransferCommand>().Init(log, registry, gateway, aimWatcher, driver);
+        // The console registration stays even though the console is unreachable (session 5); the prompt is the way in.
+        TransferCommand command = IL2CPPChainloader.AddUnityComponent<TransferCommand>();
+        command.Init(log, registry, gateway, aimWatcher, driver);
+        IL2CPPChainloader.AddUnityComponent<TransferPromptUi>().Init(log, config, command);
     }
 }

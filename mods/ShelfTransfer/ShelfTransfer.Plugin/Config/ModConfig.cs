@@ -25,8 +25,11 @@ public sealed class ModConfig
 
     public ModConfig(ConfigFile file)
     {
-        TransferKey = file.Bind(_keysSection, "Transfer", KeyCode.L,
-            "Opens the transfer overlay while aiming at a shelf slot.");
+        // A new entry name, not "Transfer": BepInEx keeps a saved value over a new default, so the old L would stick.
+        TransferKey = file.Bind(_keysSection, "TransferPrompt", KeyCode.Equals,
+            "Opens the transfer prompt (list, <count> <index>, cancel). Default: the =/+ key on the main row.");
+        TransferAltKey = file.Bind(_keysSection, "TransferPromptAlt", KeyCode.KeypadPlus,
+            "Second key that opens the transfer prompt; None turns it off. Default: numpad +.");
         LabelKey = file.Bind(_keysSection, "Label", KeyCode.K,
             "Opens the label editor for the shelf you are looking at.");
         DiscoveryKey = file.Bind(_keysSection, "Discovery", KeyCode.F8,
@@ -49,6 +52,8 @@ public sealed class ModConfig
     }
 
     public ConfigEntry<KeyCode> TransferKey { get; }
+
+    public ConfigEntry<KeyCode> TransferAltKey { get; }
 
     public ConfigEntry<KeyCode> LabelKey { get; }
 
