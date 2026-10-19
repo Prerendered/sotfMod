@@ -34,6 +34,10 @@ public interface IShelfGateway
     /// null, when the shelf is empty or gone. Reads only.</summary>
     IReadOnlyList<ShelfStockEntry> ListStock(ShelfRef shelf);
 
+    /// <summary>Free space of the hook the next <see cref="StoreOne"/> would fill, chosen as the game chooses it (a hook
+    /// already holding the item with room). 0 when that hook would be an empty one or cannot be resolved. Reads only.</summary>
+    int GetReceivingHookFree(ShelfRef shelf, ItemId item);
+
     /// <summary>The vanilla take of one chunk (<see cref="GetTransferUnit"/> items) from the aimed slot (what E does).</summary>
     GatewayOutcome TakeOne(ShelfRef shelf, SlotRef slot, ItemId item);
 

@@ -166,6 +166,39 @@ public sealed class InteropShelfGateway : IShelfGateway
             return ShelfStockEntry.BuildList(slots);
         });
 
+    // Reads only (I2), mirroring ItemStorageController.TryAddItem (0x333D580): an empty _selectedHookPoint wins over any
+    // hook; else TryGetAvailableHook (0x333ECB0) takes the first hook in order whose _layoutItemGroup holds the item with
+    // GetAvailableSpace() > 0, then an empty hook with a template. Arrow mode takes another path (unresolved here).
+    public int GetReceivingHookFree(ShelfRef shelf, ItemId item) =>
+        Guard("get_receiving_hook_free", _ => 0, () =>
+        {
+            if (!TryGetShelf(shelf, out ItemStorageController? controller) || controller._arrowMode)
+            {
+                return 0;
+            }
+
+            ItemStorageHookPoint? selected = controller._selectedHookPoint;
+            if (selected != null && selected._layoutItemGroup == null)
+            {
+                return 0;
+            }
+
+            foreach (ItemStorageHookPoint hook in CopyHooks(controller))
+            {
+                InWorldLayoutItemGroup? group = hook._layoutItemGroup;
+                if (group != null && group._itemId == item.Value)
+                {
+                    int free = group.GetAvailableSpace();
+                    if (free > 0)
+                    {
+                        return free;
+                    }
+                }
+            }
+
+            return 0;
+        });
+
     public GatewayOutcome TakeOne(ShelfRef shelf, SlotRef slot, ItemId item) =>
         Guard("take_one", GatewayOutcome.Failed, () =>
         {
