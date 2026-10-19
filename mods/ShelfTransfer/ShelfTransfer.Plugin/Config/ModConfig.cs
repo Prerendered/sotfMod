@@ -24,6 +24,11 @@ public sealed class ModConfig
     private const int _confirmTicksDefault = 30;
     private const int _confirmTicksMin = 0;
     private const int _confirmTicksMax = 300;
+    private const int _burstSizeDefault = 10;
+    private const int _burstSizeMin = 1;
+
+    // The largest game chunk seen (plan.md: unit 50); a burst never exceeds the chunk anyway.
+    private const int _burstSizeMax = 50;
     private const int _faultInjectOff = 0;
 
     public ModConfig(ConfigFile file)
@@ -49,6 +54,16 @@ public sealed class ModConfig
             "Per-step wait, in frames, for the host to confirm each take and store on a friend-hosted game before the "
             + "transfer stops. Single-player and hosted games confirm at once; 0 never waits.",
             new AcceptableValueRange<int>(_confirmTicksMin, _confirmTicksMax)));
+        // Off until the in-game check on a friend-hosted world shows back-to-back stores all land (card 91).
+        BurstStores = file.Bind(_transferSection, "BurstStores", false,
+            "Faster stores on a friend-hosted game: stores several items one after another, then checks them all at "
+            + "once, instead of checking after every item. Each store is still the game's normal single store. "
+            + "Off checks every item.");
+        BurstSize = file.Bind(_transferSection, "BurstSize", _burstSizeDefault, new ConfigDescription(
+            "With BurstStores on: the most items stored before one check. Never more than the item's chunk, or than "
+            + "the shelf slot receiving them still has room for. Higher is faster; if the host turns a store down, "
+            + "up to this many items can end up on the ground by the shelf.",
+            new AcceptableValueRange<int>(_burstSizeMin, _burstSizeMax)));
 
         // DryRun until card 82 shows the shelf scan finds every shelf: it missed real shelves and pruned their labels.
         PruneMode = file.Bind(_labelsSection, "PruneMode", LabelPruneMode.DryRun,
@@ -75,6 +90,10 @@ public sealed class ModConfig
     public ConfigEntry<int> ItemsPerFrame { get; }
 
     public ConfigEntry<int> ConfirmTicks { get; }
+
+    public ConfigEntry<bool> BurstStores { get; }
+
+    public ConfigEntry<int> BurstSize { get; }
 
     public ConfigEntry<LabelPruneMode> PruneMode { get; }
 

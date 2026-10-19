@@ -1,6 +1,7 @@
 // purpose: runs one TransferRunner at a time, ticking it once per frame inside the P2 try/catch boundary
 // owns:    TransferDriver
-// deps:    TransferRunner, TransferRequest, TransferReport, IShelfGateway, IModLog, ModConfig (ItemsPerFrame, ConfirmTicks), UnityEngine
+// deps:    TransferRunner, TransferRequest, TransferReport, IShelfGateway, IModLog, ModConfig (ItemsPerFrame, ConfirmTicks, BurstStores,
+//          BurstSize), UnityEngine
 // caution: the only catch is around Tick; a throw aborts the runner (GatewayError, counts re-read), nothing is retried (I3)
 
 using System;
@@ -55,7 +56,9 @@ public sealed class TransferDriver : MonoBehaviour
         }
 
         int confirmTicks = _config.ConfirmTicks.Value;
-        _log.Write(LogLevel.Info, "transfer.request", new KeyValuePair<string, object?>[]
+        bool isBursting = _config.BurstStores.Value;
+        int burstSize = isBursting ? _config.BurstSize.Value : 1;
+        List<KeyValuePair<string, object?>> line = new()
         {
             new("source", request.Source.Key),
             new("target", request.Target.Key),
@@ -64,8 +67,16 @@ public sealed class TransferDriver : MonoBehaviour
             new("slot", request.SourceSlot.Index),
             new("items_per_frame", _config.ItemsPerFrame.Value),
             new("confirm_ticks", confirmTicks),
-        });
-        _runner = new TransferRunner(_gateway, _log, request, confirmTicks);
+        };
+
+        // Only when on, so a run with BurstStores off logs exactly as before card 91.
+        if (isBursting)
+        {
+            line.Add(new("burst_size", burstSize));
+        }
+
+        _log.Write(LogLevel.Info, "transfer.request", line);
+        _runner = new TransferRunner(_gateway, _log, request, confirmTicks, burstSize);
         _onFinished = onFinished;
         return true;
     }

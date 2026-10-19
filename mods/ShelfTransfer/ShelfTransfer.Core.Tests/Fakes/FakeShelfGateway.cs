@@ -24,6 +24,10 @@ public sealed class FakeShelf
 
     public bool IsAlive { get; set; } = true;
 
+    /// <summary>What GetReceivingHookFree answers; null mirrors the plugin on a one-hook shelf: Free while the shelf holds the
+    /// item, 0 (an empty hook) while it holds none.</summary>
+    public int? ReceivingHookFree { get; set; }
+
     /// <summary>Per-slot stock of a mixed shelf (card 74), in hook order.</summary>
     public List<(SlotRef Slot, ItemId Item, int Count)> Slots { get; } = new();
 
@@ -230,6 +234,19 @@ public sealed class FakeShelfGateway : IShelfGateway
         }
 
         return ShelfStockEntry.BuildList(fake.Slots.Select(s => (s.Slot, s.Item, s.Count, UnitOf(s.Item))));
+    }
+
+    // A gone shelf answers 0, as the plugin's Guard does.
+    public int GetReceivingHookFree(ShelfRef shelf, ItemId item)
+    {
+        Record($"GetReceivingHookFree({shelf.Key})");
+        FakeShelf fake = _shelves[shelf.Key];
+        if (!fake.IsAlive)
+        {
+            return 0;
+        }
+
+        return fake.ReceivingHookFree ?? (fake.Count > 0 ? fake.Free : 0);
     }
 
     public GatewayOutcome TakeOne(ShelfRef shelf, SlotRef slot, ItemId item)

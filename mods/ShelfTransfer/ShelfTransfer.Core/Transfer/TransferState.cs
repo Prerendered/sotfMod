@@ -13,9 +13,10 @@ public enum TransferState
     /// <summary>TakeOne issued; verify source-N and inventory+N, re-reading once per tick while the counts have not moved yet.
     /// Held until the first StoreOne, so a stop before it counts the whole chunk off the source.</summary>
     TakenAwaitingVerify,
-    /// <summary>Between the single stores of a chunk (N &gt; 1), the rest of it still in the inventory; never spans a tick.</summary>
+    /// <summary>Between the store bursts of a chunk (N &gt; 1), the rest of it still in the inventory; never spans a tick.</summary>
     StoringQueue,
-    /// <summary>StoreOne issued; verify target+1 and inventory-1 before the next store or cycle, re-reading once per tick while the counts have not moved yet.</summary>
+    /// <summary>A burst of B StoreOne calls issued (B = 1 per item); verify target+B and inventory-B before the next burst or cycle,
+    /// re-reading once per tick while the counts have not moved yet.</summary>
     StoredAwaitingVerify,
     Finished,
 }

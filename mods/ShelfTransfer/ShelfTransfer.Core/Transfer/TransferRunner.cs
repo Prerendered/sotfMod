@@ -1,9 +1,10 @@
-// purpose: the transfer state machine (flow F2): plan, then per cycle take one chunk -> verify -> (store one -> verify) per item
-//          of the chunk; any fault stops, never retries
+// purpose: the transfer state machine (flow F2): plan, then per cycle take one chunk -> verify -> (store a burst of single
+//          items -> verify) until the chunk is stored; any fault stops, never retries
 // owns:    TransferRunner
 // deps:    IShelfGateway, IModLog, AmountClamp, TransferRequest, TransferReport, TransferState, StopReason
 // caution: a cycle splits across ticks only while awaiting a host confirm, and then only re-reads (I1, D7); only TakeOne/StoreOne mutate (I2);
-//          at most one chunk is ever in the inventory (I1 amended); Tick never catches; after a throw, Abort or the next Tick finishes (P2)
+//          at most one chunk is ever in the inventory (I1 amended); Tick never catches; after a throw, Abort or the next Tick finishes (P2);
+//          burst size 1 is the per-item path (I3); above 1 each burst is verified as a whole (I3 amended, card 91)
 
 using System;
 using System.Collections.Generic;
@@ -19,6 +20,9 @@ public sealed class TransferRunner
     private readonly IModLog _log;
     private readonly TransferRequest _request;
     private readonly int _confirmTicks;
+
+    // Most single stores sent before one verify; 1 = verify every item.
+    private readonly int _burstSize;
     private bool _hasBaseline;
     private int _sourceStart;
     private int _targetStart;
@@ -36,19 +40,32 @@ public sealed class TransferRunner
     // Items of the current chunk whose take is verified and whose store is not yet verified (the backpack queue).
     private int _queued;
 
+    // Ok StoreOne calls of the current burst; set from its first store until the next burst starts.
+    private int _inFlight;
+
+    // A burst cut short by a non-Ok store; the stores before it are verified first, then the run stops with this.
+    private (StopReason Reason, string Detail)? _pendingStoreFault;
+
     /// <summary><paramref name="confirmTicks"/>: ticks to keep re-reading after an Ok take or store whose counts have not moved yet
-    /// (a friend-hosted client sees them only once the host applies it); 0 verifies immediately.</summary>
-    public TransferRunner(IShelfGateway gateway, IModLog log, TransferRequest request, int confirmTicks = 0)
+    /// (a friend-hosted client sees them only once the host applies it); 0 verifies immediately.
+    /// <paramref name="burstSize"/>: most single stores sent back to back before one verify (card 91); 1 verifies each item.</summary>
+    public TransferRunner(IShelfGateway gateway, IModLog log, TransferRequest request, int confirmTicks = 0, int burstSize = 1)
     {
         if (confirmTicks < 0)
         {
             throw new ArgumentOutOfRangeException(nameof(confirmTicks), confirmTicks, "must not be negative");
         }
 
+        if (burstSize < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(burstSize), burstSize, "must be at least 1");
+        }
+
         _gateway = gateway;
         _log = log;
         _request = request;
         _confirmTicks = confirmTicks;
+        _burstSize = burstSize;
     }
 
     public TransferState State { get; private set; } = TransferState.Planning;
@@ -63,8 +80,13 @@ public sealed class TransferRunner
 
     private bool IsFinished => State == TransferState.Finished;
 
+    private bool IsBursting => _burstSize > 1;
+
     // Valid between chunks and during a take wait, where Moved is a whole number of chunks.
     private int ChunkNumber => Moved / _unit + 1;
+
+    // The item number of a store step; a burst of several shows its range ("11..20").
+    private object StoreNumber => IsBursting && _inFlight > 1 ? $"{Moved + 1}..{Moved + _inFlight}" : Moved + 1;
 
     /// <summary>Honoured at the next <see cref="TransferState.ReadyForNext"/>, never mid-cycle (D7).</summary>
     public void RequestCancel() => _isCancelRequested = true;
@@ -308,7 +330,7 @@ public sealed class TransferRunner
 
         bool isCycleDone = State == TransferState.TakenAwaitingVerify
             ? VerifyTake(ChunkNumber) && IsTargetUnchangedSinceCycleStart() && TryStoreChunk()
-            : VerifyStore(Moved + 1) && TryStoreChunk();
+            : VerifyStore() && TryStoreChunk();
         if (isCycleDone)
         {
             CompleteCycle();
@@ -428,46 +450,87 @@ public sealed class TransferRunner
         return !IsFinished;
     }
 
-    // Stores the queued items one at a time, each verified before the next (I3); cancel never lands mid-chunk (D7).
-    // True once the queue is empty; false while awaiting a store confirm or after a stop.
+    // Stores the queued items in bursts of single stores, each burst verified before the next (I3 amended); cancel never
+    // lands mid-chunk (D7). True once the queue is empty; false while awaiting a store confirm or after a stop.
     private bool TryStoreChunk()
     {
-        while (_queued > 0)
+        while (true)
         {
-            if (!TryStore(Moved + 1))
+            if (_pendingStoreFault is (StopReason reason, string detail))
+            {
+                Finish(reason, detail);
+                return false;
+            }
+
+            if (_queued == 0)
+            {
+                return true;
+            }
+
+            int burst = GetBurstSize();
+            if (IsFinished || !TryStoreBurst(burst))
             {
                 return false;
             }
         }
-
-        return true;
     }
 
-    private bool TryStore(int itemNumber)
+    // On a client every store of a burst lands on the hook the first one picks (local counts stay stale until the host
+    // confirms), so the burst must fit that hook (I4). An empty hook gets its group from the first store: it goes alone.
+    private int GetBurstSize()
     {
-        GatewayOutcome store = _gateway.StoreOne(_request.Target, _request.Item);
-        if (IsFinished)
+        if (!IsBursting)
         {
-            return false;
+            return 1;
         }
 
-        if (!store.IsOk)
-        {
-            Finish(GetFaultReason(store.Status, StopReason.StoreRefused), $"store {store.Status}: {store.Detail}");
-            return false;
-        }
-
-        State = TransferState.StoredAwaitingVerify;
-        _hasStoreVerdict = false;
-        return VerifyStore(itemNumber);
+        int hookFree = _gateway.GetReceivingHookFree(_request.Target, _request.Item);
+        return hookFree < 1 ? 1 : Math.Min(Math.Min(_burstSize, _queued), hookFree);
     }
 
-    // Same as VerifyTake. While awaiting, the verdict stays out so Finish settles the item from fresh reads.
-    private bool VerifyStore(int itemNumber)
+    // burst = 1 is the per-item store. A non-Ok store ends the burst; the Ok ones before it still get their verify.
+    private bool TryStoreBurst(int burst)
     {
+        _inFlight = 0;
+        for (int i = 0; i < burst; i++)
+        {
+            GatewayOutcome store = _gateway.StoreOne(_request.Target, _request.Item);
+            if (IsFinished)
+            {
+                return false;
+            }
+
+            if (!store.IsOk)
+            {
+                StopReason reason = GetFaultReason(store.Status, StopReason.StoreRefused);
+                string detail = $"store {store.Status}: {store.Detail}";
+                if (_inFlight == 0)
+                {
+                    Finish(reason, detail);
+                    return false;
+                }
+
+                _pendingStoreFault = (reason, detail);
+                break;
+            }
+
+            _inFlight++;
+            State = TransferState.StoredAwaitingVerify;
+            _hasStoreVerdict = false;
+        }
+
+        return VerifyStore();
+    }
+
+    // Same as VerifyTake, for the whole burst: target +n, inventory -n. While awaiting, the verdict stays out so Finish
+    // settles the burst from fresh reads.
+    private bool VerifyStore()
+    {
+        object storeNumber = StoreNumber;
         int targetBefore = _targetStart + Moved;
+        int targetExpected = targetBefore + _inFlight;
         int inventoryBefore = _inventoryStart + _queued;
-        int inventoryExpected = inventoryBefore - 1;
+        int inventoryExpected = inventoryBefore - _inFlight;
         int targetAfter = _gateway.GetCount(_request.Target, _request.Item);
         if (IsFinished)
         {
@@ -480,10 +543,10 @@ public sealed class TransferRunner
             return false;
         }
 
-        bool isTargetVerified = targetAfter == targetBefore + 1;
+        bool isTargetVerified = targetAfter == targetExpected;
         bool isInventoryVerified = inventoryAfter == inventoryExpected;
         bool isVerified = isTargetVerified && isInventoryVerified;
-        bool isAwaitable = IsAwaitable(targetAfter, targetBefore, targetBefore + 1)
+        bool isAwaitable = IsAwaitable(targetAfter, targetBefore, targetExpected)
             && IsAwaitable(inventoryAfter, inventoryBefore, inventoryExpected);
         if (TryAwaitConfirm(isVerified, isAwaitable))
         {
@@ -492,12 +555,13 @@ public sealed class TransferRunner
 
         _hasStoreVerdict = true;
         string waitNote = GetNoConfirmNote(targetAfter == targetBefore && inventoryAfter == inventoryBefore);
-        EndWait(itemNumber, "store", isVerified);
-        LogStep("transfer.store", itemNumber, "dst", targetBefore, targetAfter, inventoryBefore, inventoryAfter, isVerified);
+        EndWait(storeNumber, "store", isVerified);
+        LogStep("transfer.store", storeNumber, "dst", targetBefore, targetAfter, inventoryBefore, inventoryAfter, isVerified,
+            burst: IsBursting ? _inFlight : null);
         if (isVerified)
         {
-            Moved++;
-            _queued--;
+            Moved += _inFlight;
+            _queued -= _inFlight;
             if (_queued > 0)
             {
                 // The rest of the chunk is still in the inventory; Finish counts it stranded if the next store fails.
@@ -507,17 +571,43 @@ public sealed class TransferRunner
             return true;
         }
 
-        LogStoreMismatch(itemNumber, targetBefore, targetAfter, inventoryBefore, inventoryAfter);
+        LogStoreMismatch(storeNumber, targetBefore, targetAfter, inventoryBefore, inventoryAfter, _inFlight);
+        int sent = _inFlight;
+        int confirmed = GetConfirmedStores(targetBefore, targetAfter, inventoryBefore, inventoryAfter);
+        CreditConfirmedStores(confirmed);
+        string burstNote = sent > 1 ? $"; {confirmed} of {sent} confirmed" : "";
+        if (_pendingStoreFault is (_, string cutBy))
+        {
+            burstNote += $"; burst cut by {cutBy}";
+        }
+
         if (!isTargetVerified)
         {
-            Finish(StopReason.TargetMismatch, $"store: target expected {targetBefore + 1} read {targetAfter}{waitNote}");
+            Finish(StopReason.TargetMismatch, $"store: target expected {targetExpected} read {targetAfter}{waitNote}{burstNote}");
         }
         else
         {
-            Finish(StopReason.InventoryMismatch, $"store: inventory expected {inventoryExpected} read {inventoryAfter}{waitNote}");
+            Finish(StopReason.InventoryMismatch,
+                $"store: inventory expected {inventoryExpected} read {inventoryAfter}{waitNote}{burstNote}");
         }
 
         return false;
+    }
+
+    // Stores of the burst the counts prove landed: the inventory gave up the whole burst (the client consumes at once) and
+    // the target rose by no more than it. Anything else is drift, and nothing is credited. For one store that is all or none.
+    private int GetConfirmedStores(int targetBefore, int? targetAfter, int inventoryBefore, int? inventoryAfter)
+    {
+        int? landed = targetAfter - targetBefore;
+        return inventoryAfter == inventoryBefore - _inFlight && landed >= 0 && landed <= _inFlight ? landed.Value : 0;
+    }
+
+    // Keeps the tracked fallback in Finish consistent with the credit: credited stores leave both the queue and the burst.
+    private void CreditConfirmedStores(int confirmed)
+    {
+        Moved += confirmed;
+        _queued -= confirmed;
+        _inFlight -= confirmed;
     }
 
     // A count between its before value and the expected one is one the host has not (fully) applied yet; any other value
@@ -541,8 +631,8 @@ public sealed class TransferRunner
     private string GetNoConfirmNote(bool isUnmoved) =>
         _isAwaitingConfirm && isUnmoved ? $"; no host confirm after {_waitTicks} ticks" : "";
 
-    // number: the chunk for a take wait, the item for a store wait (the same for one-item chunks).
-    private void EndWait(int number, string step, bool isVerified)
+    // number: the chunk for a take wait, the item (or burst range) for a store wait (the same for one-item chunks).
+    private void EndWait(object number, string step, bool isVerified)
     {
         if (!_isAwaitingConfirm)
         {
@@ -575,14 +665,14 @@ public sealed class TransferRunner
 
         // A stop mid-wait (Abort after a throw or disconnect, a re-entrant stop, shelf gone) still records the wait.
         bool isTakeWait = stoppedIn == TransferState.TakenAwaitingVerify;
-        EndWait(isTakeWait ? ChunkNumber : Moved + 1, isTakeWait ? "take" : "store", false);
+        EndWait(isTakeWait ? ChunkNumber : StoreNumber, isTakeWait ? "take" : "store", false);
 
         // An unverified take is assumed to have moved its whole chunk; after a verified take the queue says what is off
-        // the source, and a store in flight is assumed to have left the inventory (the client consumes at once).
+        // the source, and the stores in flight are assumed to have left the inventory (the client consumes at once).
         bool isStoreUnsettled = stoppedIn == TransferState.StoredAwaitingVerify && !_hasStoreVerdict;
         int offSource = isTakeWait ? _unit : _queued;
         int trackedRemaining = _sourceStart - Moved - offSource;
-        int trackedStranded = stoppedIn == TransferState.StoredAwaitingVerify ? Math.Max(0, _queued - 1) : offSource;
+        int trackedStranded = stoppedIn == TransferState.StoredAwaitingVerify ? Math.Max(0, _queued - _inFlight) : offSource;
 
         // Re-read rather than derive (invariant 1); tracked counts only when the gateway cannot answer, and the detail says so.
         string? countsNote = null;
@@ -611,20 +701,21 @@ public sealed class TransferRunner
             : null;
         int stranded = inventoryNow is int inventory ? Math.Clamp(inventory - _inventoryStart, 0, _unit) : trackedStranded;
 
-        // The game said Ok but the stop came before the verify; settle the item from the fresh reads, never on the game's word.
+        // The game said Ok but the stop came before the verify; settle the burst from the fresh reads, never on the game's word.
+        // A burst can be part-applied by the host: only what the counts prove landed is moved.
         string? storeNote = null;
         if (isStoreUnsettled)
         {
+            object storeNumber = StoreNumber;
+            int sent = _inFlight;
             int targetBefore = _targetStart + Moved;
             int inventoryBefore = _inventoryStart + _queued;
-            if (targetNow == targetBefore + 1 && inventoryNow == inventoryBefore - 1)
+            int confirmed = GetConfirmedStores(targetBefore, targetNow, inventoryBefore, inventoryNow);
+            CreditConfirmedStores(confirmed);
+            if (confirmed < sent)
             {
-                Moved++;
-            }
-            else
-            {
-                LogStoreMismatch(Moved + 1, targetBefore, targetNow, inventoryBefore, inventoryNow);
-                storeNote = "store unverified";
+                LogStoreMismatch(storeNumber, targetBefore, targetNow, inventoryBefore, inventoryNow, sent);
+                storeNote = sent > 1 ? $"burst unverified, {confirmed} of {sent} confirmed" : "store unverified";
             }
         }
 
@@ -660,17 +751,25 @@ public sealed class TransferRunner
 
     // The report's S0 check sees only source + inventory, so a store the game called Ok that the counts contradict
     // could hide a target-side loss or duplicate; flag it separately.
-    private void LogStoreMismatch(int itemNumber, int targetBefore, int? targetAfter, int inventoryBefore, int? inventoryAfter)
+    private void LogStoreMismatch(
+        object storeNumber,
+        int targetBefore,
+        int? targetAfter,
+        int inventoryBefore,
+        int? inventoryAfter,
+        int sent)
     {
-        _log.Write(LogLevel.Warn, "conservation.mismatch", new KeyValuePair<string, object?>[]
+        List<KeyValuePair<string, object?>> line = new() { new("check", "store"), new("n", storeNumber) };
+        if (IsBursting)
         {
-            new("check", "store"),
-            new("n", itemNumber),
-            new("dst_before", targetBefore),
-            new("dst_after", targetAfter),
-            new("inv_before", inventoryBefore),
-            new("inv_after", inventoryAfter),
-        });
+            line.Add(new("burst", sent));
+        }
+
+        line.Add(new("dst_before", targetBefore));
+        line.Add(new("dst_after", targetAfter));
+        line.Add(new("inv_before", inventoryBefore));
+        line.Add(new("inv_after", inventoryAfter));
+        _log.Write(LogLevel.Warn, "conservation.mismatch", line);
     }
 
     private static string? JoinNotes(params string?[] notes)
@@ -696,19 +795,25 @@ public sealed class TransferRunner
 
     private void LogStep(
         string eventName,
-        int number,
+        object number,
         string shelfPrefix,
         int shelfBefore,
         int shelfAfter,
         int inventoryBefore,
         int inventoryAfter,
         bool isVerified,
-        int? unit = null)
+        int? unit = null,
+        int? burst = null)
     {
         List<KeyValuePair<string, object?>> line = new() { new("n", number) };
         if (unit is int chunk)
         {
             line.Add(new("unit", chunk));
+        }
+
+        if (burst is int sent)
+        {
+            line.Add(new("burst", sent));
         }
 
         line.Add(new(shelfPrefix + "_before", shelfBefore));
