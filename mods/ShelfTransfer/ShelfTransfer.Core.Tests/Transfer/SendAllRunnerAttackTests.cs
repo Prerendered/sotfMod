@@ -347,6 +347,9 @@ public sealed class SendAllRunnerAttackTests
     [InlineData(10, 15, 0, 20, 5)]
     [InlineData(10, 10, 10, 30, 0)]
     [InlineData(10, 10, 7, 20, 7)]
+    [InlineData(15, 15, 0, 20, 10)]
+    [InlineData(15, 15, 15, 30, 15)]
+    [InlineData(5, 25, 9, 20, 19)]
     public void Tick_TypeSplitOverSlots_MovesWholeChunksAndLeavesTheRemainder(int a, int b, int c, int moved, int left)
     {
         Rig rig = new(mre: 0, ammo: a, third: 0);
@@ -367,10 +370,63 @@ public sealed class SendAllRunnerAttackTests
         Assert.Equal(0, rig.Gateway.Inventory);
     }
 
-    // Total 15 at unit 10 but no slot holds a whole chunk: the any-hook take refuses, which is an unsafe stop for the whole queue
-    // (safe, nothing moved or stranded; a design question filed as a card, not a skip).
+    // Card 85 crit 1: ammo 15 + 15 plans 20, moves 20, Completed, and the queue goes on to the next type
     [Fact]
-    public void Tick_TypeOnlyInPartialChunkSlots_TakeRefusedEndsQueueWithNothingStranded()
+    public void Tick_AmmoFifteenPlusFifteen_MovesTwentyCompletedAndQueueContinues()
+    {
+        Rig rig = new(mre: 0, ammo: 15, third: 4);
+        rig.Gateway.Shelf(SendAllRunnerTests.Src).Slots.Add((new SlotRef(11), SendAllRunnerTests.Ammo, 15));
+
+        rig.RunToEnd();
+
+        Assert.Equal(SendAllStopReason.Completed, rig.Report.Reason);
+        SendAllTypeResult ammo = rig.Report.Types[0];
+        Assert.Equal(SendAllTypeOutcome.Moved, ammo.Outcome);
+        Assert.Equal(StopReason.Completed, SendAllRunnerTests.RunOf(ammo).Reason);
+        Assert.Equal(20, SendAllRunnerTests.RunOf(ammo).Requested);
+        Assert.Equal(20, ammo.Moved);
+        Assert.Equal(10, ammo.Remaining);
+        Assert.Equal(SendAllTypeOutcome.Moved, rig.Report.Types[1].Outcome);
+        Assert.Equal(24, rig.Report.Moved);
+        Assert.Equal(0, rig.Report.Stranded);
+        Assert.Equal(6, rig.Gateway.TakeCalls);
+    }
+
+    // Card 85, mixed shelf: split ammo (15 + 15) moves 20, a 5 + 5 + 5 chunk type is skipped DoesntFit with no take, MRE moves, queue Completed
+    [Fact]
+    public void Tick_MixedShelfSplitAmmoPartialOnlyTypeAndMre_MovesAmmoSkipsPartialMovesMre()
+    {
+        Rig rig = new(mre: 6, ammo: 15, third: 5);
+        FakeShelf source = rig.Gateway.Shelf(SendAllRunnerTests.Src);
+        source.Slots.Add((new SlotRef(11), SendAllRunnerTests.Ammo, 15));
+        source.Slots.Add((new SlotRef(12), SendAllRunnerTests.Third, 5));
+        source.Slots.Add((new SlotRef(13), SendAllRunnerTests.Third, 5));
+        rig.Gateway.ItemUnits[SendAllRunnerTests.Third] = 10;
+
+        rig.RunToEnd();
+
+        Assert.Equal(SendAllStopReason.Completed, rig.Report.Reason);
+        SendAllTypeResult ammo = rig.Report.Types.Single(t => t.Item == SendAllRunnerTests.Ammo);
+        SendAllTypeResult partial = rig.Report.Types.Single(t => t.Item == SendAllRunnerTests.Third);
+        SendAllTypeResult mre = rig.Report.Types.Single(t => t.Item == SendAllRunnerTests.Mre);
+        Assert.Equal(SendAllTypeOutcome.Moved, ammo.Outcome);
+        Assert.Equal(20, ammo.Moved);
+        Assert.Equal(10, ammo.Remaining);
+        Assert.Equal(SendAllTypeOutcome.Skipped, partial.Outcome);
+        Assert.Equal(SendAllSkipReason.DoesntFit, partial.SkipReason);
+        Assert.Equal(15, partial.Remaining);
+        Assert.Equal(SendAllTypeOutcome.Moved, mre.Outcome);
+        Assert.Equal(6, mre.Moved);
+        Assert.Equal(26, rig.Report.Moved);
+        Assert.Equal(0, rig.Report.Stranded);
+        Assert.Equal(26, rig.Target.Count);
+        Assert.Equal(0, rig.Gateway.Inventory);
+        Assert.Equal(2 + 6, rig.Gateway.TakeCalls);
+    }
+
+    // Card 85 crit 3: total 15 at unit 10 but no slot holds a whole chunk -> skipped before any take, the queue goes on
+    [Fact]
+    public void Tick_TypeOnlyInPartialChunkSlots_SkippedDoesntFitBeforeAnyTakeAndQueueContinues()
     {
         Rig rig = new(mre: 0, ammo: 5, third: 4);
         rig.Gateway.Shelf(SendAllRunnerTests.Src).Slots.Add((new SlotRef(11), SendAllRunnerTests.Ammo, 5));
@@ -378,11 +434,17 @@ public sealed class SendAllRunnerAttackTests
 
         rig.RunToEnd();
 
-        Assert.Equal(SendAllStopReason.SafetyStop, rig.Report.Reason);
-        Assert.Equal(StopReason.TakeRefused, SendAllRunnerTests.RunOf(rig.Report.Types[0]).Reason);
-        Assert.Equal(0, rig.Report.Moved);
+        Assert.Equal(SendAllStopReason.Completed, rig.Report.Reason);
+        SendAllTypeResult ammo = rig.Report.Types[0];
+        Assert.Equal(SendAllTypeOutcome.Skipped, ammo.Outcome);
+        Assert.Equal(SendAllSkipReason.DoesntFit, ammo.SkipReason);
+        Assert.Equal(StopReason.BlockedBeforeStart, SendAllRunnerTests.RunOf(ammo).Reason);
+        Assert.Equal(15, ammo.Remaining);
+        Assert.Equal(SendAllTypeOutcome.Moved, rig.Report.Types[1].Outcome);
+        Assert.Equal(4, rig.Report.Moved);
         Assert.Equal(0, rig.Report.Stranded);
-        Assert.Equal(SendAllTypeOutcome.NotStarted, rig.Report.Types[1].Outcome);
+        Assert.Equal(4, rig.Gateway.TakeCalls);
+        Assert.Contains("reason=DoesntFit", rig.Lines("queue.type")[0], StringComparison.Ordinal);
     }
 
     // Client shape: the host applies a take or store only after the call returns, so the run waits (confirmTicks > 0)

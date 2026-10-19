@@ -182,6 +182,22 @@ public sealed class TransferRunner
             return;
         }
 
+        // A take moves a whole chunk from one slot, so short slots (15 + 15 at 10) hold less than the rounded total (card 85).
+        // Unit 1 always moves the whole count, so it skips the read.
+        bool isBlockedOnSplit = false;
+        if (_unit > 1 && clamp.Reason == ClampReason.Ok)
+        {
+            int movable = _gateway.GetMovableCount(_request.Source, _request.SourceSlot, _request.Item);
+            if (IsFinished)
+            {
+                return;
+            }
+
+            int capped = AmountClamp.RoundDownToChunk(Math.Min(clamp.Amount, Math.Max(0, movable)), _unit);
+            isBlockedOnSplit = capped == 0;
+            clamp = clamp with { Amount = capped };
+        }
+
         // The gateway answers 0 for an emptied slot too, so a count reason (NothingToMove) wins over "unit unknown".
         bool isBlockedOnUnit = !isUnitKnown && clamp.Reason == ClampReason.Ok;
         Requested = isBlockedOnUnit ? 0 : clamp.Amount;
@@ -211,6 +227,11 @@ public sealed class TransferRunner
         {
             // Taking blind could put a whole unknown chunk in the inventory and misreport it (I1).
             Finish(StopReason.BlockedBeforeStart, "transfer unit unknown");
+        }
+        else if (isBlockedOnSplit)
+        {
+            // Not "NothingToMove": a whole chunk's worth is there, only split, so Send all skips it as DoesntFit (card 85).
+            Finish(StopReason.BlockedBeforeStart, $"no slot holds a whole chunk of {_unit}");
         }
         else if (Requested == 0)
         {
