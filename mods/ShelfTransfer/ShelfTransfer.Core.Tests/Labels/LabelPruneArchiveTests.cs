@@ -54,7 +54,7 @@ public sealed class LabelPruneArchiveTests : IDisposable
         ShelfLabel? atArchive = null;
         fs.OnAppend = () => atArchive = store.Get("gone");
 
-        LabelPruneResult result = PruneTwice(new LabelPruneGuard(), store);
+        LabelPruneResult result = PruneTwice(new LabelPruneGuard(LabelPruneMode.Archive), store);
 
         Assert.Equal(_goneLabel, atArchive);
         (string world, var entries) = Assert.Single(fs.Appends);
@@ -69,7 +69,7 @@ public sealed class LabelPruneArchiveTests : IDisposable
     {
         var fs = new FakeLabelFileSystem { AppendResult = LabelWriteResult.Failed("disk full") };
         LabelStore store = NewStore(fs);
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
 
         LabelPruneResult failed = PruneTwice(guard, store);
         fs.AppendResult = LabelWriteResult.Ok;
@@ -89,7 +89,7 @@ public sealed class LabelPruneArchiveTests : IDisposable
         fs.OnAppend = () => throw new IOException("locked");
         LabelStore store = NewStore(fs);
 
-        LabelPruneResult result = PruneTwice(new LabelPruneGuard(), store);
+        LabelPruneResult result = PruneTwice(new LabelPruneGuard(LabelPruneMode.Archive), store);
 
         Assert.Equal(LabelPruneOutcome.ArchiveFailed, result.Outcome);
         Assert.Equal(_goneLabel, store.Get("gone"));
@@ -101,7 +101,7 @@ public sealed class LabelPruneArchiveTests : IDisposable
     public void SavePruned_SaveNotSaved_PutsTheEntriesBack(LabelSaveStatus status)
     {
         LabelStore store = NewStore(new FakeLabelFileSystem());
-        LabelPruneResult result = PruneTwice(new LabelPruneGuard(), store);
+        LabelPruneResult result = PruneTwice(new LabelPruneGuard(LabelPruneMode.Archive), store);
 
         LabelSaveResult? saved = LabelPruneGuard.SavePruned(store, result.Pruned, () => new LabelSaveResult(status, 1, null));
 
@@ -113,7 +113,7 @@ public sealed class LabelPruneArchiveTests : IDisposable
     public void SavePruned_NoStoreToSave_PutsTheEntriesBackAsFailed()
     {
         LabelStore store = NewStore(new FakeLabelFileSystem());
-        LabelPruneResult result = PruneTwice(new LabelPruneGuard(), store);
+        LabelPruneResult result = PruneTwice(new LabelPruneGuard(LabelPruneMode.Archive), store);
 
         LabelSaveResult? saved = LabelPruneGuard.SavePruned(store, result.Pruned, () => null);
 
@@ -129,7 +129,7 @@ public sealed class LabelPruneArchiveTests : IDisposable
         store.Load();
         store.Set("live", "Logs", null);
         store.Set("gone", _goneLabel.Label, _goneLabel.Group);
-        LabelPruneResult result = PruneTwice(new LabelPruneGuard(), store);
+        LabelPruneResult result = PruneTwice(new LabelPruneGuard(LabelPruneMode.Archive), store);
 
         LabelSaveResult? saved = LabelPruneGuard.SavePruned(store, result.Pruned, store.Save);
 
@@ -195,7 +195,7 @@ public sealed class LabelPruneArchiveTests : IDisposable
     public void SavePruned_KeySetAgainBeforeFailedSave_NewerValueWins()
     {
         LabelStore store = NewStore(new FakeLabelFileSystem());
-        LabelPruneResult result = PruneTwice(new LabelPruneGuard(), store);
+        LabelPruneResult result = PruneTwice(new LabelPruneGuard(LabelPruneMode.Archive), store);
         store.Set("gone", "Newer", "Other");
 
         LabelPruneGuard.SavePruned(store, result.Pruned, () => new LabelSaveResult(LabelSaveStatus.Failed, 1, null));
@@ -209,7 +209,7 @@ public sealed class LabelPruneArchiveTests : IDisposable
     public void SavePruned_KeySetAgainInsideTheSave_NewerValueWins(LabelSaveStatus status)
     {
         LabelStore store = NewStore(new FakeLabelFileSystem());
-        LabelPruneResult result = PruneTwice(new LabelPruneGuard(), store);
+        LabelPruneResult result = PruneTwice(new LabelPruneGuard(LabelPruneMode.Archive), store);
 
         LabelPruneGuard.SavePruned(store, result.Pruned, () =>
         {
@@ -226,7 +226,7 @@ public sealed class LabelPruneArchiveTests : IDisposable
     public void SavePruned_KeyDeletedBeforeFailedSave_IsResurrected_PinnedBehaviour()
     {
         LabelStore store = NewStore(new FakeLabelFileSystem());
-        LabelPruneResult result = PruneTwice(new LabelPruneGuard(), store);
+        LabelPruneResult result = PruneTwice(new LabelPruneGuard(LabelPruneMode.Archive), store);
         store.Set("gone", null, null);
 
         LabelPruneGuard.SavePruned(store, result.Pruned, () => new LabelSaveResult(LabelSaveStatus.Failed, 1, null));

@@ -28,7 +28,7 @@ public class LabelPruneGuardTests
     {
         LabelStore store = NewStore();
 
-        LabelPruneResult result = new LabelPruneGuard().Prune(store, new[] { "live" }, "src");
+        LabelPruneResult result = new LabelPruneGuard(LabelPruneMode.Archive).Prune(store, new[] { "live" }, "src");
 
         Assert.Equal(LabelPruneOutcome.Checked, result.Outcome);
         Assert.Empty(result.Pruned);
@@ -40,7 +40,7 @@ public class LabelPruneGuardTests
     public void Prune_SecondConsecutiveScanMissingKey_RemovesItAndReturnsItsLabel()
     {
         LabelStore store = NewStore();
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "live" }, "src");
 
         LabelPruneResult result = guard.Prune(store, new[] { "live" }, "src");
@@ -57,7 +57,7 @@ public class LabelPruneGuardTests
     public void Prune_KeySeenBetweenTwoMissingScans_IsNotPruned()
     {
         LabelStore store = NewStore();
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "live" }, "src");
         guard.Prune(store, new[] { "live", "gone" }, "src");
 
@@ -71,7 +71,7 @@ public class LabelPruneGuardTests
     public void Prune_SourceKeyOnly_IsLive()
     {
         LabelStore store = NewStore();
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "live" }, "gone");
 
         LabelPruneResult result = guard.Prune(store, new[] { "live" }, "gone");
@@ -84,7 +84,7 @@ public class LabelPruneGuardTests
     public void Prune_FallbackWorld_NeverPrunes()
     {
         LabelStore store = NewStore(world: null);
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "live" }, "src");
 
         LabelPruneResult result = guard.Prune(store, new[] { "live" }, "src");
@@ -98,7 +98,7 @@ public class LabelPruneGuardTests
     public void Prune_EmptyListing_SkipsAndBreaksTheRun()
     {
         LabelStore store = NewStore();
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "live" }, "src");
 
         LabelPruneResult skipped = guard.Prune(store, Array.Empty<string>(), "src");
@@ -112,7 +112,7 @@ public class LabelPruneGuardTests
     [Fact]
     public void Prune_NewStoreInstance_StartsOver()
     {
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(NewStore(), new[] { "live" }, "src");
         LabelStore reentered = NewStore();
 

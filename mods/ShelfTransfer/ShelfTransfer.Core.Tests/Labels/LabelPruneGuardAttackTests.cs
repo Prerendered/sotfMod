@@ -35,7 +35,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_MissSeenMissMiss_PrunesOnlyOnTheSecondConsecutiveMiss()
     {
         LabelStore store = NewStore("a", "gone");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         string[] without = { "a" };
         string[] with = { "a", "gone" };
 
@@ -52,7 +52,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_AlternatingMissAndSeen_NeverPrunes()
     {
         LabelStore store = NewStore("a", "gone");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
 
         for (int i = 0; i < 20; i++)
         {
@@ -67,7 +67,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_ThreeScansMissing_PrunesOnceThenNothingMore()
     {
         LabelStore store = NewStore("a", "gone");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "a" }, "s");
         Assert.Single(guard.Prune(store, new[] { "a" }, "s").Pruned);
 
@@ -83,7 +83,7 @@ public class LabelPruneGuardAttackTests
     {
         string[] all = Enumerable.Range(0, 300).Select(i => "k" + i.ToString("D3")).ToArray();
         LabelStore store = NewStore(all);
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         string[] firstListing = all.Where((_, i) => i % 3 != 0).ToArray();     // every third missing
         string[] secondListing = all.Where((_, i) => i % 6 != 0 && i % 3 != 1).ToArray();    // sixths missing again; thirds-plus-one newly missing
 
@@ -106,7 +106,7 @@ public class LabelPruneGuardAttackTests
         store.Set("alpha", "A", null);
         store.Set("mid", "M", "G2");
         store.Set("live", "Live", null);
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "live" }, "s");
 
         LabelPruneResult result = guard.Prune(store, new[] { "live" }, "s");
@@ -124,7 +124,7 @@ public class LabelPruneGuardAttackTests
         var store = new LabelStore(new FakeLabelFileSystem(), "w1");
         store.Set("gone", null, "Base");
         store.Set("live", "x", null);
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "live" }, "s");
 
         LabelPruneResult result = guard.Prune(store, new[] { "live" }, "s");
@@ -137,7 +137,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_SourceShelfWithLabel_NeverPendingOrPruned_EvenWhenAbsentFromListing()
     {
         LabelStore store = NewStore("src", "live");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
 
         LabelPruneResult first = guard.Prune(store, new[] { "live" }, "src");
         LabelPruneResult second = guard.Prune(store, new[] { "live" }, "src");
@@ -152,7 +152,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_SourceChangesBetweenOpens_PreviousSourceStartsItsRunFromTheNextScan()
     {
         LabelStore store = NewStore("a", "b", "live");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "live" }, "a");                       // a protected, b pending
         LabelPruneResult second = guard.Prune(store, new[] { "live" }, "b");   // b protected, a pending: nobody pruned
 
@@ -168,7 +168,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_SourceKeyIsInTheListingToo_NoSpecialProblem()
     {
         LabelStore store = NewStore("src", "gone");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "src" }, "src");
 
         LabelPruneResult result = guard.Prune(store, new[] { "src" }, "src");
@@ -181,7 +181,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_DuplicateKeysInListing_AreHarmless()
     {
         LabelStore store = NewStore("a", "gone");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         string[] listing = { "a", "a", "a" };
         guard.Prune(store, listing, "s");
 
@@ -194,7 +194,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_KeysCompareOrdinally_CaseDiffersMeansMissing()
     {
         LabelStore store = NewStore("Shelf");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "shelf" }, "s");
 
         LabelPruneResult result = guard.Prune(store, new[] { "shelf" }, "s");
@@ -206,7 +206,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_EmptyListingBetweenTwoMisses_BreaksTheRunAndLeavesLabelsAlone()
     {
         LabelStore store = NewStore("a", "gone");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "a" }, "s");
         LabelPruneResult empty = guard.Prune(store, Array.Empty<string>(), "s");
 
@@ -225,7 +225,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_EmptyListingWithASourceKey_StillSkips_NothingIsProvenLive()
     {
         LabelStore store = NewStore("src", "gone");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
 
         LabelPruneResult result = guard.Prune(store, Array.Empty<string>(), "src");
 
@@ -238,7 +238,7 @@ public class LabelPruneGuardAttackTests
     {
         var store = new LabelStore(new FakeLabelFileSystem(), "w1");
 
-        LabelPruneResult result = new LabelPruneGuard().Prune(store, new[] { "a" }, "s");
+        LabelPruneResult result = new LabelPruneGuard(LabelPruneMode.Archive).Prune(store, new[] { "a" }, "s");
 
         Assert.Equal(LabelPruneOutcome.Checked, result.Outcome);
         Assert.Empty(result.Pruned);
@@ -250,7 +250,7 @@ public class LabelPruneGuardAttackTests
     {
         LabelStore store = NewStore("a", "b");
 
-        LabelPruneResult result = new LabelPruneGuard().Prune(store, new[] { "a", "b" }, "s");
+        LabelPruneResult result = new LabelPruneGuard(LabelPruneMode.Archive).Prune(store, new[] { "a", "b" }, "s");
 
         Assert.Equal(0, result.Pending);
         Assert.Empty(result.Pruned);
@@ -264,7 +264,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_AnyWorldThatSanitisesToTheFallback_NeverPrunesAcrossManyScans(string? world)
     {
         LabelStore store = NewStore(new FakeLabelFileSystem(), world, "a", "gone");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
 
         for (int i = 0; i < 5; i++)
         {
@@ -282,7 +282,7 @@ public class LabelPruneGuardAttackTests
     {
         LabelStore store = NewStore(new FakeLabelFileSystem(), null, "a");
 
-        LabelPruneResult result = new LabelPruneGuard().Prune(store, Array.Empty<string>(), "s");
+        LabelPruneResult result = new LabelPruneGuard(LabelPruneMode.Archive).Prune(store, Array.Empty<string>(), "s");
 
         Assert.Equal(LabelPruneOutcome.SkippedUnknownWorld, result.Outcome);
     }
@@ -291,7 +291,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_RealWorldWhoseIdContainsUnknown_IsStillPruned()
     {
         LabelStore store = NewStore(new FakeLabelFileSystem(), "unknown-2", "a", "gone");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "a" }, "s");
 
         LabelPruneResult result = guard.Prune(store, new[] { "a" }, "s");
@@ -302,7 +302,7 @@ public class LabelPruneGuardAttackTests
     [Fact]
     public void Prune_FallbackStoreBetweenTwoRealOpens_ResetsTheRun()
     {
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         LabelStore world = NewStore("a", "gone");
         guard.Prune(world, new[] { "a" }, "s");
         guard.Prune(NewStore(new FakeLabelFileSystem(), null, "a"), new[] { "a" }, "s");
@@ -316,7 +316,7 @@ public class LabelPruneGuardAttackTests
     [Fact]
     public void Prune_NewStoreForTheSameWorld_StartsOver_EvenWithIdenticalContent()
     {
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         var fs = new FakeLabelFileSystem();
         LabelStore first = NewStore(fs, "w1", "a", "gone");
         guard.Prune(first, new[] { "a" }, "s");
@@ -332,7 +332,7 @@ public class LabelPruneGuardAttackTests
     [Fact]
     public void Prune_ReturningToAnEarlierStoreInstance_DoesNotRememberItsOldRun()
     {
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         LabelStore a = NewStore("x", "gone");
         LabelStore b = NewStore("x", "gone");
         guard.Prune(a, new[] { "x" }, "s");
@@ -348,8 +348,8 @@ public class LabelPruneGuardAttackTests
     public void Prune_TwoGuards_KeepIndependentRuns()
     {
         LabelStore store = NewStore("a", "gone");
-        var one = new LabelPruneGuard();
-        var two = new LabelPruneGuard();
+        var one = new LabelPruneGuard(LabelPruneMode.Archive);
+        var two = new LabelPruneGuard(LabelPruneMode.Archive);
         one.Prune(store, new[] { "a" }, "s");
 
         LabelPruneResult fromTwo = two.Prune(store, new[] { "a" }, "s");
@@ -367,7 +367,7 @@ public class LabelPruneGuardAttackTests
         store.Load();
         store.Set("a", "L-a", null);
         store.Set("gone", "L-gone", null);
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "a" }, "s");
         store.Load();
         store.Set("a", "L-a", null);
@@ -382,7 +382,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_LabelEditedBetweenOpens_PrunedResultCarriesTheLatestLabel()
     {
         LabelStore store = NewStore("a", "gone");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "a" }, "s");
         store.Set("gone", "Renamed", "NewGroup");
 
@@ -396,7 +396,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_PendingLabelClearedByThePlayer_DropsOutOfPendingAndIsNotReported()
     {
         LabelStore store = NewStore("a", "gone");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "a" }, "s");
         store.Set("gone", null, null);
 
@@ -410,7 +410,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_PendingKeyRelabelledAfterClearing_NeedsTwoFreshMisses()
     {
         LabelStore store = NewStore("a", "gone");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "a" }, "s");
         store.Set("gone", null, null);
         guard.Prune(store, new[] { "a" }, "s");
@@ -427,7 +427,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_KeyLabelledBetweenOpens_StartsItsRunFromItsFirstScan()
     {
         LabelStore store = NewStore("a");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "a" }, "s");
         store.Set("late", "Late", null);
 
@@ -443,7 +443,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_ShelfComesBackAfterBeingPending_IsNotPrunedAndNotPendingAfter()
     {
         LabelStore store = NewStore("a", "back");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "a" }, "s");
 
         LabelPruneResult seen = guard.Prune(store, new[] { "a", "back" }, "s");
@@ -458,7 +458,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_KeyPrunedThenRelabelled_StartsAFreshRunNotAnInstantPrune()
     {
         LabelStore store = NewStore("a", "gone");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "a" }, "s");
         guard.Prune(store, new[] { "a" }, "s");
         store.Set("gone", "Again", null);
@@ -474,7 +474,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_AfterAPrune_StoreContainsExactlyTheLiveAndPendingKeys()
     {
         LabelStore store = NewStore("a", "p1", "gone1", "gone2");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "a", "p1" }, "s");
         store.Set("p2", "P2", null);
 
@@ -489,7 +489,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_PrunedEntriesAreReturnedAsASnapshotNotAViewOfTheStore()
     {
         LabelStore store = NewStore("a", "gone");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "a" }, "s");
         LabelPruneResult result = guard.Prune(store, new[] { "a" }, "s");
 
@@ -502,7 +502,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_SkippedResultsShareNoMutableState_AcrossCalls()
     {
         LabelStore store = NewStore("a");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
 
         IReadOnlyList<PrunedLabel> one = guard.Prune(store, Array.Empty<string>(), "s").Pruned;
         IReadOnlyList<PrunedLabel> two = guard.Prune(store, Array.Empty<string>(), "s").Pruned;
@@ -520,7 +520,7 @@ public class LabelPruneGuardAttackTests
         store.Load();
         store.Set("a", "A", null);
         store.Set("gone", "G", null);
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "a" }, "s");
         LabelPruneResult result = guard.Prune(store, new[] { "a" }, "s");
 
@@ -542,7 +542,7 @@ public class LabelPruneGuardAttackTests
         store.Set("a", "A", null);
         store.Set("gone", "G", null);
 
-        new LabelPruneGuard().Prune(store, new[] { "a" }, "s");
+        new LabelPruneGuard(LabelPruneMode.Archive).Prune(store, new[] { "a" }, "s");
 
         Assert.Empty(fs.Writes);
         Assert.Equal(2, store.Count);
@@ -556,7 +556,7 @@ public class LabelPruneGuardAttackTests
         // Card 20 accepts this; the recovery is that the player re-labels. If the guard ever learns about load
         // progress, this test should flip to "kept".
         LabelStore store = NewStore("loaded", "streaming");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         string[] partial = { "loaded" };
 
         guard.Prune(store, partial, "s");
@@ -569,7 +569,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_PartialWindowThenFullListing_KeepsEverything()
     {
         LabelStore store = NewStore("loaded", "streaming");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "loaded" }, "s");
 
         LabelPruneResult full = guard.Prune(store, new[] { "loaded", "streaming" }, "s");
@@ -585,7 +585,7 @@ public class LabelPruneGuardAttackTests
     {
         // Review gap: a world with exactly one shelf. The listing is [source]; the guard treats it as a real scan.
         LabelStore store = NewStore("src", "gone");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "src" }, "src");
 
         LabelPruneResult result = guard.Prune(store, new[] { "src" }, "src");
@@ -599,7 +599,7 @@ public class LabelPruneGuardAttackTests
     {
         // Review gap: if the caller lists "other shelves" and there are none, the empty listing skips safely.
         LabelStore store = NewStore("src", "gone");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
 
         guard.Prune(store, Array.Empty<string>(), "src");
         LabelPruneResult second = guard.Prune(store, Array.Empty<string>(), "src");
@@ -613,7 +613,7 @@ public class LabelPruneGuardAttackTests
     {
         // Review gap: twin shelves with one key are one dictionary key; listing it twice keeps the one entry live.
         LabelStore store = NewStore("twin", "gone");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         string[] listing = { "twin", "twin" };
         guard.Prune(store, listing, "s");
 
@@ -627,7 +627,7 @@ public class LabelPruneGuardAttackTests
     public void Prune_ThrowingListingEnumeration_LeavesStoreAndRunUntouched()
     {
         LabelStore store = NewStore("a", "gone");
-        var guard = new LabelPruneGuard();
+        var guard = new LabelPruneGuard(LabelPruneMode.Archive);
         guard.Prune(store, new[] { "a" }, "s");
 
         Assert.Throws<InvalidOperationException>(() => guard.Prune(store, new ThrowingKeys(), "s"));
