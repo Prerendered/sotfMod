@@ -10,9 +10,11 @@ public enum TransferState
     Planning,
     /// <summary>Between chunks: cancel is checked here and only here.</summary>
     ReadyForNext,
-    /// <summary>TakeOne issued; verify source-N and inventory+N before storing, re-reading once per tick while the counts have not moved yet.
-    /// Also the state between the single stores of a verified chunk, while its items are still in the inventory.</summary>
+    /// <summary>TakeOne issued; verify source-N and inventory+N, re-reading once per tick while the counts have not moved yet.
+    /// Held until the first StoreOne, so a stop before it counts the whole chunk off the source.</summary>
     TakenAwaitingVerify,
+    /// <summary>Between the single stores of a chunk (N &gt; 1), the rest of it still in the inventory; never spans a tick.</summary>
+    StoringQueue,
     /// <summary>StoreOne issued; verify target+1 and inventory-1 before the next store or cycle, re-reading once per tick while the counts have not moved yet.</summary>
     StoredAwaitingVerify,
     Finished,

@@ -3,8 +3,8 @@
 // deps:    ShelfRegistry, IShelfGateway, GatewayOutcome, IModLog, Sons.Gameplay / Sons.Inventory / TheForest (interop)
 // caution: side effects only in TakeOne (InWorldLayoutItemGroup.RemoveItem, one whole chunk of _transferAmount) and StoreOne
 //          (ItemStorageController.TryAddItem then PlayerInventory.RemoveItem, the vanilla pair, one item); all else is field reads
-//          and count getters. On a client the
-//          host applies shelf changes later (card 46). Never ItemInstanceManager writes, Host* or *FromClient calls.
+//          and count getters. On a client the host applies shelf changes later (card 46). Never ItemInstanceManager writes,
+//          Host* or *FromClient calls.
 
 using System;
 using System.Collections.Generic;

@@ -174,7 +174,7 @@ public sealed class TransferRunner
         _unit = isUnitKnown ? unit : 1;
 
         bool canHold = _gateway.CanHold(_request.Target, _request.Item);
-        ClampResult clamp = canHold && isUnitKnown
+        ClampResult clamp = canHold
             ? AmountClamp.Clamp(_request.Amount, _sourceStart, _gateway.GetFreeCapacity(_request.Target, _request.Item), _unit)
             : new ClampResult(0, ClampReason.TargetFull);
         if (IsFinished)
@@ -182,7 +182,9 @@ public sealed class TransferRunner
             return;
         }
 
-        Requested = clamp.Amount;
+        // The gateway answers 0 for an emptied slot too, so a count reason (NothingToMove) wins over "unit unknown".
+        bool isBlockedOnUnit = !isUnitKnown && clamp.Reason == ClampReason.Ok;
+        Requested = isBlockedOnUnit ? 0 : clamp.Amount;
 
         List<KeyValuePair<string, object?>> start = new()
         {
@@ -205,7 +207,7 @@ public sealed class TransferRunner
         {
             Finish(StopReason.BlockedBeforeStart, "target cannot hold item");
         }
-        else if (!isUnitKnown)
+        else if (isBlockedOnUnit)
         {
             // Taking blind could put a whole unknown chunk in the inventory and misreport it (I1).
             Finish(StopReason.BlockedBeforeStart, "transfer unit unknown");
@@ -266,7 +268,7 @@ public sealed class TransferRunner
     }
 
     // A wait spans frames, so the shelves are re-checked as at ReadyForNext; the wait only re-reads, never takes or stores again (I1).
-    // Only a take wait sits in TakenAwaitingVerify: between the stores of a chunk no tick boundary passes without a store wait.
+    // StoringQueue never waits: between the stores of a chunk no tick boundary passes without a store wait.
     private void ResumeWait()
     {
         string step = State == TransferState.TakenAwaitingVerify ? "take" : "store";
@@ -478,7 +480,7 @@ public sealed class TransferRunner
             if (_queued > 0)
             {
                 // The rest of the chunk is still in the inventory; Finish counts it stranded if the next store fails.
-                State = TransferState.TakenAwaitingVerify;
+                State = TransferState.StoringQueue;
             }
 
             return true;
@@ -556,11 +558,10 @@ public sealed class TransferRunner
 
         // An unverified take is assumed to have moved its whole chunk; after a verified take the queue says what is off
         // the source, and a store in flight is assumed to have left the inventory (the client consumes at once).
-        bool isTakeUnverified = isTakeWait && _queued == 0;
         bool isStoreUnsettled = stoppedIn == TransferState.StoredAwaitingVerify && !_hasStoreVerdict;
-        int offSource = isTakeUnverified ? _unit : _queued;
+        int offSource = isTakeWait ? _unit : _queued;
         int trackedRemaining = _sourceStart - Moved - offSource;
-        int trackedStranded = stoppedIn == TransferState.StoredAwaitingVerify ? _queued - 1 : offSource;
+        int trackedStranded = stoppedIn == TransferState.StoredAwaitingVerify ? Math.Max(0, _queued - 1) : offSource;
 
         // Re-read rather than derive (invariant 1); tracked counts only when the gateway cannot answer, and the detail says so.
         string? countsNote = null;

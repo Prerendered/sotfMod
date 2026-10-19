@@ -36,7 +36,8 @@ public sealed class ModConfig
             "Writes a discovery dump of the aimed object to the mod log. Only works when Debug.DiscoveryEnabled is true.");
 
         ItemsPerFrame = file.Bind(_transferSection, "ItemsPerFrame", _itemsPerFrameDefault, new ConfigDescription(
-            "Take-and-store cycles run per frame during a transfer. Higher is faster; 1 is the safest.",
+            "Take-and-store cycles run per frame during a transfer. A cycle is one game chunk: one take, then one store per item "
+            + "(1 item for most, 10 for rifle ammo). Higher is faster; 1 is the safest.",
             new AcceptableValueRange<int>(_itemsPerFrameMin, _itemsPerFrameMax)));
         ConfirmTicks = file.Bind(_transferSection, "ConfirmTicks", _confirmTicksDefault, new ConfigDescription(
             "Per-step wait, in frames, for the host to confirm each take and store on a friend-hosted game before the "

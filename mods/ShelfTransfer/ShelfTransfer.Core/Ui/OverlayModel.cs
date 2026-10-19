@@ -72,14 +72,24 @@ public sealed class OverlayModel
     // Null exactly when Amount is confirmable.
     private string? _amountReason;
 
-    public OverlayModel(AimTarget source)
+    /// <summary><paramref name="transferUnit"/>: items one take moves (IShelfGateway.GetTransferUnit), so the amount is
+    /// clamped to whole chunks exactly as the runner plans it (I4).</summary>
+    public OverlayModel(AimTarget source, int transferUnit = 1)
     {
+        if (transferUnit < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(transferUnit), transferUnit, "must be at least 1");
+        }
+
         Source = source;
+        TransferUnit = transferUnit;
     }
 
     public OverlayState State { get; private set; } = OverlayState.Loading;
 
     public AimTarget Source { get; }
+
+    public int TransferUnit { get; }
 
     /// <summary>Groups as listed, with Expanded reflecting the player's toggles. Rebuilt on change only, safe to read per frame.</summary>
     public IReadOnlyList<ShelfGroup> Groups { get; private set; } = _noGroups;
@@ -241,7 +251,7 @@ public sealed class OverlayModel
         ApplyRequestedAmount(typed, raw);
     }
 
-    /// <summary>Stepper; floors at 1 so it never produces an invalid amount, and clamps to the row like typing does.</summary>
+    /// <summary>Stepper in whole chunks; floors at one chunk so it never produces an invalid amount, and clamps to the row like typing does.</summary>
     public void StepAmount(int delta)
     {
         if (State != OverlayState.Ready || SelectedRow is null)
@@ -249,7 +259,7 @@ public sealed class OverlayModel
             return;
         }
 
-        int requested = (int)Math.Clamp((long)Amount + delta, 1, int.MaxValue);
+        int requested = (int)Math.Clamp((long)Amount + (long)delta * TransferUnit, TransferUnit, int.MaxValue);
         ApplyRequestedAmount(requested, null);
     }
 
@@ -329,7 +339,7 @@ public sealed class OverlayModel
         ClampResult clamp = ClampAgainstSelectedRow(requested);
         if (clamp.Reason == ClampReason.InvalidAmount)
         {
-            SetInvalidAmount(typedText ?? requested.ToString(CultureInfo.InvariantCulture), AmountTooSmallReason);
+            SetInvalidAmount(typedText ?? requested.ToString(CultureInfo.InvariantCulture), GetTooSmallReason());
             return;
         }
 
@@ -360,13 +370,17 @@ public sealed class OverlayModel
             ClampReason.Ok => null,
             ClampReason.NothingToMove => NothingToMoveReason,
             ClampReason.TargetFull => TargetFullReason,
-            _ => AmountTooSmallReason,
+            _ => GetTooSmallReason(),
         };
     }
 
+    private string GetTooSmallReason() => TransferUnit > 1
+        ? string.Format(CultureInfo.InvariantCulture, "Amount must be at least {0}; this item moves in {0}s", TransferUnit)
+        : AmountTooSmallReason;
+
     // Fits is already AmountClamp's "All" for this row, so it stands in for the target's free capacity.
     private ClampResult ClampAgainstSelectedRow(int requested) =>
-        AmountClamp.Clamp(requested, Source.Count, SelectedRow?.Fits ?? 0);
+        AmountClamp.Clamp(requested, Source.Count, SelectedRow?.Fits ?? 0, TransferUnit);
 
     private void SetInvalidAmount(string text, string reason)
     {

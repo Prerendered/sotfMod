@@ -49,11 +49,7 @@ public static class AmountClamp
     /// the game takes a chunk at once, so a target must fit a whole chunk before a take).</summary>
     public static ClampResult Clamp(int requested, int sourceCount, int targetFree, int unit)
     {
-        if (unit < 1)
-        {
-            throw new ArgumentOutOfRangeException(nameof(unit), unit, "must be at least 1");
-        }
-
+        RequireUnit(unit);
         ClampResult clamp = Clamp(requested, sourceCount, targetFree);
         if (clamp.Reason != ClampReason.Ok || unit == 1)
         {
@@ -73,5 +69,17 @@ public static class AmountClamp
         return new ClampResult(0, reason);
     }
 
-    public static int RoundDownToChunk(int amount, int unit) => amount / unit * unit;
+    public static int RoundDownToChunk(int amount, int unit)
+    {
+        RequireUnit(unit);
+        return amount / unit * unit;
+    }
+
+    private static void RequireUnit(int unit)
+    {
+        if (unit < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(unit), unit, "must be at least 1");
+        }
+    }
 }

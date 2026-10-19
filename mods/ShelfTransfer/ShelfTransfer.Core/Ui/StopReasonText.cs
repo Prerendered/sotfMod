@@ -26,7 +26,7 @@ public static class StopReasonText
             return new ResultLine(counts, true);
         }
 
-        string text = StoppedPrefix + GetReasonText(report.Reason) + ". " + counts + FormatStranded(report.StrandedInInventory) + ".";
+        string text = StoppedPrefix + GetReasonText(report.Reason) + ". " + counts + FormatStranded(report.StrandedInInventory, report.Moved) + ".";
         return new ResultLine(text, false);
     }
 
@@ -49,11 +49,12 @@ public static class StopReasonText
     };
 #pragma warning restore CS8524
 
-    private static string FormatStranded(int stranded) => stranded switch
+    private static string FormatStranded(int stranded, int moved) => stranded switch
     {
         <= 0 => ", " + StrandedNone,
         1 => ". " + StrandedOne,
-        // The runner caps this at 1; worded anyway so a broken report still reads as recoverable, never lost.
-        _ => string.Format(CultureInfo.InvariantCulture, ". {0} items are in your inventory, the rest is on the source", stranded),
+        // 2..one chunk (card 68): a stop mid-chunk leaves part of the move on the target and part in the inventory, so say where each is.
+        _ => string.Format(CultureInfo.InvariantCulture, ". {0} items are in your inventory{1}, the rest is on the source", stranded,
+            moved > 0 ? string.Format(CultureInfo.InvariantCulture, ", {0} already on the target", moved) : ""),
     };
 }
