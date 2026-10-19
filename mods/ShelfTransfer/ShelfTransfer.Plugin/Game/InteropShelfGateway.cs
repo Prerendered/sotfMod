@@ -1,6 +1,6 @@
 // purpose: IShelfGateway over the game's own calls; the only code that changes shelf state (I2)
 // owns:    InteropShelfGateway
-// deps:    ShelfRegistry, IShelfGateway, GatewayOutcome, IModLog, Sons.Gameplay / Sons.Inventory / TheForest (interop)
+// deps:    ShelfRegistry, IShelfGateway, GatewayOutcome, ShelfStockEntry, IModLog, Sons.Gameplay / Sons.Inventory / TheForest (interop)
 // caution: side effects only in TakeOne (InWorldLayoutItemGroup.RemoveItem, one whole chunk of _transferAmount) and StoreOne
 //          (ItemStorageController.TryAddItem then PlayerInventory.RemoveItem, the vanilla pair, one item); all else is field reads
 //          and count getters. On a client the host applies shelf changes later (card 46). Never ItemInstanceManager writes,
@@ -110,6 +110,31 @@ public sealed class InteropShelfGateway : IShelfGateway
             }
 
             return 0;
+        });
+
+    // Reads only (I2): each stocked hook's group fields and count, folded in Core. The unit is the group's _transferAmount, as
+    // GetTransferUnit reads it for the same slot.
+    public IReadOnlyList<ShelfStockEntry> ListStock(ShelfRef shelf) =>
+        Guard<IReadOnlyList<ShelfStockEntry>>("list_stock", _ => Array.Empty<ShelfStockEntry>(), () =>
+        {
+            if (!TryGetShelf(shelf, out ItemStorageController? controller))
+            {
+                return Array.Empty<ShelfStockEntry>();
+            }
+
+            List<(SlotRef Slot, ItemId Item, int Count, int TransferUnit)> slots = new();
+            foreach (ItemStorageHookPoint hook in CopyHooks(controller))
+            {
+                InWorldLayoutItemGroup? group = FindActiveGroup(hook);
+                int count = group == null ? 0 : group.GetCurrentCount();
+                if (group != null && count > 0)
+                {
+                    slots.Add((new SlotRef(ReadSlotIndex(hook, group)), new ItemId(group._itemId), count,
+                        Math.Max(0, group._transferAmount)));
+                }
+            }
+
+            return ShelfStockEntry.BuildList(slots);
         });
 
     public GatewayOutcome TakeOne(ShelfRef shelf, SlotRef slot, ItemId item) =>
@@ -230,12 +255,15 @@ public sealed class InteropShelfGateway : IShelfGateway
     }
 
     // AimWatcher's resolution (the stocked group's _storage); the hook's own component only for an empty slot.
-    private static bool IsSlot(ItemStorageHookPoint hook, InWorldLayoutItemGroup? group, int index)
+    private static bool IsSlot(ItemStorageHookPoint hook, InWorldLayoutItemGroup? group, int index) =>
+        ReadSlotIndex(hook, group) == index;
+
+    private static int? ReadSlotIndex(ItemStorageHookPoint hook, InWorldLayoutItemGroup? group)
     {
         StructureStorage? storage = group != null && group._storage != null
             ? group._storage
             : FindOnObject<StructureStorage>(hook);
-        return storage != null && storage.StorageSlotIndex == index;
+        return storage == null ? null : storage.StorageSlotIndex;
     }
 
     // A stocked hook takes more only of its own item; an empty hook takes any item it has a layout template for,

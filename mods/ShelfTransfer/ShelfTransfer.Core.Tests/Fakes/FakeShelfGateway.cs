@@ -1,10 +1,12 @@
 // purpose: scriptable in-memory IShelfGateway for runner tests: real take/store arithmetic, ordered call log, per-call hooks
 // owns:    FakeShelfGateway, FakeShelf
 // deps:    IShelfGateway
-// caution: calls are logged as "Name(key)" or "Name" (inventory); OnCall fires after logging and before the call acts, so it can flip IsAlive, request cancel or throw
+// caution: calls are logged as "Name(key)" or "Name" (inventory); OnCall fires after logging and before the call acts, so it can flip IsAlive, request cancel or throw.
+//          A shelf given Slots is a mixed shelf: ListStock, GetCount and GetTransferUnit read the slots, take/store still use Count
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 
 using ShelfTransfer.Core.Gateway;
 
@@ -21,6 +23,9 @@ public sealed class FakeShelf
 
     public bool IsAlive { get; set; } = true;
 
+    /// <summary>Per-slot stock of a mixed shelf (card 74), in hook order.</summary>
+    public List<(SlotRef Slot, ItemId Item, int Count)> Slots { get; } = new();
+
     public int Free => Math.Max(0, Capacity - Count);
 }
 
@@ -35,6 +40,9 @@ public sealed class FakeShelfGateway : IShelfGateway
     /// <summary>What GetTransferUnit returns for a stocked shelf (0 for an empty one, as the plugin), and how many items the
     /// real take moves (whole chunks only, as the plugin). GetTransferUnit is not logged in <see cref="Calls"/>.</summary>
     public int TransferUnit { get; set; } = 1;
+
+    /// <summary>Per-item chunk on a mixed shelf (e.g. 10 for rifle ammo); an item missing here uses <see cref="TransferUnit"/>.</summary>
+    public Dictionary<ItemId, int> ItemUnits { get; } = new();
 
     public int TakeCalls { get; private set; }
 
@@ -112,7 +120,8 @@ public sealed class FakeShelfGateway : IShelfGateway
     public int GetCount(ShelfRef shelf, ItemId item)
     {
         Record($"GetCount({shelf.Key})");
-        return _shelves[shelf.Key].Count;
+        FakeShelf fake = _shelves[shelf.Key];
+        return fake.Slots.Count > 0 ? fake.Slots.Where(s => s.Item == item).Sum(s => s.Count) : fake.Count;
     }
 
     public int GetFreeCapacity(ShelfRef shelf, ItemId item)
@@ -133,7 +142,29 @@ public sealed class FakeShelfGateway : IShelfGateway
         return Inventory;
     }
 
-    public int GetTransferUnit(ShelfRef shelf, SlotRef slot, ItemId item) => _shelves[shelf.Key].Count > 0 ? TransferUnit : 0;
+    // A mixed shelf answers as the plugin: the unit of the given slot (any slot when Index is null) stocked with the item.
+    public int GetTransferUnit(ShelfRef shelf, SlotRef slot, ItemId item)
+    {
+        FakeShelf fake = _shelves[shelf.Key];
+        if (fake.Slots.Count == 0)
+        {
+            return fake.Count > 0 ? TransferUnit : 0;
+        }
+
+        bool isStocked = fake.Slots.Any(s => s.Item == item && s.Count > 0 && (slot.Index is null || s.Slot == slot));
+        return isStocked ? UnitOf(item) : 0;
+    }
+
+    public IReadOnlyList<ShelfStockEntry> ListStock(ShelfRef shelf)
+    {
+        Record($"ListStock({shelf.Key})");
+        if (!_shelves.TryGetValue(shelf.Key, out FakeShelf? fake) || !fake.IsAlive)
+        {
+            return Array.Empty<ShelfStockEntry>();
+        }
+
+        return ShelfStockEntry.BuildList(fake.Slots.Select(s => (s.Slot, s.Item, s.Count, UnitOf(s.Item))));
+    }
 
     public GatewayOutcome TakeOne(ShelfRef shelf, SlotRef slot, ItemId item)
     {
@@ -149,6 +180,8 @@ public sealed class FakeShelfGateway : IShelfGateway
         Record($"StoreOne({shelf.Key})");
         return StoreBehavior?.Invoke(StoreCalls) ?? ApplyStore(shelf);
     }
+
+    private int UnitOf(ItemId item) => ItemUnits.TryGetValue(item, out int unit) ? unit : TransferUnit;
 
     private void Record(string entry)
     {
