@@ -1,6 +1,7 @@
-// purpose: the label file on disk, <dir>/<worldId>.json via System.Text.Json, written temp-then-move (F3, invariant 5)
+// purpose: the label file on disk, <dir>/<worldId>.json via System.Text.Json, written temp-then-move (F3, invariant 5),
+//          and its pruned-label archive <dir>/<worldId>.pruned.json, read-append-write the same way
 // owns:    JsonLabelFileSystem, JsonLabelFileSystem.MaxFileBytes, JsonLabelFileSystem.MaxBadCopies
-// deps:    ILabelFileSystem, LabelFile, WorldId, IModLog
+// deps:    ILabelFileSystem, LabelFile, PrunedLabelArchive, WorldId, IModLog
 // caution: P4 catch site: every disk or JSON step runs through Guard once, never from inside another guarded step.
 //          Corrupt is returned only once a .bad with the same content exists (new copy, or an identical one already
 //          there, so a still-corrupt file is not copied again each launch); if neither, Failed keeps Save blocked.
@@ -31,7 +32,10 @@ public sealed class JsonLabelFileSystem : ILabelFileSystem
 
     private const string _readEvent = "labels.read";
     private const string _writeEvent = "labels.write";
+    private const string _archiveEvent = "labels.archive";
     private const string _extension = ".json";
+    private const string _archiveSuffix = ".pruned";
+    private const string _prunedAtFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'";
     private const string _tempSuffix = ".tmp";
     private const string _badSuffix = ".bad";
     private const string _badStampFormat = "yyyyMMdd'T'HHmmss'Z'";
@@ -46,6 +50,7 @@ public sealed class JsonLabelFileSystem : ILabelFileSystem
 
     private static readonly string _versionProperty = JsonNamingPolicy.CamelCase.ConvertName(nameof(LabelFile.Version));
     private static readonly string _shelvesProperty = JsonNamingPolicy.CamelCase.ConvertName(nameof(LabelFile.Shelves));
+    private static readonly string _prunedProperty = JsonNamingPolicy.CamelCase.ConvertName(nameof(PrunedLabelArchive.Pruned));
     private static readonly byte[] _utf8Bom = { 0xEF, 0xBB, 0xBF };
     private static readonly char[] _separators = { '\\', '/' };
 
@@ -133,52 +138,58 @@ public sealed class JsonLabelFileSystem : ILabelFileSystem
             return LabelWriteResult.Failed("world id is not sanitised");
         }
 
-        byte[]? serialized = null;
-        Exception? serializeError = Guard(() => serialized = JsonSerializer.SerializeToUtf8Bytes(file, _jsonOptions));
-        if (serializeError is not null || serialized is null)
+        return WriteJson(_writeEvent, worldId, count, GetPath(worldId), file);
+    }
+
+    /// <summary>
+    /// Never throws for a non-null list. Reads the existing &lt;id&gt;.pruned.json first; one that cannot be read, is
+    /// not a version-1 archive, or would pass MaxFileBytes refuses the append (Failed) and is left untouched.
+    /// </summary>
+    public LabelWriteResult AppendPruned(string worldId, IReadOnlyList<PrunedLabel> entries)
+    {
+        ArgumentNullException.ThrowIfNull(entries);
+        int count = entries.Count;
+        if (!IsSanitised(worldId))
         {
-            return FailWrite(worldId, count, serializeError, "serialize");
+            LogEvent(LogLevel.Error, _archiveEvent, worldId, count, Field("reason", "invalid_world"));
+            return LabelWriteResult.Failed("world id is not sanitised");
         }
 
-        // Refused before touching disk: a file this class could not read back would turn Corrupt on next launch.
-        byte[] json = serialized;
-        if (json.Length > MaxFileBytes)
+        string path = GetArchivePath(worldId);
+        FileContent? content = null;
+        Exception? readError = Guard(() => content = ReadContent(path));
+        bool isNew = readError is FileNotFoundException or DirectoryNotFoundException;
+        if (!isNew && (readError is not null || content is null))
         {
-            LogEvent(
-                LogLevel.Error,
-                _writeEvent,
-                worldId,
-                count,
-                Field("reason", "too_large"),
-                Field("bytes", json.Length),
-                Field("limit_bytes", MaxFileBytes));
-            return LabelWriteResult.Failed($"file would be {json.Length} bytes, limit {MaxFileBytes}");
+            return FailWrite(_archiveEvent, worldId, count, readError, "read");
         }
 
-        string path = GetPath(worldId);
-        string tempPath = path + _tempSuffix;
-        bool isRefused = false;
-        Exception? writeError = Guard(() => isRefused = !TryWriteAtomically(json, tempPath, path));
-        if (isRefused)
+        PrunedLabelArchive? archive = isNew ? new PrunedLabelArchive { WorldId = worldId } : null;
+        string? problem = null;
+        if (content is { Bytes: null })
         {
-            // The link is left in place: removing it is the user's call, and Save stays failed until then.
-            LogEvent(LogLevel.Error, _writeEvent, worldId, count, Field("reason", "reparse_point"), Field("step", "write"));
-            return LabelWriteResult.Failed("temp file is a link (reparse point); refused");
+            problem = $"archive is {content.Length} bytes, limit {MaxFileBytes}";
+        }
+        else if (content?.Bytes is byte[] bytes)
+        {
+            Exception? parseError = Guard(() => archive = ParseArchive(bytes));
+            problem = parseError is not null ? FormatDetail(parseError) : "not a version-1 archive";
         }
 
-        if (writeError is null)
+        if (archive is null)
         {
-            LogEvent(LogLevel.Info, _writeEvent, worldId, count);
-            return LabelWriteResult.Ok;
+            // Never rewritten: the archive is the only copy of every earlier prune.
+            LogEvent(LogLevel.Error, _archiveEvent, worldId, count, Field("reason", "unreadable"), Field("detail", problem));
+            return LabelWriteResult.Failed($"archive left untouched: {problem}");
         }
 
-        Exception? cleanupError = Guard(() => DeleteIfPresent(tempPath));
-        if (cleanupError is not null)
+        string stamp = DateTime.UtcNow.ToString(_prunedAtFormat, CultureInfo.InvariantCulture);
+        foreach (PrunedLabel entry in entries)
         {
-            LogError(_writeEvent, worldId, cleanupError, "temp_cleanup");
+            archive.Pruned.Add(new PrunedLabelEntry(entry.Key, entry.Label.Label, entry.Label.Group, stamp));
         }
 
-        return FailWrite(worldId, count, writeError, "write");
+        return WriteJson(_archiveEvent, worldId, count, path, archive);
     }
 
     // Equality with the sanitiser's output is the whole path defence: [A-Za-z0-9_-] only, no separator, no "..".
@@ -248,6 +259,28 @@ public sealed class JsonLabelFileSystem : ILabelFileSystem
         return file is null ? new ParsedFile(null, "no content") : new ParsedFile(file, null);
     }
 
+    // Throws on malformed JSON; null for any other version or a missing list, which the caller must not overwrite.
+    private static PrunedLabelArchive? ParseArchive(byte[] bytes)
+    {
+        ReadOnlyMemory<byte> utf8 = bytes;
+        if (bytes.AsSpan().StartsWith(_utf8Bom))
+        {
+            utf8 = utf8.Slice(_utf8Bom.Length);
+        }
+
+        using JsonDocument document = JsonDocument.Parse(utf8);
+        JsonElement root = document.RootElement;
+        bool isCurrent = root.ValueKind == JsonValueKind.Object
+            && root.TryGetProperty(_versionProperty, out JsonElement version)
+            && version.ValueKind == JsonValueKind.Number
+            && version.TryGetInt32(out int versionNumber)
+            && versionNumber == PrunedLabelArchive.CurrentVersion
+            && root.TryGetProperty(_prunedProperty, out JsonElement pruned)
+            && pruned.ValueKind == JsonValueKind.Array;
+        PrunedLabelArchive? archive = isCurrent ? root.Deserialize<PrunedLabelArchive>(_jsonOptions) : null;
+        return archive?.Pruned is null ? null : archive;
+    }
+
     private static void DeleteIfPresent(string path)
     {
         if (File.Exists(path))
@@ -275,6 +308,9 @@ public sealed class JsonLabelFileSystem : ILabelFileSystem
     private static KeyValuePair<string, object?> Field(string key, object? value) => new(key, value);
 
     private string GetPath(string worldId) => Path.Combine(_directory, worldId + _extension);
+
+    // A sanitised id has no '.', so <id>.pruned.json can never be another world's label file or match the .bad pattern.
+    private string GetArchivePath(string worldId) => Path.Combine(_directory, worldId + _archiveSuffix + _extension);
 
     // The temp file sits beside the target so the move is a same-volume rename, never a copy. The rename replaces a
     // link at <id>.json rather than writing through it. False = refused before anything was written.
@@ -491,16 +527,65 @@ public sealed class JsonLabelFileSystem : ILabelFileSystem
         return LabelReadResult.Failed(FormatDetail(error));
     }
 
-    private LabelWriteResult FailWrite(string worldId, int count, Exception? error, string step)
+    private LabelWriteResult FailWrite(string eventName, string worldId, int count, Exception? error, string step)
     {
         if (error is null)
         {
-            LogEvent(LogLevel.Error, _writeEvent, worldId, count, Field("reason", step));
+            LogEvent(LogLevel.Error, eventName, worldId, count, Field("reason", step));
             return LabelWriteResult.Failed(step);
         }
 
-        LogError(_writeEvent, worldId, error, step);
+        LogError(eventName, worldId, error, step);
         return LabelWriteResult.Failed(FormatDetail(error));
+    }
+
+    private LabelWriteResult WriteJson<T>(string eventName, string worldId, int count, string path, T value)
+    {
+        byte[]? serialized = null;
+        Exception? serializeError = Guard(() => serialized = JsonSerializer.SerializeToUtf8Bytes(value, _jsonOptions));
+        if (serializeError is not null || serialized is null)
+        {
+            return FailWrite(eventName, worldId, count, serializeError, "serialize");
+        }
+
+        // Refused before touching disk: a file this class could not read back would turn Corrupt on next launch.
+        byte[] json = serialized;
+        if (json.Length > MaxFileBytes)
+        {
+            LogEvent(
+                LogLevel.Error,
+                eventName,
+                worldId,
+                count,
+                Field("reason", "too_large"),
+                Field("bytes", json.Length),
+                Field("limit_bytes", MaxFileBytes));
+            return LabelWriteResult.Failed($"file would be {json.Length} bytes, limit {MaxFileBytes}");
+        }
+
+        string tempPath = path + _tempSuffix;
+        bool isRefused = false;
+        Exception? writeError = Guard(() => isRefused = !TryWriteAtomically(json, tempPath, path));
+        if (isRefused)
+        {
+            // The link is left in place: removing it is the user's call, and Save stays failed until then.
+            LogEvent(LogLevel.Error, eventName, worldId, count, Field("reason", "reparse_point"), Field("step", "write"));
+            return LabelWriteResult.Failed("temp file is a link (reparse point); refused");
+        }
+
+        if (writeError is null)
+        {
+            LogEvent(LogLevel.Info, eventName, worldId, count);
+            return LabelWriteResult.Ok;
+        }
+
+        Exception? cleanupError = Guard(() => DeleteIfPresent(tempPath));
+        if (cleanupError is not null)
+        {
+            LogError(eventName, worldId, cleanupError, "temp_cleanup");
+        }
+
+        return FailWrite(eventName, worldId, count, writeError, "write");
     }
 
     private void LogEvent(

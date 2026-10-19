@@ -1,6 +1,6 @@
 // purpose: one world's shelf labels and groups in memory, loaded from and saved to ILabelFileSystem (flow F3, invariant 5)
 // owns:    LabelStore, LabelLoadResult, LabelLoadStatus, LabelSaveResult, LabelSaveStatus
-// deps:    ILabelFileSystem, LabelFile, ShelfLabel, WorldId
+// deps:    ILabelFileSystem, LabelFile, ShelfLabel, PrunedLabel, WorldId
 // caution: keys are opaque ShelfKey strings - never reference Core/Gateway here. Not thread-safe (main thread only).
 //          Prune trusts its caller: an empty live set from a registry that has not populated yet drops every label.
 //          Save is allowed after a Corrupt load, so the file system must preserve the corrupt file (e.g. .bad) at Read
@@ -111,6 +111,28 @@ public sealed class LabelStore
         }
 
         return removed;
+    }
+
+    /// <summary>Never throws. Appends the entries to this world's pruned-label archive; the map is not changed.</summary>
+    public LabelWriteResult ArchivePruned(IReadOnlyList<PrunedLabel> entries)
+    {
+        try
+        {
+            return _fileSystem.AppendPruned(SanitisedWorldId, entries);
+        }
+        catch (Exception ex)
+        {
+            return LabelWriteResult.Failed($"{ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    /// <summary>Puts pruned entries back; a key set again since the prune keeps its newer value.</summary>
+    public void Restore(IEnumerable<PrunedLabel> entries)
+    {
+        foreach (PrunedLabel entry in entries)
+        {
+            _labels.TryAdd(entry.Key, entry.Label);
+        }
     }
 
     /// <summary>Replaces the in-memory map with the file's content. Never throws; on any failure the map is empty.</summary>

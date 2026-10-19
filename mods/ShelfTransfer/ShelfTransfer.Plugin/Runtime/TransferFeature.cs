@@ -1,7 +1,7 @@
-// purpose: installs the transfer feature from the composition root: registry, gateway, aim watcher, driver, console command
-//          and the transfer prompt
+// purpose: installs the transfer feature from the composition root: registry, gateway, aim watcher, driver, console command,
+//          the transfer prompt and the transfer overlay
 // owns:    TransferFeature
-// deps:    ModConfig, ShelfRegistry, InteropShelfGateway, AimWatcher, TransferDriver, TransferCommand, TransferPromptUi, LabelsFeature (Store, read-only), ShelfTransfer.Core.Logging (IModLog, LogLevel), BepInEx IL2CPPChainloader
+// deps:    ModConfig, ShelfRegistry, InteropShelfGateway, AimWatcher, TransferDriver, TransferCommand, TransferPromptUi, OverlayUi, LabelsFeature (Store, read-only), ShelfTransfer.Core.Logging (IModLog, LogLevel), BepInEx IL2CPPChainloader
 
 using System.Collections.Generic;
 
@@ -34,5 +34,6 @@ public static class TransferFeature
         // Read fresh on every command: the store is replaced on each world change. Entries is a read-only view (I5).
         command.Init(log, registry, gateway, aimWatcher, driver, () => LabelsFeature.Store?.Entries);
         IL2CPPChainloader.AddUnityComponent<TransferPromptUi>().Init(log, config, command);
+        IL2CPPChainloader.AddUnityComponent<OverlayUi>().Init(log, config, command, gateway, registry.List);
     }
 }

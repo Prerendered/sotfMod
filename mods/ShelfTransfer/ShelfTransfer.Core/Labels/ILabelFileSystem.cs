@@ -1,9 +1,11 @@
 // purpose: the I/O seam for the label file; the plugin implements it with System.Text.Json, tests with a fake (invariant 5)
 // owns:    ILabelFileSystem, LabelReadResult, LabelReadStatus, LabelWriteResult
-// deps:    LabelFile
+// deps:    LabelFile, PrunedLabel
 // caution: implementations convert their own I/O and JSON exceptions to Failed/Corrupt; LabelStore still guards the call.
 //          Returning Corrupt MUST first preserve the corrupt file (e.g. as .bad) at Read time — never defer it to Write —
 //          because LabelStore allows Save after a Corrupt load and the first Save would overwrite the only copy.
+
+using System.Collections.Generic;
 
 namespace ShelfTransfer.Core.Labels;
 
@@ -43,4 +45,10 @@ public interface ILabelFileSystem
 
     /// <summary>Writes the file named by <see cref="LabelFile.WorldId"/>, replacing any existing one.</summary>
     LabelWriteResult Write(LabelFile file);
+
+    /// <summary>
+    /// Appends <paramref name="entries"/>, stamped now, to the world's pruned-label archive. Not Ok = nothing appended
+    /// and an existing archive left as it was.
+    /// </summary>
+    LabelWriteResult AppendPruned(string worldId, IReadOnlyList<PrunedLabel> entries);
 }

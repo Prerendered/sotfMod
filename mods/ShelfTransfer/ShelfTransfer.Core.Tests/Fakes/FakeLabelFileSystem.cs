@@ -1,6 +1,6 @@
-// purpose: scriptable ILabelFileSystem so label tests (cards 13, 15) run without disk
+// purpose: scriptable ILabelFileSystem so label tests (cards 13, 15, 20) run without disk
 // owns:    FakeLabelFileSystem
-// deps:    ILabelFileSystem, LabelFile
+// deps:    ILabelFileSystem, LabelFile, PrunedLabel
 
 using System;
 using System.Collections.Generic;
@@ -25,6 +25,14 @@ public sealed class FakeLabelFileSystem : ILabelFileSystem
 
     /// <summary>Every file passed to Write, in call order (recorded even when the write is scripted to fail or throw).</summary>
     public List<LabelFile> Writes { get; } = new();
+
+    public LabelWriteResult AppendResult { get; set; } = LabelWriteResult.Ok;
+
+    /// <summary>Runs at the start of AppendPruned, so a test can see the store as the archive write found it.</summary>
+    public Action? OnAppend { get; set; }
+
+    /// <summary>Every AppendPruned call, in call order (recorded even when scripted to fail).</summary>
+    public List<(string WorldId, IReadOnlyList<PrunedLabel> Entries)> Appends { get; } = new();
 
     /// <summary>Makes subsequent Reads return Ok(file); a successful Write also becomes the stored file.</summary>
     public FakeLabelFileSystem Store(LabelFile file)
@@ -58,5 +66,12 @@ public sealed class FakeLabelFileSystem : ILabelFileSystem
         }
 
         return WriteResult;
+    }
+
+    public LabelWriteResult AppendPruned(string worldId, IReadOnlyList<PrunedLabel> entries)
+    {
+        OnAppend?.Invoke();
+        Appends.Add((worldId, entries));
+        return AppendResult;
     }
 }

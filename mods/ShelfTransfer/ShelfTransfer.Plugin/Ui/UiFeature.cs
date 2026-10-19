@@ -1,4 +1,5 @@
-// purpose: installs the UI feature (hint, overlay, label editor) from the composition root; empty until those stories land
+// purpose: marks the UI feature in plugin.load; the overlay and typed prompt are installed by TransferFeature, which owns
+//          the command and gateway they read, and the label editor by LabelsFeature
 // owns:    UiFeature
 // deps:    ModConfig, ShelfTransfer.Core.Logging (IModLog, LogLevel)
 
