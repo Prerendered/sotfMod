@@ -1,8 +1,10 @@
 // purpose: the only door between Core and the game; the plugin implements it over interop, tests implement it with a fake
 // owns:    IShelfGateway
-// deps:    ShelfRef, SlotRef, ItemId, GatewayOutcome
+// deps:    ShelfRef, SlotRef, ItemId, GatewayOutcome, ShelfStockEntry
 // caution: TakeOne/StoreOne must call the game's own take/store (invariant 2). Implementations never
 //          write storage state directly and never throw — they return Failed. TakeOne moves a whole chunk or nothing.
+
+using System.Collections.Generic;
 
 namespace ShelfTransfer.Core.Gateway;
 
@@ -23,6 +25,10 @@ public interface IShelfGateway
     /// <summary>Items one <see cref="TakeOne"/> moves from the slot: the game's chunk (1 for most items, 10 for ammo).
     /// 0 when no stocked slot holds the item.</summary>
     int GetTransferUnit(ShelfRef shelf, SlotRef slot, ItemId item);
+
+    /// <summary>Every item type with stock on the shelf (<see cref="ShelfStockEntry.BuildList"/>), read fresh. Empty, never
+    /// null, when the shelf is empty or gone. Reads only.</summary>
+    IReadOnlyList<ShelfStockEntry> ListStock(ShelfRef shelf);
 
     /// <summary>The vanilla take of one chunk (<see cref="GetTransferUnit"/> items) from the aimed slot (what E does).</summary>
     GatewayOutcome TakeOne(ShelfRef shelf, SlotRef slot, ItemId item);
