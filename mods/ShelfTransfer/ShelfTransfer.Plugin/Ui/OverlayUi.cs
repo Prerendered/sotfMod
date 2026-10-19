@@ -1,11 +1,14 @@
 // purpose: the transfer overlay (§02): the transfer key on an aimed shelf slot opens a left-anchored IMGUI panel with the
-//          source slot (item, count, shelf) and a read-only target list; Esc closes it with nothing moved
+//          source slot and the other shelves grouped by base; a row click selects it, a header click collapses it, and
+//          each row's rename / group link edits its label inline. Esc closes it with nothing moved
 // owns:    OverlayUi
-// deps:    OverlayModel, ShelfListBuilder, IShelfGateway (reads only), TransferCommand (CaptureAim, ReleaseAim,
-//          IsCapturedShelfGone, GetShelfName), LabelsFeature (Store, SaveNow), LabelPruneGuard, InputBlocker,
-//          OverlayStyles, ModConfig (TransferKey, PruneMode), IModLog, UnityEngine IMGUI
-// caution: I1/I2 - no Confirm path yet: never calls TakeOne/StoreOne or the driver. Esc goes through OverlayModel.Escape;
-//          this class renders the model and forwards input. Update and OnGUI are P2 boundaries: a throw logs
+// deps:    OverlayModel, ShelfTargetScan, ShelfListBuilder, IShelfGateway (reads only), TransferCommand (CaptureAim,
+//          ReleaseAim, IsCapturedShelfGone, GetShelfName), LabelsFeature (Store, SetLabel, IsValidName, SaveNow),
+//          LabelPruneGuard, InputBlocker, OverlayStyles, ModConfig (TransferKey, PruneMode), IModLog, UnityEngine IMGUI
+// caution: I1/I2 - no Confirm path yet: never calls TakeOne/StoreOne or the driver. Selection, collapse and Esc go through
+//          OverlayModel (I4: it refuses a dimmed row); this class renders the model and forwards input. I5 - labels are
+//          written only through LabelsFeature.SetLabel. The list is cached: rebuilt on a 1 m move or a label save, never
+//          per frame, and the gateway is read once per open. Update and OnGUI are P2 boundaries: a throw logs
 //          error event=ui.overlay, gives input back at once and halts the overlay for the session
 
 using System;
@@ -34,22 +37,45 @@ public sealed class OverlayUi : MonoBehaviour
 {
     private const string _inputBlockName = "ShelfTransfer.OverlayInput";
     private const string _logEvent = "ui.overlay";
+    private const string _labelLogEvent = "ui.label";
     private const string _pruneLogEvent = "labels.prune";
     private const string _pruneCandidateLogEvent = "labels.prune_candidate";
+    private const string _editControl = "ShelfTransfer.OverlayLabelEdit";
+
+    // Criterion 2 allows 1 m against a tape check, so a smaller move never needs new rows.
+    private const float _rebuildDistance = 1f;
+    private const float _noteSeconds = 4f;
+    private const int _maxLabelChars = 22;
+    private const int _groupChipColumns = 3;
 
     private const int _closeButtonWidth = 56;
     private const int _rowIndent = 16;
     private const int _distanceColumnWidth = 56;
     private const int _bearingColumnWidth = 36;
-    private const int _fitColumnWidth = 96;
+    private const int _fitColumnWidth = 72;
+    private const int _renameLinkWidth = 56;
+    private const int _groupLinkWidth = 48;
     private const int _scrollbarWidth = 20;
 
     private const string _titleText = "Transfer";
     private const string _closeText = "Esc";
     private const string _sendToText = "Send to";
-    private const string _hintText = "Esc closes, nothing is moved";
+    private const string _hintText = "Click a shelf to select it. Esc closes, nothing is moved";
+    private const string _editHintText = "Enter saves the label, Esc cancels the edit";
     private const string _cannotHoldText = "can't hold";
+    private const string _renameText = "rename";
+    private const string _groupText = "group";
+    private const string _saveText = "save";
+    private const string _cancelText = "cancel";
+    private const string _noGroupText = "None";
+    private const string _truncatedSuffix = "...";
+    private const string _savedText = "Label saved";
+    private const string _saveFailedText = "Could not save labels, see log";
+    private const string _saveBlockedText = "Labels are read-only this session, see log";
+    private const string _noStoreText = "Labels are not available, see log";
+    private const string _invalidCharText = "Names cannot contain control characters.";
 
+    private static readonly string _tooLongText = $"Names stop at {LabelsFeature.MaxNameLength} characters.";
     private static readonly IReadOnlyDictionary<string, ShelfLabel> _noLabels = new Dictionary<string, ShelfLabel>();
 
     private IModLog? _log;
@@ -62,16 +88,33 @@ public sealed class OverlayUi : MonoBehaviour
     private readonly InputBlocker _inputBlocker = new(_inputBlockName, _logEvent);
     private LabelPruneGuard? _pruneGuard;
 
-    // Built once at open: the list cannot change while this card's overlay is open, so no text is formatted per frame.
-    private readonly List<(bool IsHeader, bool IsDimmed, string Label, string Distance, string Bearing, string Fit)> _lines = new();
+    // Rebuilt from the model on a list change or a group toggle only, so no row text is formatted per frame. Key is the
+    // shelf key for a row and the group name for a header.
+    private readonly List<(bool IsHeader, string Key, bool IsDimmed, string Label, string Distance, string Bearing,
+        string Fit)> _lines = new();
 
     private OverlayModel? _model;
+    private IReadOnlyList<ShelfCandidate> _candidates = Array.Empty<ShelfCandidate>();
+    private int _sourceCount;
+    private LabelStore? _store;
+    private Vector3 _builtAt;
     private string _itemText = string.Empty;
     private string? _unitText;
     private float _itemWidth;
     private OverlayStyles? _itemWidthStyles;
     private string _shelfText = string.Empty;
     private Vector2 _listScroll;
+
+    // Inline label edit (card 16's write path): the edited row's key, which field, and the text typed so far.
+    private string? _editKey;
+    private bool _isEditingGroup;
+    private string _editText = string.Empty;
+    private IReadOnlyList<string> _editGroups = Array.Empty<string>();
+    private bool _shouldFocusEdit;
+
+    private string? _note;
+    private bool _isNoteError;
+    private float _noteUntil;
 
     public OverlayUi(IntPtr ptr) : base(ptr) { }
 
@@ -145,10 +188,15 @@ public sealed class OverlayUi : MonoBehaviour
         if (lostReason is not null)
         {
             Close(log, lostReason);
+            return;
         }
-        else
+
+        HandlePanelKey(log, _inputBlocker.ReadPanelKey());
+        Camera camera = Camera.main;
+        if (_model is OverlayModel model && camera != null
+            && (camera.transform.position - _builtAt).sqrMagnitude > _rebuildDistance * _rebuildDistance)
         {
-            HandlePanelKey(log, _inputBlocker.ReadPanelKey());
+            RebuildList(log, model, camera, "moved");
         }
     }
 
@@ -184,20 +232,22 @@ public sealed class OverlayUi : MonoBehaviour
         int unit = Math.Max(1, gateway.GetTransferUnit(aim.Shelf, aim.Slot, aim.Item));
         int sourceCount = gateway.GetCount(aim.Shelf, aim.Item);
         IReadOnlyList<ShelfRef> shelves = listShelves();
-        LabelStore? store = LabelsFeature.Store;
-        Vector3 player = camera.transform.position;
-        ShelfList list = BuildTargetList(gateway, shelves, aim, sourceCount, unit,
-            new WorldPosition(player.x, player.y, player.z), store?.Entries ?? _noLabels);
-        (string Outcome, int Pruned, int Pending, int Candidates) prune = PruneLabels(log, store, shelves, aim, pruneMode);
+        // The same scan as the typed prompt's list (card 80): shelves only, each read once per open.
+        _candidates = ShelfTargetScan.ReadCandidates(gateway, shelves, aim.Item);
+        _sourceCount = sourceCount;
+        _store = LabelsFeature.Store;
 
         OverlayModel model = new(aim, unit);
-        model.OnShelfList(list);
-        BuildLines(model);
+        ShelfList list = RebuildList(null, model, camera, "open");
+        // The prune sees every storage the registry listed, not the filtered targets, so no label looks stale by type.
+        (string Outcome, int Pruned, int Pending, int Candidates) prune = PruneLabels(log, _store, shelves, aim, pruneMode);
+
         _itemText = string.Format(CultureInfo.InvariantCulture, "Item {0} x {1}", aim.Item.Value, aim.Count);
         _unitText = unit > 1 ? string.Format(CultureInfo.InvariantCulture, "(moves in {0}s)", unit) : null;
         _itemWidthStyles = null;
         _shelfText = "From " + command.GetShelfName(aim.Shelf);
         _listScroll = Vector2.zero;
+        _note = null;
         _model = model;
 
         _inputBlocker.Block();
@@ -216,24 +266,38 @@ public sealed class OverlayUi : MonoBehaviour
             new("prune_pending", prune.Pending),
             new("prune_candidates", prune.Candidates),
         });
+        WriteListLine(log, list, "open");
     }
 
-    // The same candidate reads as the typed prompt's list (TransferCommand), so both agree on which shelves exist and
-    // their fits; labels are passed in here so the rows group by base.
+    // Rows from the cached candidates: only the player position and the labels can have changed since the open.
+    // A null log skips the list line (the open writes it after its own line).
     [HideFromIl2Cpp]
-    private static ShelfList BuildTargetList(IShelfGateway gateway, IReadOnlyList<ShelfRef> shelves, AimTarget aim,
-        int sourceCount, int unit, WorldPosition player, IReadOnlyDictionary<string, ShelfLabel> labels)
+    private ShelfList RebuildList(IModLog? log, OverlayModel model, Camera camera, string reason)
     {
-        List<ShelfCandidate> candidates = new(shelves.Count);
-        foreach (ShelfRef shelf in shelves)
+        Vector3 player = camera.transform.position;
+        _builtAt = player;
+        ShelfList list = ShelfListBuilder.Build(_candidates, model.Source.Shelf.Key, _sourceCount,
+            new WorldPosition(player.x, player.y, player.z), _store?.Entries ?? _noLabels, model.TransferUnit);
+        model.OnShelfList(list);
+        BuildLines(model);
+        if (log is not null)
         {
-            // CanHold then GetFreeCapacity back to back share one hook walk in the gateway.
-            bool canHold = gateway.CanHold(shelf, aim.Item);
-            int free = gateway.GetFreeCapacity(shelf, aim.Item);
-            candidates.Add(new ShelfCandidate(shelf, free, canHold));
+            WriteListLine(log, list, reason);
         }
 
-        return ShelfListBuilder.Build(candidates, aim.Shelf.Key, sourceCount, player, labels, unit);
+        return list;
+    }
+
+    [HideFromIl2Cpp]
+    private static void WriteListLine(IModLog log, ShelfList list, string reason)
+    {
+        log.Write(LogLevel.Info, _logEvent, new KeyValuePair<string, object?>[]
+        {
+            new("state", "list"),
+            new("reason", reason),
+            new("shelves", list.Groups.Sum(group => group.Rows.Count)),
+            new("groups", list.Groups.Count),
+        });
     }
 
     // §07 prune on open. LabelPruneGuard decides (two consecutive scans, never the shared unknown file). DryRun (the
@@ -333,8 +397,8 @@ public sealed class OverlayUi : MonoBehaviour
         foreach (ShelfGroup group in model.Groups)
         {
             string header = string.Format(CultureInfo.InvariantCulture, "{0} {1} ({2})",
-                group.Expanded ? "v" : ">", group.Name, group.Rows.Count);
-            _lines.Add((true, false, header, string.Empty, string.Empty, string.Empty));
+                group.Expanded ? "v" : ">", FormatLabel(group.Name), group.Rows.Count);
+            _lines.Add((true, group.Name, false, header, string.Empty, string.Empty, string.Empty));
             if (!group.Expanded)
             {
                 continue;
@@ -342,12 +406,30 @@ public sealed class OverlayUi : MonoBehaviour
 
             foreach (ShelfRow row in group.Rows)
             {
-                _lines.Add((false, !row.Selectable, row.Label,
+                _lines.Add((false, row.Shelf.Key, !row.Selectable, FormatLabel(row.Label),
                     string.Format(CultureInfo.InvariantCulture, "{0:0} m", row.Distance),
                     row.Bearing,
                     row.Selectable ? string.Format(CultureInfo.InvariantCulture, "fits {0}", row.Fits) : _cannotHoldText));
             }
         }
+    }
+
+    // Cut with "..." so a long name never runs under the number columns; never splits a surrogate pair.
+    [HideFromIl2Cpp]
+    private static string FormatLabel(string label)
+    {
+        if (label.Length <= _maxLabelChars)
+        {
+            return label;
+        }
+
+        int cut = _maxLabelChars - _truncatedSuffix.Length;
+        if (char.IsHighSurrogate(label[cut - 1]))
+        {
+            cut--;
+        }
+
+        return label[..cut] + _truncatedSuffix;
     }
 
     [HideFromIl2Cpp]
@@ -362,9 +444,29 @@ public sealed class OverlayUi : MonoBehaviour
         return command.IsCapturedShelfGone ? "shelf_gone" : null;
     }
 
+    // While a label edit is open Enter saves it and Esc cancels only the edit, as in the label editor (card 16).
     [HideFromIl2Cpp]
     private void HandlePanelKey(IModLog log, KeyCode key)
     {
+        if (key == KeyCode.None)
+        {
+            return;
+        }
+
+        if (_editKey is not null)
+        {
+            if (key == KeyCode.Escape)
+            {
+                CancelEdit(log, "esc");
+            }
+            else
+            {
+                SubmitEdit(log);
+            }
+
+            return;
+        }
+
         if (key == KeyCode.Escape)
         {
             Escape(log, "esc");
@@ -385,6 +487,11 @@ public sealed class OverlayUi : MonoBehaviour
     [HideFromIl2Cpp]
     private void Close(IModLog log, string reason)
     {
+        if (_editKey is not null)
+        {
+            CancelEdit(log, reason);
+        }
+
         log.Write(LogLevel.Info, _logEvent, new KeyValuePair<string, object?>[]
         {
             new("state", "close"),
@@ -399,6 +506,10 @@ public sealed class OverlayUi : MonoBehaviour
     {
         _model = null;
         _lines.Clear();
+        _candidates = Array.Empty<ShelfCandidate>();
+        _store = null;
+        _note = null;
+        EndEdit();
         _command?.ReleaseAim();
     }
 
@@ -418,6 +529,183 @@ public sealed class OverlayUi : MonoBehaviour
 
         ResetOverlay();
         _inputBlocker.ReleaseNow();
+    }
+
+    [HideFromIl2Cpp]
+    private void Select(IModLog log, OverlayModel model, string key)
+    {
+        // The model refuses a dimmed row (I4) and keeps the current selection; the refusal is logged as evidence.
+        if (!model.SelectRow(key))
+        {
+            log.Write(LogLevel.Info, _logEvent, new KeyValuePair<string, object?>[]
+            {
+                new("state", "refuse"),
+                new("target", key),
+            });
+            return;
+        }
+
+        log.Write(LogLevel.Info, _logEvent, new KeyValuePair<string, object?>[]
+        {
+            new("state", "select"),
+            new("target", key),
+            new("fits", model.SelectedRow?.Fits),
+        });
+    }
+
+    [HideFromIl2Cpp]
+    private void ToggleGroup(IModLog log, OverlayModel model, string groupName)
+    {
+        model.ToggleGroup(groupName);
+        BuildLines(model);
+        log.Write(LogLevel.Info, _logEvent, new KeyValuePair<string, object?>[]
+        {
+            new("state", "toggle"),
+            new("group", groupName),
+            new("expanded", model.Groups.FirstOrDefault(group => group.Name == groupName)?.Expanded),
+        });
+    }
+
+    [HideFromIl2Cpp]
+    private void BeginEdit(IModLog log, string key, bool isGroup)
+    {
+        if (_editKey is not null)
+        {
+            CancelEdit(log, "switch");
+        }
+
+        LabelStore? store = _store;
+        if (store is null || !ReferenceEquals(LabelsFeature.Store, store))
+        {
+            log.Write(LogLevel.Info, _labelLogEvent, new KeyValuePair<string, object?>[]
+            {
+                new("action", "none"),
+                new("reason", "no_store"),
+                new("shelf", key),
+            });
+            ShowNote(_noStoreText, true);
+            return;
+        }
+
+        ShelfLabel? existing = store.Get(key);
+        _editKey = key;
+        _isEditingGroup = isGroup;
+        _editText = (isGroup ? existing?.Group : existing?.Label) ?? string.Empty;
+        _editGroups = isGroup ? store.ListGroups() : Array.Empty<string>();
+        _shouldFocusEdit = true;
+        _note = null;
+        log.Write(LogLevel.Info, _labelLogEvent, new KeyValuePair<string, object?>[]
+        {
+            new("action", "open"),
+            new("shelf", key),
+            new("label", existing?.Label),
+            new("group", existing?.Group),
+            new("groups", store.ListGroups().Count),
+            new("field", isGroup ? "group" : "label"),
+            new("from", "overlay"),
+        });
+    }
+
+    // The label editor's rule and write path (card 16): IsValidName first, then ui.label set|clear, then SetLabel, which
+    // saves and logs labels.write. The field not being edited keeps its stored value.
+    [HideFromIl2Cpp]
+    private void SubmitEdit(IModLog log)
+    {
+        string? key = _editKey;
+        LabelStore? store = _store;
+        if (key is null || _model is not OverlayModel model)
+        {
+            return;
+        }
+
+        Camera camera = Camera.main;
+        if (store is null || !ReferenceEquals(LabelsFeature.Store, store) || camera == null)
+        {
+            CancelEdit(log, "world_left");
+            return;
+        }
+
+        ShelfLabel? existing = store.Get(key);
+        string text = _editText.Trim();
+        string? label = _isEditingGroup ? existing?.Label : text;
+        string? group = _isEditingGroup ? (text.Length == 0 ? null : text) : existing?.Group;
+        if (!LabelsFeature.IsValidName(label) || !LabelsFeature.IsValidName(group))
+        {
+            bool isTooLong = (label?.Trim().Length ?? 0) > LabelsFeature.MaxNameLength
+                || (group?.Trim().Length ?? 0) > LabelsFeature.MaxNameLength;
+            ShowNote(isTooLong ? _tooLongText : _invalidCharText, true);
+            log.Write(LogLevel.Info, _labelLogEvent, new KeyValuePair<string, object?>[]
+            {
+                new("action", "reject"),
+                new("shelf", key),
+                new("reason", isTooLong ? "too_long" : "invalid_char"),
+            });
+            return;
+        }
+
+        string action = string.IsNullOrWhiteSpace(label) && group is null ? "clear" : "set";
+        log.Write(LogLevel.Info, _labelLogEvent, new KeyValuePair<string, object?>[]
+        {
+            new("action", action),
+            new("shelf", key),
+            new("label", label),
+            new("group", group),
+        });
+
+        // Ended first, so a throw from the save still leaves no edit open.
+        bool wasGroupEdit = _isEditingGroup;
+        EndEdit();
+        ShowSaveResult(LabelsFeature.SetLabel(key, label, group));
+        RebuildList(log, model, camera, "label");
+        if (wasGroupEdit)
+        {
+            // A regrouped row would vanish into a collapsed group.
+            model.ExpandGroupOf(key);
+            BuildLines(model);
+        }
+    }
+
+    [HideFromIl2Cpp]
+    private void CancelEdit(IModLog log, string reason)
+    {
+        log.Write(LogLevel.Info, _labelLogEvent, new KeyValuePair<string, object?>[]
+        {
+            new("action", "cancel"),
+            new("shelf", _editKey),
+            new("reason", reason),
+        });
+        EndEdit();
+    }
+
+    [HideFromIl2Cpp]
+    private void EndEdit()
+    {
+        _editKey = null;
+        _isEditingGroup = false;
+        _editText = string.Empty;
+        _editGroups = Array.Empty<string>();
+        _shouldFocusEdit = false;
+    }
+
+    [HideFromIl2Cpp]
+    private void ShowSaveResult(LabelSaveResult? saved)
+    {
+        (string text, bool isError) = saved?.Status switch
+        {
+            LabelSaveStatus.Saved => (_savedText, false),
+            LabelSaveStatus.Failed => (_saveFailedText, true),
+            LabelSaveStatus.Blocked => (_saveBlockedText, true),
+            _ => (_noStoreText, true),
+        };
+        ShowNote(text, isError);
+    }
+
+    [HideFromIl2Cpp]
+    private void ShowNote(string text, bool isError)
+    {
+        _note = text;
+        _isNoteError = isError;
+        _noteUntil = Time.unscaledTime + _noteSeconds;
     }
 
     [HideFromIl2Cpp]
@@ -469,9 +757,29 @@ public sealed class OverlayUi : MonoBehaviour
         GUI.Label(new Rect(x, y, innerWidth, styles.SmallLineHeight), _sendToText, styles.Small);
         y += styles.SmallLineHeight;
 
-        DrawList(styles, status, new Rect(x, y, innerWidth, listHeight), contentHeight);
+        // Applied after the list is drawn: a click that rebuilds _lines must not change it while it is enumerated.
+        Action? clicked = DrawList(log, model, styles, status, new Rect(x, y, innerWidth, listHeight), contentHeight);
         y += listHeight + gap;
-        GUI.Label(new Rect(x, y, innerWidth, styles.SmallLineHeight), _hintText, styles.Small);
+        DrawFooter(styles, new Rect(x, y, innerWidth, styles.SmallLineHeight));
+        clicked?.Invoke();
+    }
+
+    [HideFromIl2Cpp]
+    private void DrawFooter(OverlayStyles styles, Rect area)
+    {
+        if (_note is not null && Time.unscaledTime >= _noteUntil)
+        {
+            _note = null;
+        }
+
+        if (_note is not null)
+        {
+            GUI.Label(area, _note, _isNoteError ? styles.SmallError : styles.SmallSuccess);
+        }
+        else
+        {
+            GUI.Label(area, _editKey is null ? _hintText : _editHintText, styles.Small);
+        }
     }
 
     [HideFromIl2Cpp]
@@ -509,17 +817,30 @@ public sealed class OverlayUi : MonoBehaviour
     private float GetLinesHeight(OverlayStyles styles)
     {
         float height = 0f;
-        foreach ((bool isHeader, _, _, _, _, _) in _lines)
+        foreach ((bool isHeader, string key, _, _, _, _, _) in _lines)
         {
             height += styles.Px(isHeader ? OverlayStyles.GroupHeaderHeight : OverlayStyles.RowHeight);
+            if (!isHeader && _isEditingGroup && key == _editKey)
+            {
+                height += GetChipsHeight(styles);
+            }
         }
 
         return height;
     }
 
-    // Read-only until card 21 adds hover, selection and rename; rows follow design.md's fixed columns so numbers align.
     [HideFromIl2Cpp]
-    private void DrawList(OverlayStyles styles, string? status, Rect area, float contentHeight)
+    private float GetChipsHeight(OverlayStyles styles)
+    {
+        int rows = (_editGroups.Count + _groupChipColumns) / _groupChipColumns;
+        float gap = styles.Px(OverlayStyles.Space2);
+        return (rows * (styles.Px(OverlayStyles.ChipHeight) + gap)) + gap;
+    }
+
+    // Rows follow design.md's fixed columns so numbers align; returns the click to apply once drawing is done.
+    [HideFromIl2Cpp]
+    private Action? DrawList(IModLog log, OverlayModel model, OverlayStyles styles, string? status, Rect area,
+        float contentHeight)
     {
         bool isScrolling = contentHeight > area.height;
         float viewWidth = isScrolling ? area.width - styles.Px(_scrollbarWidth) : area.width;
@@ -531,35 +852,161 @@ public sealed class OverlayUi : MonoBehaviour
             y += styles.BodyLineHeight;
         }
 
-        float indent = styles.Px(_rowIndent);
-        float fitWidth = styles.Px(_fitColumnWidth);
-        float bearingWidth = styles.Px(_bearingColumnWidth);
-        float distanceWidth = styles.Px(_distanceColumnWidth);
-        float gap = styles.Px(OverlayStyles.Space2);
-        foreach ((bool isHeader, bool isDimmed, string label, string distance, string bearing, string fit) in _lines)
+        Action? clicked = null;
+        string? selectedKey = model.SelectedRow?.Shelf.Key;
+        foreach ((bool isHeader, string key, bool isDimmed, string label, string distance, string bearing, string fit)
+            in _lines)
         {
             if (isHeader)
             {
                 float headerHeight = styles.Px(OverlayStyles.GroupHeaderHeight);
-                GUI.Label(new Rect(0f, y, viewWidth, headerHeight), label, styles.GroupHeader);
+                Rect header = new(0f, y, viewWidth, headerHeight);
+                if (header.Contains(Event.current.mousePosition))
+                {
+                    GUI.DrawTexture(header, styles.RowHoverTexture);
+                }
+
+                GUI.Label(header, label, styles.GroupHeader);
+                if (GUI.Button(header, string.Empty, styles.RowHit))
+                {
+                    clicked = () => ToggleGroup(log, model, key);
+                }
+
                 y += headerHeight;
                 continue;
             }
 
-            float rowHeight = styles.Px(OverlayStyles.RowHeight);
-            float fitX = viewWidth - fitWidth;
-            float bearingX = fitX - gap - bearingWidth;
-            float distanceX = bearingX - gap - distanceWidth;
-            GUI.Label(new Rect(indent, y, Math.Max(0f, distanceX - indent - gap), rowHeight), label,
-                isDimmed ? styles.RowDisabled : styles.Body);
-            GUI.Label(new Rect(distanceX, y, distanceWidth, rowHeight), distance, styles.SmallRight);
-            GUI.Label(new Rect(bearingX, y, bearingWidth, rowHeight), bearing, styles.Small);
-            GUI.Label(new Rect(fitX, y, fitWidth, rowHeight), fit, isDimmed ? styles.SmallDisabled : styles.SmallRight);
-            GUI.DrawTexture(new Rect(0f, y + rowHeight - 1f, viewWidth, 1f), styles.DividerTexture);
-            y += rowHeight;
+            Rect row = new(0f, y, viewWidth, styles.Px(OverlayStyles.RowHeight));
+            Action? rowClick = key == _editKey
+                ? DrawEditRow(log, styles, row)
+                : DrawRow(log, model, styles, row, key, key == selectedKey, isDimmed, label, distance, bearing, fit);
+            clicked ??= rowClick;
+            y += row.height;
+            if (_isEditingGroup && key == _editKey)
+            {
+                y = DrawGroupChips(styles, viewWidth, y);
+            }
         }
 
         GUI.EndScrollView();
+        return clicked;
+    }
+
+    [HideFromIl2Cpp]
+    private Action? DrawRow(IModLog log, OverlayModel model, OverlayStyles styles, Rect row, string key, bool isSelected,
+        bool isDimmed, string label, string distance, string bearing, string fit)
+    {
+        // A dimmed row gets no hover fill (design: disabled) but still forwards its click; the model refuses it.
+        if (isSelected)
+        {
+            GUI.DrawTexture(row, styles.RowSelectedTexture);
+            float barWidth = styles.Px(OverlayStyles.SelectedBarWidth);
+            GUI.DrawTexture(new Rect(row.x, row.y, barWidth, row.height), styles.AccentTexture);
+        }
+        else if (!isDimmed && row.Contains(Event.current.mousePosition))
+        {
+            GUI.DrawTexture(row, styles.RowHoverTexture);
+        }
+
+        (float labelX, float distanceX, float bearingX, float fitX, float renameX, float groupX) =
+            GetColumns(styles, row.width);
+        float gap = styles.Px(OverlayStyles.Space2);
+        GUIStyle labelStyle = isSelected ? styles.BodyOnAccent : isDimmed ? styles.RowDisabled : styles.Body;
+        GUIStyle numberStyle = isSelected ? styles.SmallOnAccentRight : styles.SmallRight;
+        GUI.Label(new Rect(labelX, row.y, Math.Max(0f, distanceX - labelX - gap), row.height), label, labelStyle);
+        GUI.Label(new Rect(distanceX, row.y, styles.Px(_distanceColumnWidth), row.height), distance, numberStyle);
+        GUI.Label(new Rect(bearingX, row.y, styles.Px(_bearingColumnWidth), row.height), bearing,
+            isSelected ? styles.SmallOnAccent : styles.Small);
+        GUI.Label(new Rect(fitX, row.y, styles.Px(_fitColumnWidth), row.height), fit,
+            isDimmed ? styles.SmallDisabled : numberStyle);
+        GUI.DrawTexture(new Rect(row.x, row.yMax - 1f, row.width, 1f), styles.DividerTexture);
+
+        GUIStyle linkStyle = isSelected ? styles.LinkOnAccent : styles.Link;
+        if (GUI.Button(new Rect(renameX, row.y, styles.Px(_renameLinkWidth), row.height), _renameText, linkStyle))
+        {
+            return () => BeginEdit(log, key, isGroup: false);
+        }
+
+        if (GUI.Button(new Rect(groupX, row.y, styles.Px(_groupLinkWidth), row.height), _groupText, linkStyle))
+        {
+            return () => BeginEdit(log, key, isGroup: true);
+        }
+
+        // The links sit outside this target, so a link click never also selects the row.
+        if (GUI.Button(new Rect(row.x, row.y, renameX - gap - row.x, row.height), string.Empty, styles.RowHit))
+        {
+            return () => Select(log, model, key);
+        }
+
+        return null;
+    }
+
+    [HideFromIl2Cpp]
+    private Action? DrawEditRow(IModLog log, OverlayStyles styles, Rect row)
+    {
+        (float labelX, _, _, _, float renameX, float groupX) = GetColumns(styles, row.width);
+        float inset = styles.Px(OverlayStyles.Space1);
+        float gap = styles.Px(OverlayStyles.Space2);
+        GUI.SetNextControlName(_editControl);
+        _editText = GUI.TextField(new Rect(labelX, row.y + inset, renameX - gap - labelX, row.height - (2f * inset)),
+            _editText, LabelsFeature.MaxNameLength, styles.TextField);
+        if (_shouldFocusEdit)
+        {
+            GUI.FocusControl(_editControl);
+            _shouldFocusEdit = false;
+        }
+
+        if (GUI.Button(new Rect(renameX, row.y, styles.Px(_renameLinkWidth), row.height), _saveText, styles.Link))
+        {
+            return () => SubmitEdit(log);
+        }
+
+        if (GUI.Button(new Rect(groupX, row.y, styles.Px(_groupLinkWidth), row.height), _cancelText, styles.Link))
+        {
+            return () => CancelEdit(log, "button");
+        }
+
+        return null;
+    }
+
+    // "None" first, then each existing group, as in the label editor; a click fills the field and Enter saves it.
+    [HideFromIl2Cpp]
+    private float DrawGroupChips(OverlayStyles styles, float width, float y)
+    {
+        float indent = styles.Px(_rowIndent);
+        float gap = styles.Px(OverlayStyles.Space2);
+        float chipHeight = styles.Px(OverlayStyles.ChipHeight);
+        float chipWidth = (width - indent - ((_groupChipColumns - 1) * gap)) / _groupChipColumns;
+        string typed = _editText.Trim();
+        y += gap;
+        for (int index = 0; index <= _editGroups.Count; index++)
+        {
+            string group = index == 0 ? string.Empty : _editGroups[index - 1];
+            Rect chip = new(indent + ((index % _groupChipColumns) * (chipWidth + gap)),
+                y + ((index / _groupChipColumns) * (chipHeight + gap)), chipWidth, chipHeight);
+            bool isPicked = string.Equals(group, typed, StringComparison.Ordinal);
+            GUIStyle chipStyle = isPicked ? styles.ChipSelected : styles.Button;
+            if (GUI.Button(chip, index == 0 ? _noGroupText : FormatLabel(group), chipStyle))
+            {
+                _editText = group;
+                _shouldFocusEdit = true;
+            }
+        }
+
+        return y - gap + GetChipsHeight(styles);
+    }
+
+    [HideFromIl2Cpp]
+    private static (float Label, float Distance, float Bearing, float Fit, float Rename, float Group) GetColumns(
+        OverlayStyles styles, float width)
+    {
+        float gap = styles.Px(OverlayStyles.Space2);
+        float groupX = width - styles.Px(_groupLinkWidth);
+        float renameX = groupX - styles.Px(OverlayStyles.Space1) - styles.Px(_renameLinkWidth);
+        float fitX = renameX - gap - styles.Px(_fitColumnWidth);
+        float bearingX = fitX - gap - styles.Px(_bearingColumnWidth);
+        float distanceX = bearingX - gap - styles.Px(_distanceColumnWidth);
+        return (styles.Px(_rowIndent), distanceX, bearingX, fitX, renameX, groupX);
     }
 
     [HideFromIl2Cpp]
