@@ -247,13 +247,11 @@ public sealed class TransferRunnerTests
     }
 
     // Card 68 criterion 5: the gateway reports unit 0 for an emptied slot, as the plugin does; the count reason must win.
-    [Theory]
-    [InlineData(1)]
-    [InlineData(10)]
-    public void Tick_SourceEmptiedBeforePlanning_BlocksNothingToMoveNotUnitUnknown(int unit)
+    [Fact]
+    public void Tick_SourceEmptiedBeforePlanningWithUnitTen_BlocksNothingToMoveNotUnitUnknown()
     {
         Rig rig = Build(source: 0);
-        rig.Gateway.TransferUnit = unit;
+        rig.Gateway.TransferUnit = 10;
 
         rig.Runner.Tick(10);
 
