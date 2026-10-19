@@ -139,6 +139,75 @@ public sealed class SendAllRunnerSafetyTests
         AssertNoFurtherCall(rig);
     }
 
+    // Review fix (PR #33): a gateway callback during an outer Abort's stop re-reads must not settle the run before its report exists
+    [Theory]
+    [InlineData("abort")]
+    [InlineData("tick")]
+    public void Abort_NestedCallDuringRunStopReReads_ReportsTheRunsFinalCountsAndStopIsTheLastLine(string nested)
+    {
+        Rig rig = new();
+        while (rig.Gateway.StoreCalls < 16)
+        {
+            rig.Queue.Tick(1);
+        }
+
+        rig.Gateway.OnCall = call =>
+        {
+            if (call != "IsAlive(src)")
+            {
+                return;
+            }
+
+            if (nested == "abort")
+            {
+                rig.Queue.Abort(StopReason.GatewayError, "nested");
+            }
+            else
+            {
+                rig.Queue.Tick(1);
+            }
+        };
+
+        rig.Queue.Abort(StopReason.GatewayError, "outer");
+
+        SendAllReport report = rig.Report;
+        Assert.Equal(SendAllStopReason.SafetyStop, report.Reason);
+        Assert.Equal(SendAllTypeOutcome.Stopped, report.Types[1].Outcome);
+        Assert.Equal(10, report.Types[1].Moved);
+        Assert.Equal(20, report.Types[1].SourceStart);
+        Assert.Equal(SendAllTypeOutcome.NotStarted, report.Types[2].Outcome);
+        Assert.Equal(16, report.Moved);
+        Assert.Equal(new[]
+        {
+            "queue.start source=src target=dst types=3",
+            "queue.type k=1 n=3 item=438 outcome=Moved moved=6 remaining=0 stranded=0 s0=6",
+            "queue.type k=2 n=3 item=362 outcome=Stopped moved=10 remaining=10 stranded=0 s0=20",
+            "queue.stop reason=SafetyStop types_done=2 moved=16 stranded=0 detail=\"GatewayError: outer\"",
+        }, rig.Lines("queue."));
+    }
+
+    // Review fix (PR #33): queue.start opens the log even when ListStock throws
+    [Fact]
+    public void Abort_AfterListStockThrows_LogsStartThenStop()
+    {
+        Rig rig = new();
+        rig.Gateway.OnCall = call =>
+        {
+            if (call == "ListStock(src)")
+            {
+                throw new InvalidOperationException(_throwMessage);
+            }
+        };
+
+        DriveToEnd(rig);
+
+        Assert.Equal(new[]
+        {
+            "queue.start source=src target=dst types=0 listing_failed=true",
+            $"queue.stop reason=SafetyStop types_done=0 moved=0 stranded=0 detail=\"GatewayError: {_throwMessage}\"",
+        }, rig.Lines("queue."));
+    }
+
     private static void Arm(Rig rig, string fault)
     {
         FakeShelfGateway gateway = rig.Gateway;

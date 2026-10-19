@@ -136,10 +136,10 @@ public sealed class SendAllRunnerTests
 
     // Criterion 3
     [Theory]
-    [InlineData("free below one chunk")]
-    [InlineData("cannot hold")]
-    [InlineData("source below one chunk")]
-    public void Tick_TypeDoesNotFit_SkippedBeforeAnyTakeAndQueueContinues(string why)
+    [InlineData("free below one chunk", SendAllSkipReason.DoesntFit)]
+    [InlineData("cannot hold", SendAllSkipReason.DoesntFit)]
+    [InlineData("source below one chunk", SendAllSkipReason.NothingToMove)]
+    public void Tick_TypeDoesNotFit_SkippedBeforeAnyTakeAndQueueContinues(string why, SendAllSkipReason skip)
     {
         Rig rig = why switch
         {
@@ -164,6 +164,7 @@ public sealed class SendAllRunnerTests
 
         SendAllTypeResult ammo = rig.Report.Types[1];
         Assert.Equal(SendAllTypeOutcome.Skipped, ammo.Outcome);
+        Assert.Equal(skip, ammo.SkipReason);
         Assert.Equal(StopReason.BlockedBeforeStart, RunOf(ammo).Reason);
         Assert.Equal(0, ammo.Moved);
         Assert.Equal(6 + 4, rig.Gateway.TakeCalls);
@@ -232,15 +233,16 @@ public sealed class SendAllRunnerTests
         Assert.Equal(new[] { SendAllTypeOutcome.Moved, SendAllTypeOutcome.Skipped, SendAllTypeOutcome.Moved },
             report.Types.Select(t => t.Outcome));
         Assert.Equal(new[] { 6, 20, 4 }, report.Types.Select(t => t.Moved + t.Remaining + t.Stranded));
+        Assert.Equal(new int?[] { 6, 20, 4 }, report.Types.Select(t => t.SourceStart));
         Assert.Equal(10, report.Moved);
         Assert.Equal(0, report.Stranded);
         Assert.Equal(3, report.TypesDone);
         Assert.Equal(new[]
         {
             "queue.start source=src target=dst types=3",
-            "queue.type k=1 n=3 item=438 outcome=Moved moved=6 remaining=0 stranded=0",
-            "queue.type k=2 n=3 item=362 outcome=Skipped moved=0 remaining=20 stranded=0",
-            "queue.type k=3 n=3 item=504 outcome=Moved moved=4 remaining=0 stranded=0",
+            "queue.type k=1 n=3 item=438 outcome=Moved moved=6 remaining=0 stranded=0 s0=6",
+            "queue.type k=2 n=3 item=362 outcome=Skipped moved=0 remaining=20 stranded=0 s0=20 reason=DoesntFit",
+            "queue.type k=3 n=3 item=504 outcome=Moved moved=4 remaining=0 stranded=0 s0=4",
             "queue.stop reason=Completed types_done=3 moved=10 stranded=0 detail=null",
         }, rig.Lines("queue."));
     }

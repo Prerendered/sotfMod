@@ -26,6 +26,7 @@ public sealed class SendAllRunner
     private readonly int _confirmTicks;
     private readonly List<SendAllTypeResult> _types = new();
     private TransferRunner? _run;
+    private RunStartLog? _runLog;
 
     // Index of the type the current run works on, or of the next type to start.
     private int _next;
@@ -36,6 +37,9 @@ public sealed class SendAllRunner
     private string? _abortDetail;
     private bool _isTickInFlight;
     private bool _isTickOnStack;
+
+    // Set while the run's abort re-reads; a nested Abort or Tick from them must not settle a run whose report is not built yet.
+    private bool _isAbortOnStack;
 
     /// <summary><paramref name="confirmTicks"/> is passed to every per-type run (see <see cref="TransferRunner"/>).</summary>
     public SendAllRunner(IShelfGateway gateway, IModLog log, ShelfRef source, ShelfRef target, int confirmTicks = 0)
@@ -74,10 +78,11 @@ public sealed class SendAllRunner
         _run?.RequestCancel();
     }
 
-    /// <summary>The driver calls it after a throw (P2): aborts the current run (fresh re-reads) and ends the queue. No-op once finished.</summary>
+    /// <summary>The driver calls it after a throw (P2): aborts the current run (fresh re-reads) and ends the queue. No-op once
+    /// finished, and while an earlier Abort is still re-reading (the first stop wins).</summary>
     public void Abort(StopReason reason, string? detail)
     {
-        if (IsFinished)
+        if (IsFinished || _isAbortOnStack)
         {
             return;
         }
@@ -89,7 +94,16 @@ public sealed class SendAllRunner
             return;
         }
 
-        run.Abort(reason, detail);
+        _isAbortOnStack = true;
+        try
+        {
+            run.Abort(reason, detail);
+        }
+        finally
+        {
+            _isAbortOnStack = false;
+        }
+
         if (!_isTickOnStack)
         {
             Settle(run);
@@ -105,7 +119,7 @@ public sealed class SendAllRunner
             throw new ArgumentOutOfRangeException(nameof(maxCycles), maxCycles, "must be at least 1");
         }
 
-        if (IsFinished)
+        if (IsFinished || _isAbortOnStack)
         {
             return;
         }
@@ -158,16 +172,14 @@ public sealed class SendAllRunner
             }
 
             ShelfStockEntry entry = _types[_next].Entry;
-            _run = new TransferRunner(_gateway, _log,
+            _runLog = new RunStartLog(_log);
+            _run = new TransferRunner(_gateway, _runLog,
                 new TransferRequest(_source, _anyHook, _target, entry.Item, AmountClamp.All), _confirmTicks);
         }
 
         TransferRunner run = _run;
         run.Tick(maxCycles);
-        if (!IsFinished)
-        {
-            Settle(run);
-        }
+        Settle(run);
     }
 
     // The order is fixed here; counts are not: each run re-reads source, target and free space at its own Planning (I4).
@@ -185,12 +197,7 @@ public sealed class SendAllRunner
         }
 
         State = SendAllState.Running;
-        _log.Write(LogLevel.Info, "queue.start", new KeyValuePair<string, object?>[]
-        {
-            new("source", _source.Key),
-            new("target", _target.Key),
-            new("types", _types.Count),
-        });
+        LogStart(isListed: true);
 
         if (_types.Count == 0)
         {
@@ -198,9 +205,15 @@ public sealed class SendAllRunner
         }
     }
 
-    // No-op while the run goes on. Only a clean run with nothing in the inventory lets the queue go on (I3).
+    // No-op while the run goes on and once the queue is finished. Only a clean run with nothing in the inventory lets the
+    // queue go on (I3).
     private void Settle(TransferRunner run)
     {
+        if (IsFinished)
+        {
+            return;
+        }
+
         if (run.Report is not TransferReport report)
         {
             if (_abortDetail is not null)
@@ -211,9 +224,17 @@ public sealed class SendAllRunner
             return;
         }
 
+        SendAllTypeOutcome outcome = GetOutcome(report);
+        SendAllTypeResult result = _types[_next] with
+        {
+            Outcome = outcome,
+            Run = report,
+            SourceStart = _runLog?.SourceStart,
+            SkipReason = outcome == SendAllTypeOutcome.Skipped ? GetSkipReason(report.Detail) : null,
+        };
         _run = null;
+        _runLog = null;
         _settledMoved += report.Moved;
-        SendAllTypeResult result = _types[_next] with { Outcome = GetOutcome(report), Run = report };
         _types[_next] = result;
         _next++;
         LogType(_next, result);
@@ -253,6 +274,25 @@ public sealed class SendAllRunner
         };
     }
 
+    // The run states why it was blocked only in its detail (TransferRunner.Plan); card 75 leaves the runner unchanged.
+    // Everything else it blocks on (TargetFull, cannot hold) is the target side.
+    private static SendAllSkipReason GetSkipReason(string? detail)
+    {
+        if (detail is null)
+        {
+            return SendAllSkipReason.DoesntFit;
+        }
+
+        if (detail.StartsWith("transfer unit unknown", StringComparison.Ordinal))
+        {
+            return SendAllSkipReason.UnitUnknown;
+        }
+
+        return detail.StartsWith(nameof(ClampReason.NothingToMove), StringComparison.Ordinal)
+            ? SendAllSkipReason.NothingToMove
+            : SendAllSkipReason.DoesntFit;
+    }
+
     private static string FormatUnsafe(TransferReport report) =>
         report.Reason is StopReason.Completed or StopReason.BlockedBeforeStart or StopReason.Cancelled
             ? $"{report.StrandedInInventory} stranded after {report.Reason}"
@@ -260,10 +300,27 @@ public sealed class SendAllRunner
 
     private static string FormatStop(StopReason reason, string? detail) => detail is null ? reason.ToString() : $"{reason}: {detail}";
 
+    private void LogStart(bool isListed)
+    {
+        List<KeyValuePair<string, object?>> fields = new()
+        {
+            new("source", _source.Key),
+            new("target", _target.Key),
+            new("types", _types.Count),
+        };
+        if (!isListed)
+        {
+            fields.Add(new("listing_failed", true));
+        }
+
+        _log.Write(LogLevel.Info, "queue.start", fields);
+    }
+
+    // s0 and the skip reason follow criterion 7's fields so that line keeps its shape.
     private void LogType(int number, SendAllTypeResult result)
     {
         bool isUnsafe = result.Outcome is SendAllTypeOutcome.Stopped or SendAllTypeOutcome.Stranded;
-        _log.Write(isUnsafe ? LogLevel.Warn : LogLevel.Info, "queue.type", new KeyValuePair<string, object?>[]
+        List<KeyValuePair<string, object?>> fields = new()
         {
             new("k", number),
             new("n", _types.Count),
@@ -272,7 +329,14 @@ public sealed class SendAllRunner
             new("moved", result.Moved),
             new("remaining", result.Remaining),
             new("stranded", result.Stranded),
-        });
+            new("s0", result.SourceStart),
+        };
+        if (result.SkipReason is SendAllSkipReason skip)
+        {
+            fields.Add(new("reason", skip));
+        }
+
+        _log.Write(isUnsafe ? LogLevel.Warn : LogLevel.Info, "queue.type", fields);
     }
 
     private void Finish(SendAllStopReason reason, string? detail)
@@ -280,6 +344,12 @@ public sealed class SendAllRunner
         if (IsFinished)
         {
             return;
+        }
+
+        if (State == SendAllState.Listing)
+        {
+            // ListStock threw or was aborted; queue.start still opens every queue in the log.
+            LogStart(isListed: false);
         }
 
         State = SendAllState.Finished;
@@ -293,5 +363,33 @@ public sealed class SendAllRunner
                 new("stranded", Report.Stranded),
                 new("detail", detail),
             });
+    }
+
+    // TransferRunner (unchanged by card 75) publishes its S0 only on transfer.start; this keeps it for the type's report.
+    private sealed class RunStartLog : IModLog
+    {
+        private readonly IModLog _inner;
+
+        public RunStartLog(IModLog inner) => _inner = inner;
+
+        public int? SourceStart { get; private set; }
+
+        public void Write(LogLevel level, string eventName, IReadOnlyList<KeyValuePair<string, object?>> fields)
+        {
+            if (eventName == "transfer.start")
+            {
+                foreach (KeyValuePair<string, object?> field in fields)
+                {
+                    if (field.Key == "s0" && field.Value is int s0)
+                    {
+                        SourceStart = s0;
+                    }
+                }
+            }
+
+            _inner.Write(level, eventName, fields);
+        }
+
+        public void WriteException(string eventName, Exception exception) => _inner.WriteException(eventName, exception);
     }
 }
