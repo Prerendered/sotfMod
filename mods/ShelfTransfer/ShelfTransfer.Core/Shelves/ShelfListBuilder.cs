@@ -1,8 +1,8 @@
 // purpose: builds the overlay's target list: shelves grouped by label group, sorted by distance, with bearing and fit count
 // owns:    ShelfListBuilder.Build, ShelfCandidate, ShelfGroup, ShelfList
 // deps:    AmountClamp, Bearing, ShelfRow, ShelfLabel, ShelfRef, WorldPosition
-// caution: pure — the plugin reads the gateway and label store and hands plain values in. StaleLabelKeys is a report only;
-//          an empty or partial shelf list makes every label look stale, so the caller guards before LabelStore.Prune.
+// caution: pure — the plugin reads the gateway (ShelfTargetScan) and label store and hands plain values in. StaleLabelKeys
+//          is a report only and nothing prunes from it: pruning is LabelPruneGuard's two-scan rule over the unfiltered listing.
 
 using System;
 using System.Collections.Generic;
@@ -19,7 +19,7 @@ public sealed record ShelfCandidate(ShelfRef Shelf, int FreeCapacity, bool CanHo
 
 public sealed record ShelfGroup(string Name, bool Expanded, IReadOnlyList<ShelfRow> Rows);
 
-/// <summary>StaleLabelKeys: stored label keys matching no live shelf, ordinal order, for the caller to prune.</summary>
+/// <summary>StaleLabelKeys: stored label keys matching no listed shelf, ordinal order; a report, never a prune list.</summary>
 public sealed record ShelfList(IReadOnlyList<ShelfGroup> Groups, IReadOnlyList<string> StaleLabelKeys)
 {
     public bool IsEmpty => Groups.Count == 0;
