@@ -4,7 +4,8 @@
 //          transfer; the panel then shows its progress and the result line. Esc closes it with nothing moved
 // owns:    OverlayUi
 // deps:    OverlayModel, ShelfTargetScan, ShelfListBuilder, IShelfGateway (reads only), TransferCommand (CaptureAim,
-//          ReleaseAim, IsCapturedShelfGone, GetShelfName, StartCaptured, RequestCancel, IsRunning, GetProgress),
+//          ReleaseAim, IsCapturedShelfGone, GetShelfName, StartCaptured, RefuseIfBusy, RequestCancel, IsRunning,
+//          GetProgress),
 //          LabelsFeature (Store, SetLabel, IsValidName, SaveNow), LabelPruneGuard, InputBlocker, OverlayStyles,
 //          ModConfig (TransferKey, PruneMode), IModLog, UnityEngine IMGUI
 // caution: I1/I2 - never calls TakeOne/StoreOne; Confirm starts the run through TransferCommand.StartCaptured, the typed
@@ -84,7 +85,6 @@ public sealed class OverlayUi : MonoBehaviour
     private const string _allText = "All";
     private const string _confirmText = "Confirm";
     private const string _cancelButtonText = "Cancel";
-    private const string _clampedText = "Clamped to what fits";
     private const string _doneText = "Done";
     private const string _stoppedText = "Stopped";
     private const string _cannotHoldText = "can't hold";
@@ -173,7 +173,8 @@ public sealed class OverlayUi : MonoBehaviour
     // Set by the driver's finish callback, which runs outside this class's catch, so it only stores; Tick applies it,
     // and only to the overlay instance that confirmed (a result for a closed overlay is dropped).
     private (OverlayModel Model, TransferReport Report)? _finished;
-    private bool _isAmountFocused;
+    // An Enter not yet matched to the amount field's focus; set by either key path, consumed where the field is drawn.
+    private bool _isEnterPending;
     private (int Moved, int Planned) _progress;
     private string _progressText = string.Empty;
     private string? _stepText;
@@ -257,15 +258,16 @@ public sealed class OverlayUi : MonoBehaviour
             return;
         }
 
-        HandlePanelKey(log, command, _inputBlocker.ReadPanelKey());
+        HandlePanelKey(log, _inputBlocker.ReadPanelKey());
         if (_model is not OverlayModel model)
         {
             return;
         }
 
         // Planned is 0 until the runner's first tick; until then the requested amount shows. Kept after the run ends, so
-        // the frame before the result still shows the final count.
-        if (model.State == OverlayState.Running && command.GetProgress() is { } progress && progress.Planned > 0)
+        // the frame before the result still shows the final count. Formatted on change only, never per frame.
+        if (model.State == OverlayState.Running && command.GetProgress() is { } progress && progress.Planned > 0
+            && progress != _progress)
         {
             SetProgress(progress);
         }
@@ -554,9 +556,10 @@ public sealed class OverlayUi : MonoBehaviour
     }
 
     // While a label edit is open Enter saves it and Esc cancels only the edit, as in the label editor (card 16). Enter in
-    // the amount field is Confirm (design: Keyboard); anywhere else it does nothing, so a stray Enter starts no run.
+    // the amount field is Confirm (design: Keyboard); anywhere else it does nothing, so a stray Enter starts no run. The
+    // field's focus is read where the field is drawn (DrawAmountRow), so only on a pending Enter, never per event.
     [HideFromIl2Cpp]
-    private void HandlePanelKey(IModLog log, TransferCommand command, KeyCode key)
+    private void HandlePanelKey(IModLog log, KeyCode key)
     {
         if (key == KeyCode.None)
         {
@@ -571,9 +574,9 @@ public sealed class OverlayUi : MonoBehaviour
         {
             SubmitEdit(log);
         }
-        else if (_isAmountFocused && _model is OverlayModel model)
+        else if (_model is { State: OverlayState.Ready })
         {
-            ConfirmTransfer(log, command, model);
+            _isEnterPending = true;
         }
     }
 
@@ -608,12 +611,13 @@ public sealed class OverlayUi : MonoBehaviour
         }
     }
 
-    // A second Confirm is ignored: the model gives no request once Running (crit 7), and none starts while another UI's
-    // run is active. The ui.overlay line comes first so transfer.request follows it, as the prompt's submit line does.
+    // A second Confirm is ignored: the model gives no request once Running (crit 7). While another UI's run is active the
+    // model stays Ready and the attempt logs the prompt's busy line. The ui.overlay line comes first so transfer.request
+    // follows it, as the prompt's submit line does.
     [HideFromIl2Cpp]
     private void ConfirmTransfer(IModLog log, TransferCommand command, OverlayModel model)
     {
-        if (command.IsRunning || !model.ConfirmEnabled)
+        if (!model.ConfirmEnabled || command.RefuseIfBusy())
         {
             return;
         }
@@ -636,7 +640,7 @@ public sealed class OverlayUi : MonoBehaviour
             new("amount", request.Amount),
             new("unit", model.TransferUnit),
         });
-        _isAmountFocused = false;
+        _isEnterPending = false;
         SetProgress((0, request.Amount));
         command.StartCaptured(request, report => _finished = (model, report));
     }
@@ -667,7 +671,7 @@ public sealed class OverlayUi : MonoBehaviour
         _store = null;
         _note = null;
         _finished = null;
-        _isAmountFocused = false;
+        _isEnterPending = false;
         SetProgress(default);
         EndEdit();
         _command?.ReleaseAim();
@@ -891,7 +895,7 @@ public sealed class OverlayUi : MonoBehaviour
     private void Draw(IModLog log, TransferCommand command)
     {
         // Esc never reaches Input.GetKeyDown while input is blocked (card 54); the IMGUI event does.
-        HandlePanelKey(log, command, _inputBlocker.ReadPanelKeyEvent());
+        HandlePanelKey(log, _inputBlocker.ReadPanelKeyEvent());
         OverlayModel? model = _model;
         if (model is null)
         {
@@ -1030,12 +1034,14 @@ public sealed class OverlayUi : MonoBehaviour
         float gap = styles.Px(OverlayStyles.Space2);
         float controlHeight = styles.Px(OverlayStyles.ControlHeight);
         y += gap;
-        DrawAmountRow(log, model, styles, new Rect(x, y, width, controlHeight));
+        // Enter in the field goes through ConfirmTransfer like the button, so a busy refusal logs either way.
+        PanelClick click = DrawAmountRow(log, model, styles, new Rect(x, y, width, controlHeight))
+            ? PanelClick.Confirm
+            : PanelClick.None;
         y += controlHeight + gap;
 
         string? reason = GetConfirmBlockedReason(command, model);
         float buttonWidth = styles.Px(_actionButtonWidth);
-        PanelClick click = PanelClick.None;
         if (DrawButton(styles, new Rect(x, y, buttonWidth, controlHeight), _confirmText, styles.ButtonPrimary, reason is null))
         {
             click = PanelClick.Confirm;
@@ -1061,9 +1067,9 @@ public sealed class OverlayUi : MonoBehaviour
         model.ConfirmEnabled && command.IsRunning ? OverlayModel.RunningReason : model.ConfirmDisabledReason;
 
     // Every amount rule (All default, whole-chunk steps, clamp to what fits, invalid text) is OverlayModel's; this only
-    // forwards the input and shows AmountDisplay.
+    // forwards the input and shows AmountDisplay. True when a pending Enter was pressed in the amount field.
     [HideFromIl2Cpp]
-    private void DrawAmountRow(IModLog log, OverlayModel model, OverlayStyles styles, Rect row)
+    private bool DrawAmountRow(IModLog log, OverlayModel model, OverlayStyles styles, Rect row)
     {
         bool canEdit = model.State == OverlayState.Ready && model.SelectedRow is not null;
         float gap = styles.Px(OverlayStyles.Space2);
@@ -1095,7 +1101,14 @@ public sealed class OverlayUi : MonoBehaviour
             GUI.Label(field, model.AmountDisplay, styles.ButtonDisabled);
         }
 
-        _isAmountFocused = canEdit && GUI.GetNameOfFocusedControl() == _amountControl;
+        // Only for an Enter: under IL2CPP GetNameOfFocusedControl marshals a new string on every call.
+        bool isEnterInField = false;
+        if (_isEnterPending)
+        {
+            _isEnterPending = false;
+            isEnterInField = canEdit && GUI.GetNameOfFocusedControl() == _amountControl;
+        }
+
         x += field.width + gap;
         if (DrawButton(styles, new Rect(x, row.y, stepperWidth, row.height), _stepUpText, styles.Button, canEdit))
         {
@@ -1117,6 +1130,8 @@ public sealed class OverlayUi : MonoBehaviour
         {
             GUI.Label(new Rect(x, row.y, Math.Max(0f, row.xMax - x), row.height), _stepText, styles.Small);
         }
+
+        return isEnterInField;
     }
 
     [HideFromIl2Cpp]
@@ -1124,10 +1139,9 @@ public sealed class OverlayUi : MonoBehaviour
     {
         model.SetAmountText(typed);
         // The field already shows the clamped number (crit 2); the note says why it changed under the player's fingers.
-        if (model.Amount > 0 && int.TryParse(typed.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out int number)
-            && number > model.Amount)
+        if (model.AmountNote is string note)
         {
-            ShowNote(_clampedText, NoteTone.Warn, _clampedNoteSeconds);
+            ShowNote(note, NoteTone.Warn, _clampedNoteSeconds);
         }
 
         WriteAmount(log, model, "type", typed);

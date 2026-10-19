@@ -149,7 +149,7 @@ public sealed class TransferCommand : MonoBehaviour
         }
 
         AimTarget? aim = _capturedAim;
-        string? detail = _driver.IsRunning ? _busyDetail
+        string? detail = RefuseIfBusy() ? _busyDetail
             : aim is null || aim.Shelf.Key != request.Source.Key ? _aimLostDetail
             : request.Target.Key == request.Source.Key ? _targetIsSourceDetail
             : !TrackCaptured() ? _aimLostDetail
@@ -161,18 +161,35 @@ public sealed class TransferCommand : MonoBehaviour
         }
 
         detail ??= _driverNotReadyDetail;
-        if (detail == _busyDetail)
+        // One read, so the transfer.stop line and the report cannot disagree.
+        int remaining = _gateway.GetCount(request.Source, request.Item);
+        if (detail != _busyDetail)
         {
-            WriteBusy(_log, _overlayArguments);
-        }
-        else
-        {
-            Block(_log, _gateway, aim, detail, _overlayArguments, string.Empty);
+            WriteBlocked(_log, remaining, detail, _overlayArguments);
         }
 
-        int remaining = _gateway.GetCount(request.Source, request.Item);
         onFinished(new TransferReport(StopReason.BlockedBeforeStart, 0, 0, remaining, 0, detail));
         return false;
+    }
+
+    /// <summary>
+    /// The overlay's busy refusal, the only place it is logged: when a run is active (from any UI) writes the prompt's
+    /// busy transfer.request line with args="overlay" and returns true. Call once per Confirm attempt, never per frame.
+    /// </summary>
+    public bool RefuseIfBusy()
+    {
+        if (_log is null || _driver is null)
+        {
+            throw new InvalidOperationException("TransferCommand.Init has not run");
+        }
+
+        if (!_driver.IsRunning)
+        {
+            return false;
+        }
+
+        WriteBusy(_log, _overlayArguments);
+        return true;
     }
 
     /// <summary>Honoured after the in-flight item or chunk is stored (D7); false when nothing runs.</summary>
@@ -531,7 +548,12 @@ public sealed class TransferCommand : MonoBehaviour
     private static string Block(IModLog log, IShelfGateway gateway, AimTarget? aim, string detail, string arguments,
         string message)
     {
-        int? sourceCount = aim is null ? null : gateway.GetCount(aim.Shelf, aim.Item);
+        WriteBlocked(log, aim is null ? null : gateway.GetCount(aim.Shelf, aim.Item), detail, arguments);
+        return message;
+    }
+
+    [HideFromIl2Cpp]
+    private static void WriteBlocked(IModLog log, int? sourceCount, string detail, string arguments) =>
         log.Write(LogLevel.Info, "transfer.stop", new KeyValuePair<string, object?>[]
         {
             new("reason", StopReason.BlockedBeforeStart),
@@ -542,8 +564,6 @@ public sealed class TransferCommand : MonoBehaviour
             new("detail", detail),
             new("args", arguments),
         });
-        return message;
-    }
 
     // The prompt's counterpart of AimWatcher.TrackCurrent: the controller captured at open instead of a fresh ray.
     [HideFromIl2Cpp]
