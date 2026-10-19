@@ -41,7 +41,8 @@ public static class ShelfListBuilder
         string sourceKey,
         int sourceCount,
         WorldPosition playerPosition,
-        IReadOnlyDictionary<string, ShelfLabel> labels)
+        IReadOnlyDictionary<string, ShelfLabel> labels,
+        int transferUnit = 1)
     {
         var liveKeys = new HashSet<string>(StringComparer.Ordinal) { sourceKey };
         var rowsByGroup = new Dictionary<string, List<ShelfRow>>(StringComparer.Ordinal);
@@ -61,7 +62,7 @@ public static class ShelfListBuilder
                 rowsByGroup.Add(groupName, rows);
             }
 
-            rows.Add(BuildRow(candidate, stored?.Label, sourceCount, playerPosition));
+            rows.Add(BuildRow(candidate, stored?.Label, sourceCount, playerPosition, transferUnit));
         }
 
         List<ShelfGroup> groups = rowsByGroup
@@ -79,9 +80,9 @@ public static class ShelfListBuilder
         return new ShelfList(groups, staleLabelKeys);
     }
 
-    private static ShelfRow BuildRow(ShelfCandidate candidate, string? storedLabel, int sourceCount, WorldPosition playerPosition)
+    private static ShelfRow BuildRow(ShelfCandidate candidate, string? storedLabel, int sourceCount, WorldPosition playerPosition, int transferUnit)
     {
-        int fits = CalculateFits(candidate, sourceCount);
+        int fits = CalculateFits(candidate, sourceCount, transferUnit);
         string label = string.IsNullOrWhiteSpace(storedLabel) ? DefaultLabel : storedLabel.Trim();
         WorldPosition position = candidate.Shelf.Position;
         return new ShelfRow(
@@ -93,15 +94,15 @@ public static class ShelfListBuilder
             fits > 0);
     }
 
-    // Same clamp the runner's Planning uses (invariant 4), so the row never promises more than a transfer will move.
-    private static int CalculateFits(ShelfCandidate candidate, int sourceCount)
+    // Same clamp the runner's Planning uses (invariant 4), so the row never promises more than a transfer will move (whole chunks for a chunked item).
+    private static int CalculateFits(ShelfCandidate candidate, int sourceCount, int transferUnit)
     {
         if (!candidate.CanHold)
         {
             return 0;
         }
 
-        ClampResult clamp = AmountClamp.Clamp(AmountClamp.All, sourceCount, candidate.FreeCapacity);
+        ClampResult clamp = AmountClamp.Clamp(AmountClamp.All, sourceCount, candidate.FreeCapacity, transferUnit);
         return clamp.Reason == ClampReason.Ok ? clamp.Amount : 0;
     }
 

@@ -186,15 +186,15 @@ public sealed class OverlayModelChunkTests
 
     // Card 69 owns the should-fix: a source of 5 with a roomy target yields Fits = 5 (min(source, free)), which the 4-arg
     // clamp reads as "target cannot fit a chunk", while the runner says NothingToMove. The amount agrees (0); this pins
-    // the CURRENT text, which card 69 changes to NothingToMoveReason when it wires the overlay.
+    // the text card 69 made NothingToMoveReason.
     [Fact]
-    public void SelectRow_SourceUnderOneChunk_ShowsTargetFullTextUntilCard69()
+    public void SelectRow_SourceUnderOneChunk_ShowsNothingToMoveText()
     {
         OverlayModel model = Selected(sourceCount: 5, fits: 5);
 
         Assert.Equal(0, model.Amount);
         Assert.False(model.ConfirmEnabled);
-        Assert.Equal(OverlayModel.TargetFullReason, model.ConfirmDisabledReason);
+        Assert.Equal(OverlayModel.NothingToMoveReason, model.ConfirmDisabledReason);
     }
 
     [Fact]
@@ -207,6 +207,20 @@ public sealed class OverlayModelChunkTests
 
         Assert.NotNull(request);
         Assert.Equal(50, request!.Amount);
+    }
+
+    [Theory]
+    [InlineData(10, "Stopping after the current chunk...")]
+    [InlineData(1, "Stopping after the current item...")]
+    public void Escape_WhileRunning_CancellingTextNamesTheChunkOnlyForChunkedItems(int unit, string expected)
+    {
+        OverlayModel model = Selected(sourceCount: 100, fits: 100, unit: unit);
+        model.SetAmountText(unit.ToString());
+        Assert.NotNull(model.Confirm());
+
+        model.Escape();
+
+        Assert.Equal(expected, model.StatusText);
     }
 
     // Criterion 5: unit 1 behaves as before

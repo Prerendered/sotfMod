@@ -90,13 +90,13 @@ public sealed class AmountClampChunkTests
 
     // Card 69 (overlay wiring) owns the should-fix: with the overlay's 4-arg call (Fits = min(source, free)) a source of 5 and
     // a roomy target arrive here as (All, 5, 5, 10), and the target side is checked first, so the reason is TargetFull while the
-    // runner says NothingToMove. This pins the CURRENT behaviour; card 69 flips both expectations to NothingToMove.
+    // runner says NothingToMove. Card 69 made both agree on NothingToMove (source side first).
     [Fact]
-    public void Clamp_SourceUnderOneChunkWithFitsAsFree_ReportsTargetFullUntilCard69()
+    public void Clamp_SourceUnderOneChunkWithFitsAsFree_ReportsNothingToMove()
     {
         ClampResult overlayShape = AmountClamp.Clamp(AmountClamp.All, 5, 5, 10);
         Assert.Equal(0, overlayShape.Amount);
-        Assert.Equal(ClampReason.TargetFull, overlayShape.Reason);
+        Assert.Equal(ClampReason.NothingToMove, overlayShape.Reason);
 
         ClampResult runnerShape = AmountClamp.Clamp(AmountClamp.All, 5, 100, 10);
         Assert.Equal(ClampReason.NothingToMove, runnerShape.Reason);

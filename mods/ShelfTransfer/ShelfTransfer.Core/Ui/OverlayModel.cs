@@ -47,6 +47,7 @@ public sealed class OverlayModel
     public const string NoTargetText = "No shelf can take this item";
     public const string RunningText = "Moving items...";
     public const string CancellingText = "Stopping after the current item...";
+    public const string CancellingChunkText = "Stopping after the current chunk...";
     public const string SelectTargetReason = "Select a target shelf";
     public const string AmountEmptyReason = "Enter an amount";
     public const string AmountNotNumberReason = "Amount must be a whole number";
@@ -125,7 +126,7 @@ public sealed class OverlayModel
         OverlayState.Empty => EmptyText,
         OverlayState.Error => ErrorText,
         OverlayState.Ready when !_hasSelectableRow => NoTargetText,
-        OverlayState.Running => IsCancelRequested ? CancellingText : RunningText,
+        OverlayState.Running => IsCancelRequested ? (TransferUnit > 1 ? CancellingChunkText : CancellingText) : RunningText,
         _ => null,
     };
 
