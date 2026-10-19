@@ -26,10 +26,13 @@ public sealed class ModConfig
     public ModConfig(ConfigFile file)
     {
         // A new entry name, not "Transfer": BepInEx keeps a saved value over a new default, so the old L would stick.
+        // Kept as "TransferPrompt" now that it opens the overlay, so a key the User already set stays the transfer key.
         TransferKey = file.Bind(_keysSection, "TransferPrompt", KeyCode.Equals,
-            "Opens the transfer prompt (list, <count> <index>, cancel). Default: the =/+ key on the main row.");
+            "Opens the transfer overlay while you aim at a shelf slot (pick a target shelf; Esc closes it). "
+            + "Default: the =/+ key on the main row. The typed prompt is on TransferPromptAlt.");
         TransferAltKey = file.Bind(_keysSection, "TransferPromptAlt", KeyCode.KeypadPlus,
-            "Second key that opens the transfer prompt; None turns it off. Default: numpad +.");
+            "Opens the typed transfer prompt, the fallback to the overlay (list, <count> <index or label>, cancel); "
+            + "None turns it off. Default: numpad +.");
         LabelKey = file.Bind(_keysSection, "Label", KeyCode.K,
             "Opens the label editor for the shelf you are looking at.");
         DiscoveryKey = file.Bind(_keysSection, "Discovery", KeyCode.F8,

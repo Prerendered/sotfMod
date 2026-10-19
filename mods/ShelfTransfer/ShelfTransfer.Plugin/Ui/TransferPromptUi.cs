@@ -1,8 +1,8 @@
-// purpose: the transfer prompt: the transfer key opens a small IMGUI text box that runs the `transfer` commands (list,
+// purpose: the transfer prompt: the alt transfer key opens a small IMGUI text box that runs the `transfer` commands (list,
 //          <count> <index or label>, cancel) and shows their output, because the game's debug console is not reachable
 // owns:    TransferPromptUi
 // deps:    TransferCommand (CaptureAim, ReleaseAim, RunCaptured, GetRunningText, IsCapturedShelfGone, GetShelfName),
-//          InputBlocker, Styles, ModConfig (TransferKey, TransferAltKey), LabelsFeature.MaxNameLength, IModLog, UnityEngine IMGUI
+//          InputBlocker, Styles, ModConfig (TransferAltKey), LabelsFeature.MaxNameLength, IModLog, UnityEngine IMGUI
 // caution: I1/I2 - never touches the gateway; a start goes through TransferCommand to the runner (TransferDriver). The aimed
 //          slot is captured on open, not on Enter. Update and OnGUI are P2 boundaries: a throw logs error event=ui.prompt,
 //          gives input back at once and halts the prompt for the session
@@ -423,15 +423,9 @@ public sealed class TransferPromptUi : MonoBehaviour
         return _wrapStyle;
     }
 
-    // Two entries because the main-row =/+ and numpad + are different KeyCodes; None disables either.
+    // The alt key only: the transfer key opens the overlay (card 20), so each key opens exactly one UI. None disables it.
     private static KeyCode GetOpenKeyDown(ModConfig config)
     {
-        KeyCode primary = config.TransferKey.Value;
-        if (primary != KeyCode.None && Input.GetKeyDown(primary))
-        {
-            return primary;
-        }
-
         KeyCode alternate = config.TransferAltKey.Value;
         return alternate != KeyCode.None && Input.GetKeyDown(alternate) ? alternate : KeyCode.None;
     }
