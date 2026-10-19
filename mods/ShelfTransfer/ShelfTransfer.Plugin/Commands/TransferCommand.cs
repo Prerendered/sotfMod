@@ -313,8 +313,9 @@ public sealed class TransferCommand : MonoBehaviour
         }
 
         sourceCount = aim is null ? 0 : gateway.GetCount(aim.Shelf, aim.Item);
+        int unit = aim is null ? 1 : gateway.GetTransferUnit(aim.Shelf, aim.Slot, aim.Item);
         ShelfList list = ShelfListBuilder.Build(candidates, aim?.Shelf.Key ?? "", sourceCount,
-            new WorldPosition(player.x, player.y, player.z), _noLabels);
+            new WorldPosition(player.x, player.y, player.z), _noLabels, unit);
         _indexedTargets = list.Groups.SelectMany(group => group.Rows).ToList();
         return true;
     }

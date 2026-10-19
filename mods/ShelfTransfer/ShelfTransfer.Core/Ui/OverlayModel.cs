@@ -47,6 +47,7 @@ public sealed class OverlayModel
     public const string NoTargetText = "No shelf can take this item";
     public const string RunningText = "Moving items...";
     public const string CancellingText = "Stopping after the current item...";
+    public const string CancellingChunkText = "Stopping after the current chunk...";
     public const string SelectTargetReason = "Select a target shelf";
     public const string AmountEmptyReason = "Enter an amount";
     public const string AmountNotNumberReason = "Amount must be a whole number";
@@ -124,8 +125,8 @@ public sealed class OverlayModel
         OverlayState.Loading => LoadingText,
         OverlayState.Empty => EmptyText,
         OverlayState.Error => ErrorText,
-        OverlayState.Ready when !_hasSelectableRow => NoTargetText,
-        OverlayState.Running => IsCancelRequested ? CancellingText : RunningText,
+        OverlayState.Ready when !_hasSelectableRow => GetNoSelectableRowText(),
+        OverlayState.Running => IsCancelRequested ? (TransferUnit > 1 ? CancellingChunkText : CancellingText) : RunningText,
         _ => null,
     };
 
@@ -328,11 +329,15 @@ public sealed class OverlayModel
     {
         if (SelectedRow is null)
         {
-            return _hasSelectableRow ? SelectTargetReason : NoTargetText;
+            return _hasSelectableRow ? SelectTargetReason : GetNoSelectableRowText();
         }
 
         return _amountReason;
     }
+
+    // A source under one chunk zeroes every row's Fits, so no shelf is to blame; say what the runner would.
+    private string GetNoSelectableRowText() =>
+        Source.Count > 0 && Source.Count < TransferUnit ? NothingToMoveReason : NoTargetText;
 
     private void ApplyRequestedAmount(int requested, string? typedText)
     {

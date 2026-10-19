@@ -62,9 +62,10 @@ public static class AmountClamp
             return new ClampResult(whole, ClampReason.Ok);
         }
 
-        // The target side first: "target cannot fit a chunk" is the one the player can fix by choosing another shelf.
-        ClampReason reason = targetFree < unit ? ClampReason.TargetFull
-            : sourceCount < unit ? ClampReason.NothingToMove
+        // Source first: a source under one chunk never moves, whatever the shelf. With source >= unit, min(source, free)
+        // is under a chunk exactly when free is, so TargetFull still means "choose another shelf".
+        ClampReason reason = sourceCount < unit ? ClampReason.NothingToMove
+            : targetFree < unit ? ClampReason.TargetFull
             : ClampReason.InvalidAmount;
         return new ClampResult(0, reason);
     }
