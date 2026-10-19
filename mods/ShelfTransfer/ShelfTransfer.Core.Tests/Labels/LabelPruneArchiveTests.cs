@@ -5,7 +5,9 @@
 // caution: the JsonLabelFileSystem cases use real disk, one temp directory per test
 
 using System;
+using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 
@@ -187,5 +189,175 @@ public sealed class LabelPruneArchiveTests : IDisposable
 
         Assert.False(result.IsOk);
         Assert.Equal(corrupt, File.ReadAllText(path));
+    }
+
+    [Fact]
+    public void SavePruned_KeySetAgainBeforeFailedSave_NewerValueWins()
+    {
+        LabelStore store = NewStore(new FakeLabelFileSystem());
+        LabelPruneResult result = PruneTwice(new LabelPruneGuard(), store);
+        store.Set("gone", "Newer", "Other");
+
+        LabelPruneGuard.SavePruned(store, result.Pruned, () => new LabelSaveResult(LabelSaveStatus.Failed, 1, null));
+
+        Assert.Equal(new ShelfLabel("Newer", "Other"), store.Get("gone"));
+    }
+
+    [Theory]
+    [InlineData(LabelSaveStatus.Failed)]
+    [InlineData(LabelSaveStatus.Blocked)]
+    public void SavePruned_KeySetAgainInsideTheSave_NewerValueWins(LabelSaveStatus status)
+    {
+        LabelStore store = NewStore(new FakeLabelFileSystem());
+        LabelPruneResult result = PruneTwice(new LabelPruneGuard(), store);
+
+        LabelPruneGuard.SavePruned(store, result.Pruned, () =>
+        {
+            store.Set("gone", "Newer", null);
+            return new LabelSaveResult(status, 1, null);
+        });
+
+        Assert.Equal(new ShelfLabel("Newer", null), store.Get("gone"));
+    }
+
+    // Pins current behaviour, not a goal: Restore cannot tell "deleted" from "never set", so it brings the label back.
+    // Unreachable today: prune and SavePruned run on the same main-thread frame, so the User cannot edit in between.
+    [Fact]
+    public void SavePruned_KeyDeletedBeforeFailedSave_IsResurrected_PinnedBehaviour()
+    {
+        LabelStore store = NewStore(new FakeLabelFileSystem());
+        LabelPruneResult result = PruneTwice(new LabelPruneGuard(), store);
+        store.Set("gone", null, null);
+
+        LabelPruneGuard.SavePruned(store, result.Pruned, () => new LabelSaveResult(LabelSaveStatus.Failed, 1, null));
+
+        Assert.Equal(_goneLabel, store.Get("gone"));
+    }
+
+    private static readonly PrunedLabel[] _oneEntry = { new("a", new ShelfLabel("A", null)) };
+
+    private string ArchivePath(string id = "w1") => Path.Combine(_root, id + ".pruned.json");
+
+    private string PlantLabelFile()
+    {
+        Directory.CreateDirectory(_root);
+        string labelPath = Path.Combine(_root, "w1.json");
+        File.WriteAllText(labelPath, "{\"version\":1,\"shelves\":{}}", new UTF8Encoding(false));
+        return labelPath;
+    }
+
+    private static string ArchiveJson(int version, int padding = 0, bool hasPruned = true)
+    {
+        string pruned = hasPruned
+            ? ",\"pruned\":[{\"key\":\"k\",\"label\":\"" + new string('x', padding) + "\",\"group\":null,\"prunedAt\":\"2026-01-01T00:00:00Z\"}]"
+            : string.Empty;
+        return "{\"version\":" + version + ",\"worldId\":\"w1\"" + pruned + "}";
+    }
+
+    public static TheoryData<string, string> RefusedArchives => new()
+    {
+        { "over the 1 MiB cap", ArchiveJson(1, (int)JsonLabelFileSystem.MaxFileBytes) },
+        { "version 2", ArchiveJson(2) },
+        { "valid JSON without pruned", ArchiveJson(1, hasPruned: false) },
+        { "append would pass the cap", ArchiveJson(1, (int)JsonLabelFileSystem.MaxFileBytes - 200) },
+    };
+
+    [Theory]
+    [MemberData(nameof(RefusedArchives))]
+    public void AppendPruned_RefusedArchive_FailsAndArchiveAndLabelFileAreByteIdentical(string why, string archiveJson)
+    {
+        string labelPath = PlantLabelFile();
+        byte[] before = new UTF8Encoding(false).GetBytes(archiveJson);
+        File.WriteAllBytes(ArchivePath(), before);
+        byte[] labelBefore = File.ReadAllBytes(labelPath);
+        var fs = new JsonLabelFileSystem(_root, new FakeModLog());
+        var entries = new[] { new PrunedLabel("a", new ShelfLabel(new string('y', 400), null)) };
+
+        LabelWriteResult result = fs.AppendPruned("w1", entries);
+
+        Assert.False(result.IsOk, why);
+        Assert.Equal(before, File.ReadAllBytes(ArchivePath()));
+        Assert.Equal(labelBefore, File.ReadAllBytes(labelPath));
+        Assert.False(File.Exists(ArchivePath() + ".tmp"));
+    }
+
+    [Fact]
+    public void AppendPruned_TwoCalls_KeepsBothEntriesInOrderWithPrunedAtAndLeavesTheLabelFile()
+    {
+        string labelPath = PlantLabelFile();
+        byte[] labelBefore = File.ReadAllBytes(labelPath);
+        var fs = new JsonLabelFileSystem(_root, new FakeModLog());
+
+        fs.AppendPruned("w1", new[] { new PrunedLabel("k1", new ShelfLabel("One", null)), new PrunedLabel("k2", new ShelfLabel("Two", "G")) });
+        fs.AppendPruned("w1", new[] { new PrunedLabel("k3", new ShelfLabel("Three", null)) });
+
+        using JsonDocument document = JsonDocument.Parse(File.ReadAllText(ArchivePath()));
+        JsonElement pruned = document.RootElement.GetProperty("pruned");
+        Assert.Equal(new[] { "k1", "k2", "k3" }, pruned.EnumerateArray().Select(e => e.GetProperty("key").GetString()).ToArray());
+        Assert.All(pruned.EnumerateArray(), e => Assert.Matches(@"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", e.GetProperty("prunedAt").GetString()));
+        Assert.Equal(labelBefore, File.ReadAllBytes(labelPath));
+    }
+
+    [Fact]
+    public void AppendPruned_TempPathIsReparsePoint_FailsAndWritesNothingThroughIt()
+    {
+        string outside = Path.Combine(_root, "outside");
+        Directory.CreateDirectory(outside);
+        string tempLink = ArchivePath() + ".tmp";
+        MakeDirLink(tempLink, outside);
+        var fs = new JsonLabelFileSystem(_root, new FakeModLog());
+
+        LabelWriteResult result = fs.AppendPruned("w1", _oneEntry);
+
+        Assert.False(result.IsOk);
+        Assert.False(File.Exists(ArchivePath()));
+        Assert.Empty(Directory.GetFileSystemEntries(outside));
+        Assert.True(new DirectoryInfo(tempLink).Attributes.HasFlag(FileAttributes.ReparsePoint));
+        Directory.Delete(tempLink); // non-recursive: removes the link itself so Dispose can clean the folder
+    }
+
+    [Theory]
+    [InlineData("w1")]
+    [InlineData("My World 7")]
+    [InlineData("a.json")]
+    [InlineData("..\\x")]
+    [InlineData("w1.json.bad")]
+    [InlineData("CON")]
+    [InlineData("")]
+    public void AppendPruned_SanitisedId_ArchiveNeverEqualsLabelFileOrBadCopy(string raw)
+    {
+        string id = WorldId.Sanitise(raw);
+        var fs = new JsonLabelFileSystem(_root, new FakeModLog());
+
+        LabelWriteResult result = fs.AppendPruned(id, _oneEntry);
+
+        Assert.True(result.IsOk);
+        string[] files = Directory.GetFiles(_root).Select(path => Path.GetFileName(path)).ToArray();
+        Assert.Equal(new[] { id + ".pruned.json" }, files);
+        Assert.NotEqual(id + ".json", files[0]);
+        Assert.DoesNotContain(".bad", files[0], StringComparison.Ordinal);
+    }
+
+    // Directory link: junction on Windows (no privilege), symlink on Unix.
+    private static void MakeDirLink(string link, string target)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            var psi = new ProcessStartInfo("cmd.exe", $"/c mklink /J \"{link}\" \"{target}\"")
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            using Process process = Process.Start(psi)!;
+            string output = process.StandardOutput.ReadToEnd() + process.StandardError.ReadToEnd();
+            process.WaitForExit();
+            Assert.True(process.ExitCode == 0, "cannot create junction (test environment problem): " + output);
+        }
+        else
+        {
+            Directory.CreateSymbolicLink(link, target);
+        }
     }
 }
