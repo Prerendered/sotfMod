@@ -78,6 +78,19 @@ public sealed class OverlayUi : MonoBehaviour
     private static readonly string _tooLongText = $"Names stop at {LabelsFeature.MaxNameLength} characters.";
     private static readonly IReadOnlyDictionary<string, ShelfLabel> _noLabels = new Dictionary<string, ShelfLabel>();
 
+    // A list click is recorded while drawing and applied after the list, not captured in a handler closure: a capturing
+    // lambda in a draw method allocates on every IMGUI event, clicked or not.
+    private enum ListClick
+    {
+        None,
+        ToggleGroup,
+        SelectRow,
+        RenameRow,
+        RegroupRow,
+        SaveEdit,
+        CancelEdit,
+    }
+
     private IModLog? _log;
     private ModConfig? _config;
     private TransferCommand? _command;
@@ -105,11 +118,12 @@ public sealed class OverlayUi : MonoBehaviour
     private string _shelfText = string.Empty;
     private Vector2 _listScroll;
 
-    // Inline label edit (card 16's write path): the edited row's key, which field, and the text typed so far.
+    // Inline label edit (card 16's write path): the edited row's key, which field, and the text typed so far. Chip text
+    // is cut once at BeginEdit so the chips draw without formatting.
     private string? _editKey;
     private bool _isEditingGroup;
     private string _editText = string.Empty;
-    private IReadOnlyList<string> _editGroups = Array.Empty<string>();
+    private IReadOnlyList<(string Name, string Text)> _editGroups = Array.Empty<(string, string)>();
     private bool _shouldFocusEdit;
 
     private string? _note;
@@ -453,23 +467,27 @@ public sealed class OverlayUi : MonoBehaviour
             return;
         }
 
-        if (_editKey is not null)
-        {
-            if (key == KeyCode.Escape)
-            {
-                CancelEdit(log, "esc");
-            }
-            else
-            {
-                SubmitEdit(log);
-            }
-
-            return;
-        }
-
         if (key == KeyCode.Escape)
         {
-            Escape(log, "esc");
+            HandleEscape(log, "esc");
+        }
+        else if (_editKey is not null)
+        {
+            SubmitEdit(log);
+        }
+    }
+
+    // The Esc key and the Esc button: an open edit is cancelled first, the next press closes.
+    [HideFromIl2Cpp]
+    private void HandleEscape(IModLog log, string reason)
+    {
+        if (_editKey is not null)
+        {
+            CancelEdit(log, reason);
+        }
+        else
+        {
+            Escape(log, reason);
         }
     }
 
@@ -591,7 +609,9 @@ public sealed class OverlayUi : MonoBehaviour
         _editKey = key;
         _isEditingGroup = isGroup;
         _editText = (isGroup ? existing?.Group : existing?.Label) ?? string.Empty;
-        _editGroups = isGroup ? store.ListGroups() : Array.Empty<string>();
+        _editGroups = isGroup
+            ? store.ListGroups().Select(group => (group, FormatLabel(group))).ToList()
+            : Array.Empty<(string, string)>();
         _shouldFocusEdit = true;
         _note = null;
         log.Write(LogLevel.Info, _labelLogEvent, new KeyValuePair<string, object?>[]
@@ -643,6 +663,14 @@ public sealed class OverlayUi : MonoBehaviour
             return;
         }
 
+        // The store keeps a cleared label as "" and no entry as null; either matches an empty field. Nothing to save.
+        if (string.Equals(label ?? string.Empty, existing?.Label ?? string.Empty, StringComparison.Ordinal)
+            && string.Equals(group, existing?.Group, StringComparison.Ordinal))
+        {
+            CancelEdit(log, "unchanged");
+            return;
+        }
+
         string action = string.IsNullOrWhiteSpace(label) && group is null ? "clear" : "set";
         log.Write(LogLevel.Info, _labelLogEvent, new KeyValuePair<string, object?>[]
         {
@@ -683,7 +711,7 @@ public sealed class OverlayUi : MonoBehaviour
         _editKey = null;
         _isEditingGroup = false;
         _editText = string.Empty;
-        _editGroups = Array.Empty<string>();
+        _editGroups = Array.Empty<(string, string)>();
         _shouldFocusEdit = false;
     }
 
@@ -745,7 +773,7 @@ public sealed class OverlayUi : MonoBehaviour
         float closeWidth = styles.Px(_closeButtonWidth);
         if (GUI.Button(new Rect(x + innerWidth - closeWidth, y, closeWidth, styles.TitleLineHeight), _closeText, styles.Button))
         {
-            Escape(log, "button");
+            HandleEscape(log, "button");
             return;
         }
 
@@ -758,10 +786,37 @@ public sealed class OverlayUi : MonoBehaviour
         y += styles.SmallLineHeight;
 
         // Applied after the list is drawn: a click that rebuilds _lines must not change it while it is enumerated.
-        Action? clicked = DrawList(log, model, styles, status, new Rect(x, y, innerWidth, listHeight), contentHeight);
+        (ListClick click, string clickKey) = DrawList(model, styles, status, new Rect(x, y, innerWidth, listHeight),
+            contentHeight);
         y += listHeight + gap;
         DrawFooter(styles, new Rect(x, y, innerWidth, styles.SmallLineHeight));
-        clicked?.Invoke();
+        ApplyClick(log, model, click, clickKey);
+    }
+
+    [HideFromIl2Cpp]
+    private void ApplyClick(IModLog log, OverlayModel model, ListClick click, string key)
+    {
+        switch (click)
+        {
+            case ListClick.ToggleGroup:
+                ToggleGroup(log, model, key);
+                break;
+            case ListClick.SelectRow:
+                Select(log, model, key);
+                break;
+            case ListClick.RenameRow:
+                BeginEdit(log, key, isGroup: false);
+                break;
+            case ListClick.RegroupRow:
+                BeginEdit(log, key, isGroup: true);
+                break;
+            case ListClick.SaveEdit:
+                SubmitEdit(log);
+                break;
+            case ListClick.CancelEdit:
+                CancelEdit(log, "button");
+                break;
+        }
     }
 
     [HideFromIl2Cpp]
@@ -839,7 +894,7 @@ public sealed class OverlayUi : MonoBehaviour
 
     // Rows follow design.md's fixed columns so numbers align; returns the click to apply once drawing is done.
     [HideFromIl2Cpp]
-    private Action? DrawList(IModLog log, OverlayModel model, OverlayStyles styles, string? status, Rect area,
+    private (ListClick Click, string Key) DrawList(OverlayModel model, OverlayStyles styles, string? status, Rect area,
         float contentHeight)
     {
         bool isScrolling = contentHeight > area.height;
@@ -852,7 +907,10 @@ public sealed class OverlayUi : MonoBehaviour
             y += styles.BodyLineHeight;
         }
 
-        Action? clicked = null;
+        // Read once per draw, not per row (each read is an interop call), and inside the scroll view so it is in list
+        // coordinates.
+        Vector2 mouse = Event.current.mousePosition;
+        (ListClick Click, string Key) clicked = (ListClick.None, string.Empty);
         string? selectedKey = model.SelectedRow?.Shelf.Key;
         foreach ((bool isHeader, string key, bool isDimmed, string label, string distance, string bearing, string fit)
             in _lines)
@@ -861,15 +919,15 @@ public sealed class OverlayUi : MonoBehaviour
             {
                 float headerHeight = styles.Px(OverlayStyles.GroupHeaderHeight);
                 Rect header = new(0f, y, viewWidth, headerHeight);
-                if (header.Contains(Event.current.mousePosition))
+                if (header.Contains(mouse))
                 {
                     GUI.DrawTexture(header, styles.RowHoverTexture);
                 }
 
                 GUI.Label(header, label, styles.GroupHeader);
-                if (GUI.Button(header, string.Empty, styles.RowHit))
+                if (GUI.Button(header, string.Empty, styles.RowHit) && clicked.Click == ListClick.None)
                 {
-                    clicked = () => ToggleGroup(log, model, key);
+                    clicked = (ListClick.ToggleGroup, key);
                 }
 
                 y += headerHeight;
@@ -877,10 +935,14 @@ public sealed class OverlayUi : MonoBehaviour
             }
 
             Rect row = new(0f, y, viewWidth, styles.Px(OverlayStyles.RowHeight));
-            Action? rowClick = key == _editKey
-                ? DrawEditRow(log, styles, row)
-                : DrawRow(log, model, styles, row, key, key == selectedKey, isDimmed, label, distance, bearing, fit);
-            clicked ??= rowClick;
+            ListClick rowClick = key == _editKey
+                ? DrawEditRow(styles, row)
+                : DrawRow(styles, row, mouse, key == selectedKey, isDimmed, label, distance, bearing, fit);
+            if (rowClick != ListClick.None && clicked.Click == ListClick.None)
+            {
+                clicked = (rowClick, key);
+            }
+
             y += row.height;
             if (_isEditingGroup && key == _editKey)
             {
@@ -893,8 +955,8 @@ public sealed class OverlayUi : MonoBehaviour
     }
 
     [HideFromIl2Cpp]
-    private Action? DrawRow(IModLog log, OverlayModel model, OverlayStyles styles, Rect row, string key, bool isSelected,
-        bool isDimmed, string label, string distance, string bearing, string fit)
+    private static ListClick DrawRow(OverlayStyles styles, Rect row, Vector2 mouse, bool isSelected, bool isDimmed,
+        string label, string distance, string bearing, string fit)
     {
         // A dimmed row gets no hover fill (design: disabled) but still forwards its click; the model refuses it.
         if (isSelected)
@@ -903,7 +965,7 @@ public sealed class OverlayUi : MonoBehaviour
             float barWidth = styles.Px(OverlayStyles.SelectedBarWidth);
             GUI.DrawTexture(new Rect(row.x, row.y, barWidth, row.height), styles.AccentTexture);
         }
-        else if (!isDimmed && row.Contains(Event.current.mousePosition))
+        else if (!isDimmed && row.Contains(mouse))
         {
             GUI.DrawTexture(row, styles.RowHoverTexture);
         }
@@ -924,25 +986,25 @@ public sealed class OverlayUi : MonoBehaviour
         GUIStyle linkStyle = isSelected ? styles.LinkOnAccent : styles.Link;
         if (GUI.Button(new Rect(renameX, row.y, styles.Px(_renameLinkWidth), row.height), _renameText, linkStyle))
         {
-            return () => BeginEdit(log, key, isGroup: false);
+            return ListClick.RenameRow;
         }
 
         if (GUI.Button(new Rect(groupX, row.y, styles.Px(_groupLinkWidth), row.height), _groupText, linkStyle))
         {
-            return () => BeginEdit(log, key, isGroup: true);
+            return ListClick.RegroupRow;
         }
 
         // The links sit outside this target, so a link click never also selects the row.
         if (GUI.Button(new Rect(row.x, row.y, renameX - gap - row.x, row.height), string.Empty, styles.RowHit))
         {
-            return () => Select(log, model, key);
+            return ListClick.SelectRow;
         }
 
-        return null;
+        return ListClick.None;
     }
 
     [HideFromIl2Cpp]
-    private Action? DrawEditRow(IModLog log, OverlayStyles styles, Rect row)
+    private ListClick DrawEditRow(OverlayStyles styles, Rect row)
     {
         (float labelX, _, _, _, float renameX, float groupX) = GetColumns(styles, row.width);
         float inset = styles.Px(OverlayStyles.Space1);
@@ -958,15 +1020,15 @@ public sealed class OverlayUi : MonoBehaviour
 
         if (GUI.Button(new Rect(renameX, row.y, styles.Px(_renameLinkWidth), row.height), _saveText, styles.Link))
         {
-            return () => SubmitEdit(log);
+            return ListClick.SaveEdit;
         }
 
         if (GUI.Button(new Rect(groupX, row.y, styles.Px(_groupLinkWidth), row.height), _cancelText, styles.Link))
         {
-            return () => CancelEdit(log, "button");
+            return ListClick.CancelEdit;
         }
 
-        return null;
+        return ListClick.None;
     }
 
     // "None" first, then each existing group, as in the label editor; a click fills the field and Enter saves it.
@@ -977,16 +1039,16 @@ public sealed class OverlayUi : MonoBehaviour
         float gap = styles.Px(OverlayStyles.Space2);
         float chipHeight = styles.Px(OverlayStyles.ChipHeight);
         float chipWidth = (width - indent - ((_groupChipColumns - 1) * gap)) / _groupChipColumns;
-        string typed = _editText.Trim();
+        ReadOnlySpan<char> typed = _editText.AsSpan().Trim();
         y += gap;
         for (int index = 0; index <= _editGroups.Count; index++)
         {
-            string group = index == 0 ? string.Empty : _editGroups[index - 1];
+            (string group, string text) = index == 0 ? (string.Empty, _noGroupText) : _editGroups[index - 1];
             Rect chip = new(indent + ((index % _groupChipColumns) * (chipWidth + gap)),
                 y + ((index / _groupChipColumns) * (chipHeight + gap)), chipWidth, chipHeight);
-            bool isPicked = string.Equals(group, typed, StringComparison.Ordinal);
+            bool isPicked = typed.Equals(group.AsSpan(), StringComparison.Ordinal);
             GUIStyle chipStyle = isPicked ? styles.ChipSelected : styles.Button;
-            if (GUI.Button(chip, index == 0 ? _noGroupText : FormatLabel(group), chipStyle))
+            if (GUI.Button(chip, text, chipStyle))
             {
                 _editText = group;
                 _shouldFocusEdit = true;
