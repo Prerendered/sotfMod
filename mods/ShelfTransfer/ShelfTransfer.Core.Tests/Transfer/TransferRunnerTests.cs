@@ -246,6 +246,36 @@ public sealed class TransferRunnerTests
         rig.AssertConserved();
     }
 
+    // Card 68 criterion 5: the gateway reports unit 0 for an emptied slot, as the plugin does; the count reason must win.
+    [Fact]
+    public void Tick_SourceEmptiedBeforePlanningWithUnitTen_BlocksNothingToMoveNotUnitUnknown()
+    {
+        Rig rig = Build(source: 0);
+        rig.Gateway.TransferUnit = 10;
+
+        rig.Runner.Tick(10);
+
+        Assert.Equal(StopReason.BlockedBeforeStart, rig.Runner.Report!.Reason);
+        Assert.Equal("NothingToMove", rig.Runner.Report.Detail);
+        Assert.Equal(0, rig.Gateway.Mutations);
+        Assert.False(Assert.Single(rig.Log.Named("transfer.start")).Fields.ContainsKey("unit"));
+    }
+
+    // Card 68: a stocked source whose unit the gateway cannot read blocks rather than take a chunk blind (I1).
+    [Fact]
+    public void Tick_UnitUnknownOnStockedSource_BlocksBeforeAnyTake()
+    {
+        Rig rig = Build(source: 6);
+        rig.Gateway.TransferUnit = 0;
+
+        rig.Runner.Tick(10);
+
+        Assert.Equal(StopReason.BlockedBeforeStart, rig.Runner.Report!.Reason);
+        Assert.Equal("transfer unit unknown", rig.Runner.Report.Detail);
+        Assert.Equal(0, rig.Runner.Report.Requested);
+        Assert.Equal(0, rig.Gateway.Mutations);
+    }
+
     // Criterion 5
     [Theory]
     [InlineData("TakeOne(src)", 3)]

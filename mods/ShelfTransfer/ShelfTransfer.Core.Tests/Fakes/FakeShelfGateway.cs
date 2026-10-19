@@ -32,6 +32,10 @@ public sealed class FakeShelfGateway : IShelfGateway
 
     public int Inventory { get; set; }
 
+    /// <summary>What GetTransferUnit returns for a stocked shelf (0 for an empty one, as the plugin), and how many items the
+    /// real take moves (whole chunks only, as the plugin). GetTransferUnit is not logged in <see cref="Calls"/>.</summary>
+    public int TransferUnit { get; set; } = 1;
+
     public int TakeCalls { get; private set; }
 
     /// <summary>The slot argument of every TakeOne call, in order.</summary>
@@ -76,13 +80,13 @@ public sealed class FakeShelfGateway : IShelfGateway
     public GatewayOutcome ApplyTake(ShelfRef shelf)
     {
         FakeShelf fake = _shelves[shelf.Key];
-        if (fake.Count <= 0)
+        if (fake.Count <= 0 || fake.Count < TransferUnit)
         {
             return GatewayOutcome.Refused("empty");
         }
 
-        fake.Count--;
-        Inventory++;
+        fake.Count -= TransferUnit;
+        Inventory += TransferUnit;
         return GatewayOutcome.Ok;
     }
 
@@ -128,6 +132,8 @@ public sealed class FakeShelfGateway : IShelfGateway
         Record("GetInventoryCount");
         return Inventory;
     }
+
+    public int GetTransferUnit(ShelfRef shelf, SlotRef slot, ItemId item) => _shelves[shelf.Key].Count > 0 ? TransferUnit : 0;
 
     public GatewayOutcome TakeOne(ShelfRef shelf, SlotRef slot, ItemId item)
     {

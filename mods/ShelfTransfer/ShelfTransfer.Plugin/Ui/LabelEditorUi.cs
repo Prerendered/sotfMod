@@ -1,12 +1,10 @@
 // purpose: the label editor (F3): label key while aiming at a shelf opens an IMGUI panel to name it and pick or create a group
 // owns:    LabelEditorUi
-// deps:    LabelsFeature (Store, SetLabel, IsValidName), ModConfig, Styles, ShelfRegistry.BuildShelfRef, IModLog,
-//          interop Sons.Input (InputActionMapState, InputCursorState), Sons.Gameplay.ItemStorageController
+// deps:    LabelsFeature (Store, SetLabel, IsValidName), ModConfig, Styles, InputBlocker, ShelfRegistry.BuildShelfRef,
+//          IModLog, interop Sons.Gameplay.ItemStorageController
 // caution: I5 - writes only through LabelsFeature.SetLabel. I2 - reads the aimed shelf and switches only the game's local
-//          input state, never shelf or network state. Input is blocked by the game's own InputActionMapState (Console)
-//          and InputCursorState on a private object: active = blocked, inactive = the game restores its own state.
-//          Release waits for Enter/Esc to be up so the closing key never reaches the game. Update and OnGUI are P2
-//          boundaries: a throw logs error event=ui.label, gives input back at once and halts the editor for the session
+//          input state (InputBlocker), never shelf or network state. Update and OnGUI are P2 boundaries: a throw logs
+//          error event=ui.label, gives input back at once and halts the editor for the session
 
 using System;
 using System.Collections.Generic;
@@ -15,8 +13,6 @@ using Il2CppInterop.Runtime;
 using Il2CppInterop.Runtime.Attributes;
 
 using Sons.Gameplay;
-using Sons.Input;
-using TheForest.Utils;
 
 using UnityEngine;
 
@@ -28,7 +24,6 @@ using ShelfTransfer.Plugin.Game;
 using ShelfTransfer.Plugin.Labels;
 
 using LogLevel = ShelfTransfer.Core.Logging.LogLevel;
-using UnityObject = UnityEngine.Object;
 
 namespace ShelfTransfer.Plugin.Ui;
 
@@ -36,12 +31,6 @@ public sealed class LabelEditorUi : MonoBehaviour
 {
     // Same reach as AimWatcher and the discovery dump: every usable shelf, without distant scenery.
     private const float _maxAimDistance = 10f;
-
-    // RedLoader's SUI panels use 100 for the same component; above the game's world cursor state.
-    private const int _cursorPriority = 100;
-
-    // Two frames lets the game's cursor state settle (it may apply in LateUpdate) before the restore check reads it.
-    private const int _restoreCheckDelayFrames = 2;
 
     private const float _toastSeconds = 4f;
     private const string _nameControl = "ShelfTransfer.LabelName";
@@ -81,12 +70,7 @@ public sealed class LabelEditorUi : MonoBehaviour
     private ModConfig? _config;
     private bool _isHalted;
 
-    private GameObject? _inputBlock;
-    private bool _isReleasing;
-    private int _restoreCheckFrame = -1;
-    private string _closeReason = string.Empty;
-    private CursorLockMode _cursorBefore;
-    private bool _wasCursorVisible;
+    private readonly InputBlocker _inputBlocker = new(_inputBlockName, "ui.label");
 
     private bool _isOpen;
     private LabelStore? _store;
@@ -151,25 +135,18 @@ public sealed class LabelEditorUi : MonoBehaviour
         }
     }
 
-    public void OnDestroy() => ReleaseInputNow();
+    public void OnDestroy() => _inputBlocker.ReleaseNow();
 
     [HideFromIl2Cpp]
     private void Tick(IModLog log, ModConfig config)
     {
-        if (_isReleasing)
-        {
-            TryFinishRelease();
-        }
-        else if (_restoreCheckFrame >= 0 && Time.frameCount >= _restoreCheckFrame)
-        {
-            WriteRestoreCheck(log);
-        }
-
+        _inputBlocker.Tick(log);
         if (!_isOpen)
         {
-            // Not checked while open: the label key is then just a letter typed into the name. Not while releasing
-            // either: the cursor is still the editor's, so BlockInput would record it as the state to restore.
-            if (!_isReleasing && Input.GetKeyDown(config.LabelKey.Value))
+            // Not checked while open: the label key is then just a letter typed into the name. Not while any panel holds
+            // input either: while releasing the cursor is still a panel's, so Block would record it as the state to
+            // restore, and in the open transfer prompt the key is a letter too.
+            if (!InputBlocker.IsAnyHeld && Input.GetKeyDown(config.LabelKey.Value))
             {
                 TryOpen(log);
             }
@@ -182,11 +159,20 @@ public sealed class LabelEditorUi : MonoBehaviour
         {
             Cancel(log, lostReason);
         }
-        else if (Input.GetKeyDown(KeyCode.Escape))
+        else
+        {
+            HandlePanelKey(log, _inputBlocker.ReadPanelKey());
+        }
+    }
+
+    [HideFromIl2Cpp]
+    private void HandlePanelKey(IModLog log, KeyCode key)
+    {
+        if (key == KeyCode.Escape)
         {
             Cancel(log, "esc");
         }
-        else if (Input.GetKeyDown(KeyCode.Return) || Input.GetKeyDown(KeyCode.KeypadEnter))
+        else if (key is KeyCode.Return or KeyCode.KeypadEnter)
         {
             Submit(log);
         }
@@ -233,7 +219,7 @@ public sealed class LabelEditorUi : MonoBehaviour
         // Next frame: focusing now would let this frame's label-key event type its letter into the field.
         _focusFrame = Time.frameCount + 1;
 
-        BlockInput();
+        _inputBlocker.Block();
         _isOpen = true;
         log.Write(LogLevel.Info, "ui.label", new KeyValuePair<string, object?>[]
         {
@@ -341,8 +327,7 @@ public sealed class LabelEditorUi : MonoBehaviour
     private void CloseEditor(string reason)
     {
         ResetEditor();
-        _closeReason = reason;
-        _isReleasing = true;
+        _inputBlocker.BeginRelease(reason);
     }
 
     [HideFromIl2Cpp]
@@ -365,73 +350,19 @@ public sealed class LabelEditorUi : MonoBehaviour
         _isHalted = true;
         log.WriteException("ui.label", ex);
         ResetEditor();
-        _isReleasing = false;
-        ReleaseInputNow();
-    }
-
-    [HideFromIl2Cpp]
-    private void BlockInput()
-    {
-        _cursorBefore = Cursor.lockState;
-        _wasCursorVisible = Cursor.visible;
-        _isReleasing = false;
-        _restoreCheckFrame = -1;
-        if (_inputBlock == null)
-        {
-            _inputBlock = CreateInputBlock();
-        }
-
-        _inputBlock.SetActive(true);
-    }
-
-    [HideFromIl2Cpp]
-    private void TryFinishRelease()
-    {
-        if (Input.GetKey(KeyCode.Escape) || Input.GetKey(KeyCode.Return) || Input.GetKey(KeyCode.KeypadEnter))
-        {
-            return;
-        }
-
-        _isReleasing = false;
-        ReleaseInputNow();
-        _restoreCheckFrame = Time.frameCount + _restoreCheckDelayFrames;
-    }
-
-    [HideFromIl2Cpp]
-    private void ReleaseInputNow()
-    {
-        if (_inputBlock != null)
-        {
-            _inputBlock.SetActive(false);
-        }
-    }
-
-    // Evidence for "no stuck cursor": after an Enter/Esc close the cursor must be back where it was at open.
-    [HideFromIl2Cpp]
-    private void WriteRestoreCheck(IModLog log)
-    {
-        _restoreCheckFrame = -1;
-        CursorLockMode cursor = Cursor.lockState;
-        bool isVisible = Cursor.visible;
-        bool isRestored = cursor == _cursorBefore && isVisible == _wasCursorVisible;
-        // Leaving the world legitimately frees the cursor for the menu, so only an in-world close must match.
-        bool shouldMatch = _closeReason is not ("world_left" or "shelf_gone");
-        log.Write(isRestored || !shouldMatch ? LogLevel.Info : LogLevel.Warn, "ui.label", new KeyValuePair<string, object?>[]
-        {
-            new("action", "input"),
-            new("outcome", isRestored ? "restored" : "changed"),
-            new("reason", _closeReason),
-            new("cursor", cursor.ToString()),
-            new("visible", isVisible),
-            new("cursor_before", _cursorBefore.ToString()),
-            new("visible_before", _wasCursorVisible),
-        });
+        _inputBlocker.ReleaseNow();
     }
 
     [HideFromIl2Cpp]
     private void Draw(IModLog log)
     {
         Styles styles = Styles.Get();
+        if (_isOpen)
+        {
+            // Esc never reaches Input.GetKeyDown while input is blocked (card 54); the IMGUI event does.
+            HandlePanelKey(log, _inputBlocker.ReadPanelKeyEvent());
+        }
+
         if (_isOpen)
         {
             DrawEditor(log, styles);
@@ -580,30 +511,6 @@ public sealed class LabelEditorUi : MonoBehaviour
 
     private static Rect Inset(Rect rect, float by) =>
         new(rect.x + by, rect.y + by, rect.width - (2f * by), rect.height - (2f * by));
-
-    // Built inactive so both components hold their settings before OnEnable; SetActive(true) is then the game's own
-    // "UI open" signal (map state + hardware cursor), and SetActive(false) lets the game restore what it had before.
-    private static GameObject CreateInputBlock()
-    {
-        GameObject block = new(_inputBlockName);
-        block.SetActive(false);
-        UnityObject.DontDestroyOnLoad(block);
-
-        InputActionMapState map = AddGameComponent<InputActionMapState>(block);
-        map._applyState = InputState.Console;
-        InputCursorState cursor = AddGameComponent<InputCursorState>(block);
-        cursor._enabled = true;
-        cursor._hardwareCursor = true;
-        cursor._priority = _cursorPriority;
-        return block;
-    }
-
-    // Non-generic AddComponent plus TryCast: the generic overload depends on an inflated method existing in the game.
-    private static T AddGameComponent<T>(GameObject target) where T : Component
-    {
-        Component added = target.AddComponent(Il2CppType.Of<T>());
-        return added.TryCast<T>() ?? throw new InvalidOperationException($"AddComponent did not return {typeof(T).Name}");
-    }
 
     // Any storage shelf, stocked or empty: AimWatcher.GetCurrent is null on an empty slot or the frame, so the
     // editor casts its own ray on the key press only (same nearest-non-player-hit rule as AimWatcher).

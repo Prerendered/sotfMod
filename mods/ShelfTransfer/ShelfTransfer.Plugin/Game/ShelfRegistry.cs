@@ -2,7 +2,7 @@
 // owns:    ShelfRegistry
 // deps:    ShelfKey, ShelfRef, WorldPosition, IModLog, Sons.Gameplay.ItemStorageController (interop)
 // caution: read-only (I2). List() is a full scene scan; call it on demand, never per frame. The map holds live Il2Cpp
-//          components across frames, so callers go through TryGetLive (destroyed check) before touching one
+//          components across frames, so callers go through TryResolve/TryGetLive (destroyed check) before touching one
 
 using System;
 using System.Collections.Generic;
@@ -27,13 +27,30 @@ public sealed class ShelfRegistry
 {
     private const string _cloneSuffix = "(Clone)";
 
+    // A gone shelf is asked about every runner tick; this bounds the scene scans that a miss triggers.
+    private const double _minRescanSeconds = 5.0;
+
     private readonly IModLog _log;
     private readonly Dictionary<string, ItemStorageController> _byKey = new(StringComparer.Ordinal);
+    private bool _hasListed;
+    private double _lastListAt;
+    private int _loggedCount = -1;
+    private int _loggedDuplicateKeys = -1;
 
     public ShelfRegistry(IModLog log) => _log = log;
 
-    public IReadOnlyList<ShelfRef> List()
+    public IReadOnlyList<ShelfRef> List() => Scan(isRescan: false);
+
+    /// <summary>
+    /// Maps <paramref name="key"/> to a controller the caller holds live (the aimed one), replacing any entry: the aim
+    /// path never waits for a rescan, and for a duplicate key the shelf being looked at is the one read.
+    /// </summary>
+    public void Track(string key, ItemStorageController controller) => _byKey[key] = controller;
+
+    private IReadOnlyList<ShelfRef> Scan(bool isRescan)
     {
+        _hasListed = true;
+        _lastListAt = Time.unscaledTimeAsDouble;
         _byKey.Clear();
         List<ShelfRef> shelves = new();
         int duplicateKeys = 0;
@@ -56,12 +73,42 @@ public sealed class ShelfRegistry
             shelves.Add(shelf);
         }
 
+        // A gone shelf polled every tick rescans every 5 s; an unchanged rescan result is not worth a line each time.
+        bool isUnchanged = shelves.Count == _loggedCount && duplicateKeys == _loggedDuplicateKeys;
+        if (isRescan && isUnchanged)
+        {
+            return shelves;
+        }
+
+        _loggedCount = shelves.Count;
+        _loggedDuplicateKeys = duplicateKeys;
         _log.Write(LogLevel.Info, "shelves.list", new KeyValuePair<string, object?>[]
         {
             new("count", shelves.Count),
             new("duplicate_keys", duplicateKeys),
         });
         return shelves;
+    }
+
+    /// <summary>
+    /// <see cref="TryGetLive"/>, and on a miss one rescan (rate-limited) so shelves built or streamed in after the
+    /// last <see cref="List"/> resolve too.
+    /// </summary>
+    public bool TryResolve(string key, [NotNullWhen(true)] out ItemStorageController? controller)
+    {
+        if (TryGetLive(key, out controller))
+        {
+            return true;
+        }
+
+        double now = Time.unscaledTimeAsDouble;
+        if (_hasListed && now - _lastListAt < _minRescanSeconds)
+        {
+            return false;
+        }
+
+        Scan(isRescan: true);
+        return TryGetLive(key, out controller);
     }
 
     public bool TryGetLive(string key, [NotNullWhen(true)] out ItemStorageController? controller)

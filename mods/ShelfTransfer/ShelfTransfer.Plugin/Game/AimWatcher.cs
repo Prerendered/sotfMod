@@ -1,7 +1,8 @@
-// purpose: resolves the aimed shelf slot (shelf, hook index, item, count) every frame and logs aim.change once it settles
+// purpose: resolves the aimed shelf slot (shelf, hook index, item, count) every frame; logs aim.change and aim.probe once settled
 // owns:    AimWatcher
-// deps:    ShelfRegistry, AimTarget, AimChangeDebouncer, IModLog, UnityEngine (Camera, Physics), Sons.Gameplay / Sons.Inventory (interop)
-// caution: read-only (I2): field reads plus the getters GetCurrentCount, GetItemCount, StorageSlotIndex; no Harmony patch.
+// deps:    ShelfRegistry, IShelfGateway, AimTarget, AimChangeDebouncer, IModLog, UnityEngine (Camera, Physics), Sons.Gameplay / Sons.Inventory (interop)
+// caution: read-only (I2): field reads, the getters GetCurrentCount, GetItemCount, StorageSlotIndex and gateway reads (never
+//          TakeOne/StoreOne); no Harmony patch.
 //          Il2Cpp objects live in locals of one Update; only managed values (ints, the key string) survive a frame
 
 using System;
@@ -37,9 +38,11 @@ public sealed class AimWatcher : MonoBehaviour
 
     private IModLog? _log;
     private ShelfRegistry? _registry;
+    private IShelfGateway? _gateway;
     private bool _isHalted;
-    private bool _hasListedShelves;
     private readonly AimChangeDebouncer _debouncer = new();
+    private readonly AimChangeDebouncer _probeDebouncer = new();
+    private static readonly SlotRef _anySlot = new(null);
 
     // Key cache: GetShelfKey formats a string, so it is rebuilt only when the aimed controller or its position changes.
     private int _cachedControllerId;
@@ -50,30 +53,61 @@ public sealed class AimWatcher : MonoBehaviour
 
     private AimTarget? _current;
 
+    // Last logged target, for aim.probe (would that item fit on the newly aimed shelf).
+    private string? _lastLoggedShelfKey;
+    private int _lastLoggedItem;
+
     public AimWatcher(IntPtr ptr) : base(ptr) { }
 
     // Managed parameters cannot cross into Il2Cpp; hidden so ClassInjector does not try to expose it.
     [HideFromIl2Cpp]
-    public void Init(IModLog log, ShelfRegistry registry)
+    public void Init(IModLog log, ShelfRegistry registry, IShelfGateway gateway)
     {
         _log = log;
         _registry = registry;
+        _gateway = gateway;
     }
 
     /// <summary>The slot aimed at this frame, or null when there is none (or the watcher halted).</summary>
     [HideFromIl2Cpp]
     public AimTarget? GetCurrent() => _current;
 
+    /// <summary>
+    /// Maps the current target's key to the storage aimed at right now, so gateway calls hit the looked-at shelf even
+    /// after a rescan picked a duplicate-key twin. False when nothing is aimed or the ray now resolves to another shelf.
+    /// </summary>
+    [HideFromIl2Cpp]
+    public bool TrackCurrent()
+    {
+        // Re-resolved rather than kept from Update: Il2Cpp objects never outlive the frame they were read in.
+        Camera camera = Camera.main;
+        if (_registry is null || _current is null || camera == null)
+        {
+            return false;
+        }
+
+        Collider? hit = FindAimedCollider(camera);
+        ItemStorageController? controller = hit == null ? null : FindInParent<ItemStorageController>(hit);
+        if (controller == null || GetShelf(controller).Key != _current.Shelf.Key)
+        {
+            return false;
+        }
+
+        _registry.Track(_current.Shelf.Key, controller);
+        return true;
+    }
+
     public void Update()
     {
-        if (_log is null || _registry is null || _isHalted)
+        if (_log is null || _registry is null || _gateway is null || _isHalted)
         {
             return;
         }
 
         try
         {
-            Tick(_log, _registry);
+            ItemStorageController? unstocked = Tick(_log, _registry, _gateway);
+            UpdateEmptyProbe(_log, _registry, _gateway, unstocked);
         }
         catch (Exception ex)
         {
@@ -84,29 +118,30 @@ public sealed class AimWatcher : MonoBehaviour
         }
     }
 
+    // Returns the aimed storage when the ray is on it but on no stocked slot (the empty-storage probe's input), else null.
     [HideFromIl2Cpp]
-    private void Tick(IModLog log, ShelfRegistry registry)
+    private ItemStorageController? Tick(IModLog log, ShelfRegistry registry, IShelfGateway gateway)
     {
         Camera camera = Camera.main;
         if (camera == null)
         {
             // Loading screens have no main camera; keep the last logged state so a reload logs only real changes.
             _current = null;
-            return;
+            return null;
         }
 
         Collider? hit = FindAimedCollider(camera);
         if (hit == null)
         {
             SetNoTarget(log, _reasonNoHit);
-            return;
+            return null;
         }
 
         ItemStorageController? controller = FindInParent<ItemStorageController>(hit);
         if (controller == null)
         {
             SetNoTarget(log, _reasonNotShelf);
-            return;
+            return null;
         }
 
         InWorldLayoutItemGroup? group = FindInParent<InWorldLayoutItemGroup>(hit);
@@ -116,14 +151,14 @@ public sealed class AimWatcher : MonoBehaviour
             if (hook == null)
             {
                 SetNoTarget(log, _reasonNoSlot);
-                return;
+                return controller;
             }
 
             group = FindActiveGroup(hook);
             if (group == null)
             {
                 SetNoTarget(log, _reasonEmptySlot);
-                return;
+                return controller;
             }
         }
 
@@ -131,14 +166,14 @@ public sealed class AimWatcher : MonoBehaviour
         if (storage == null)
         {
             SetNoTarget(log, _reasonNoSlot);
-            return;
+            return controller;
         }
 
         int count = group.GetCurrentCount();
         if (count <= 0)
         {
             SetNoTarget(log, _reasonEmptySlot);
-            return;
+            return controller;
         }
 
         int item = group._itemId;
@@ -147,15 +182,41 @@ public sealed class AimWatcher : MonoBehaviour
         _current = new AimTarget(shelf, new SlotRef(slot), new ItemId(item), count);
         if (!_debouncer.ShouldLog(_current, Time.unscaledTimeAsDouble))
         {
-            return;
+            return null;
         }
 
-        WriteTargetChange(log, shelf, slot, item, count, group._maxAmount, controller, storage);
-        if (!_hasListedShelves)
+        // The live controller in hand: gateway reads hit this shelf without a rescan, never a duplicate-key twin.
+        registry.Track(shelf.Key, controller);
+        WriteTargetChange(log, gateway, _current, group._maxAmount, controller, storage);
+        if (_lastLoggedShelfKey is not null && _lastLoggedShelfKey != shelf.Key && _lastLoggedItem != item)
         {
-            // First shelf aimed this session: one scan so the key-to-object map exists for card 9.
-            _hasListedShelves = true;
-            registry.List();
+            WriteProbe(log, gateway, shelf, new ItemId(_lastLoggedItem));
+        }
+
+        _lastLoggedShelfKey = shelf.Key;
+        _lastLoggedItem = item;
+        return null;
+    }
+
+    // An empty storage never writes a target line, so it is probed here, settled by its own debouncer like aim.change.
+    [HideFromIl2Cpp]
+    private void UpdateEmptyProbe(IModLog log, ShelfRegistry registry, IShelfGateway gateway,
+        ItemStorageController? unstocked)
+    {
+        AimTarget? candidate = null;
+        if (unstocked != null && _lastLoggedShelfKey is not null)
+        {
+            ShelfRef shelf = GetShelf(unstocked);
+            if (shelf.Key != _lastLoggedShelfKey)
+            {
+                candidate = new AimTarget(shelf, _anySlot, new ItemId(_lastLoggedItem), 0);
+            }
+        }
+
+        if (_probeDebouncer.ShouldLog(candidate, Time.unscaledTimeAsDouble) && candidate is not null && unstocked != null)
+        {
+            registry.Track(candidate.Shelf.Key, unstocked);
+            WriteProbe(log, gateway, candidate.Shelf, candidate.Item);
         }
     }
 
@@ -194,18 +255,23 @@ public sealed class AimWatcher : MonoBehaviour
         return _cachedShelf;
     }
 
-    // Diagnostics (cap, save_id, hook_count) are read only here, on a change, not every frame.
-    private static void WriteTargetChange(IModLog log, ShelfRef shelf, int slot, int item, int count, int cap,
+    // Diagnostics and gateway reads (inv, free, can_hold) run only here, on a settled change, never per frame. They stay out
+    // of the debounce key; a take/store on this slot still re-logs because the count is in it.
+    private static void WriteTargetChange(IModLog log, IShelfGateway gateway, AimTarget target, int cap,
         ItemStorageController controller, StructureStorage storage)
     {
+        int item = target.Item.Value;
         (int? saveId, int? hookCount, string? error) = ReadDiagnostics(controller, storage, item);
         List<KeyValuePair<string, object?>> line = new()
         {
-            new("shelf", shelf.Key),
-            new("slot", slot),
+            new("shelf", target.Shelf.Key),
+            new("slot", target.Slot.Index),
             new("item", item),
-            new("count", count),
+            new("count", target.Count),
             new("cap", cap),
+            new("inv", gateway.GetInventoryCount(target.Item)),
+            new("free", gateway.GetFreeCapacity(target.Shelf, target.Item)),
+            new("can_hold", gateway.CanHold(target.Shelf, target.Item)),
             new("save_id", saveId),
             new("hook_count", hookCount),
         };
@@ -216,6 +282,16 @@ public sealed class AimWatcher : MonoBehaviour
 
         log.Write(LogLevel.Info, "aim.change", line);
     }
+
+    // Card 9 criterion 2: the previous target's item checked against this shelf, so a shelf that rejects the type shows.
+    private static void WriteProbe(IModLog log, IShelfGateway gateway, ShelfRef shelf, ItemId item) =>
+        log.Write(LogLevel.Info, "aim.probe", new KeyValuePair<string, object?>[]
+        {
+            new("shelf", shelf.Key),
+            new("item", item.Value),
+            new("can_hold", gateway.CanHold(shelf, item)),
+            new("free", gateway.GetFreeCapacity(shelf, item)),
+        });
 
     // Guarded on its own so an unreadable diagnostic (a generic-base field, a missing component) never halts the watcher.
     // Runs only on a target change, so it is not a per-frame catch.
