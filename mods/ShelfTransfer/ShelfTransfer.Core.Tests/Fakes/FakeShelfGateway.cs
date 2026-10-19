@@ -48,6 +48,9 @@ public sealed class FakeShelfGateway : IShelfGateway
     /// <summary>GetMovableCount calls; the runner reads it only for a chunk (unit > 1).</summary>
     public int MovableCountReads { get; private set; }
 
+    /// <summary>Runs inside GetMovableCount before it answers; not in <see cref="Calls"/>, so it can throw, abort or flip IsAlive on the read.</summary>
+    public Action? OnMovableRead { get; set; }
+
     public int TakeCalls { get; private set; }
 
     /// <summary>The slot argument of every TakeOne call, in order.</summary>
@@ -198,7 +201,13 @@ public sealed class FakeShelfGateway : IShelfGateway
     public int GetMovableCount(ShelfRef shelf, SlotRef slot, ItemId item)
     {
         MovableCountReads++;
+        OnMovableRead?.Invoke();
         FakeShelf fake = _shelves[shelf.Key];
+        if (!fake.IsAlive)
+        {
+            return 0; // the plugin's Guard answers 0 for a gone shelf
+        }
+
         if (fake.Slots.Count == 0)
         {
             return TransferUnit < 1 ? 0 : fake.Count / TransferUnit * TransferUnit;

@@ -392,6 +392,38 @@ public sealed class SendAllRunnerAttackTests
         Assert.Equal(6, rig.Gateway.TakeCalls);
     }
 
+    // Card 85, mixed shelf: split ammo (15 + 15) moves 20, a 5 + 5 + 5 chunk type is skipped DoesntFit with no take, MRE moves, queue Completed
+    [Fact]
+    public void Tick_MixedShelfSplitAmmoPartialOnlyTypeAndMre_MovesAmmoSkipsPartialMovesMre()
+    {
+        Rig rig = new(mre: 6, ammo: 15, third: 5);
+        FakeShelf source = rig.Gateway.Shelf(SendAllRunnerTests.Src);
+        source.Slots.Add((new SlotRef(11), SendAllRunnerTests.Ammo, 15));
+        source.Slots.Add((new SlotRef(12), SendAllRunnerTests.Third, 5));
+        source.Slots.Add((new SlotRef(13), SendAllRunnerTests.Third, 5));
+        rig.Gateway.ItemUnits[SendAllRunnerTests.Third] = 10;
+
+        rig.RunToEnd();
+
+        Assert.Equal(SendAllStopReason.Completed, rig.Report.Reason);
+        SendAllTypeResult ammo = rig.Report.Types.Single(t => t.Item == SendAllRunnerTests.Ammo);
+        SendAllTypeResult partial = rig.Report.Types.Single(t => t.Item == SendAllRunnerTests.Third);
+        SendAllTypeResult mre = rig.Report.Types.Single(t => t.Item == SendAllRunnerTests.Mre);
+        Assert.Equal(SendAllTypeOutcome.Moved, ammo.Outcome);
+        Assert.Equal(20, ammo.Moved);
+        Assert.Equal(10, ammo.Remaining);
+        Assert.Equal(SendAllTypeOutcome.Skipped, partial.Outcome);
+        Assert.Equal(SendAllSkipReason.DoesntFit, partial.SkipReason);
+        Assert.Equal(15, partial.Remaining);
+        Assert.Equal(SendAllTypeOutcome.Moved, mre.Outcome);
+        Assert.Equal(6, mre.Moved);
+        Assert.Equal(26, rig.Report.Moved);
+        Assert.Equal(0, rig.Report.Stranded);
+        Assert.Equal(26, rig.Target.Count);
+        Assert.Equal(0, rig.Gateway.Inventory);
+        Assert.Equal(2 + 6, rig.Gateway.TakeCalls);
+    }
+
     // Card 85 crit 3: total 15 at unit 10 but no slot holds a whole chunk -> skipped before any take, the queue goes on
     [Fact]
     public void Tick_TypeOnlyInPartialChunkSlots_SkippedDoesntFitBeforeAnyTakeAndQueueContinues()

@@ -24,7 +24,7 @@ public sealed class TransferRunnerSplitSlotTests
 
     private sealed class Rig
     {
-        public Rig(int unit, int[] slots, int? slot = null, int amount = AmountClamp.All, int? capacity = null)
+        public Rig(int unit, int[] slots, int? slot = null, int amount = AmountClamp.All, int? capacity = null, int confirmTicks = 0)
         {
             Gateway = new FakeShelfGateway { TransferUnit = unit };
             FakeShelf source = Gateway.Add(_src, 0);
@@ -40,7 +40,7 @@ public sealed class TransferRunnerSplitSlotTests
             }
 
             Log = new FakeModLog();
-            Runner = new TransferRunner(Gateway, Log, new TransferRequest(_src, new SlotRef(slot), _dst, _item, amount));
+            Runner = new TransferRunner(Gateway, Log, new TransferRequest(_src, new SlotRef(slot), _dst, _item, amount), confirmTicks);
         }
 
         public FakeShelfGateway Gateway { get; }
@@ -203,6 +203,157 @@ public sealed class TransferRunnerSplitSlotTests
         Assert.Equal(StopReason.Completed, rig.Report.Reason);
         Assert.Equal(20, rig.Report.Moved);
         Assert.Equal(40, rig.Gateway.Shelf(_src).Slots.Single(s => s.Item == _other).Count);
+    }
+
+    // Precedence: every earlier reason keeps its old detail on a split shelf, and the per-slot read never runs
+    [Fact]
+    public void Tick_SplitSlotsAmountBelowOneChunk_KeepsInvalidAmountWithoutTheSplitRead()
+    {
+        Rig rig = new(10, new[] { 15, 15 }, amount: 5);
+
+        rig.RunToEnd();
+
+        Assert.Equal(StopReason.BlockedBeforeStart, rig.Report.Reason);
+        Assert.StartsWith("InvalidAmount", rig.Report.Detail, System.StringComparison.Ordinal);
+        Assert.Equal(0, rig.Gateway.MovableCountReads);
+        Assert.Equal(0, rig.Gateway.Mutations);
+    }
+
+    [Fact]
+    public void Tick_SplitSlotsTargetCannotHold_KeepsCannotHoldDetailWithoutTheSplitRead()
+    {
+        Rig rig = new(10, new[] { 15, 15 });
+        rig.Dst.CanHold = false;
+
+        rig.RunToEnd();
+
+        Assert.Equal("target cannot hold item", rig.Report.Detail);
+        Assert.Equal(0, rig.Gateway.MovableCountReads);
+        Assert.Equal(0, rig.Gateway.Mutations);
+    }
+
+    [Fact]
+    public void Tick_AimedEmptySlotOnASplitShelf_KeepsUnitUnknownDetail()
+    {
+        Rig rig = new(10, new[] { 15, 15 }, slot: 14);
+
+        rig.RunToEnd();
+
+        Assert.Equal("transfer unit unknown", rig.Report.Detail);
+        Assert.Equal(0, rig.Gateway.MovableCountReads);
+        Assert.Equal(0, rig.Gateway.Mutations);
+    }
+
+    // Aimed at the short slot next to a whole-chunk slot: only the aimed slot counts, so it is blocked and nothing is taken
+    [Fact]
+    public void Tick_AimedPartialSlotNextToWholeChunkSlot_BlockedWithSplitDetailAndNoTake()
+    {
+        Rig rig = new(10, new[] { 5, 20 }, slot: 9);
+
+        rig.RunToEnd();
+
+        Assert.Equal(StopReason.BlockedBeforeStart, rig.Report.Reason);
+        Assert.Equal("no slot holds a whole chunk of 10", rig.Report.Detail);
+        Assert.Equal(0, rig.Gateway.Mutations);
+        Assert.Equal(25, rig.SourceNow);
+    }
+
+    // The IsFinished check after the movable read: a hook on the read (not in Calls) that stops the run leaves no mutation
+    [Fact]
+    public void Tick_AbortDuringMovableRead_StopsWithNoStartLogAndNoMutation()
+    {
+        Rig rig = new(10, new[] { 15, 15 });
+        rig.Gateway.OnMovableRead = () => rig.Runner.Abort(StopReason.GatewayError, "abort on read");
+
+        rig.RunToEnd();
+
+        Assert.Equal(StopReason.GatewayError, rig.Report.Reason);
+        Assert.Equal("abort on read", rig.Report.Detail);
+        Assert.Empty(rig.Log.Named("transfer.start"));
+        Assert.Equal(1, rig.Gateway.MovableCountReads);
+        Assert.Equal(0, rig.Gateway.Mutations);
+        Assert.Equal(30, rig.SourceNow);
+    }
+
+    [Fact]
+    public void Tick_ThrowDuringMovableRead_TickThrowsThenNextTickFinishesGatewayErrorWithNoMutation()
+    {
+        Rig rig = new(10, new[] { 15, 15 });
+        rig.Gateway.OnMovableRead = () => throw new System.InvalidOperationException("read fault");
+
+        Assert.Throws<System.InvalidOperationException>(() => rig.Runner.Tick(1));
+        rig.Runner.Tick(1);
+
+        Assert.Equal(StopReason.GatewayError, rig.Report.Reason);
+        Assert.Equal(0, rig.Gateway.Mutations);
+        Assert.Equal(30, rig.SourceNow);
+    }
+
+    [Fact]
+    public void Tick_CancelRequestedDuringMovableRead_CancelsBeforeAnyTake()
+    {
+        Rig rig = new(10, new[] { 15, 15 });
+        rig.Gateway.OnMovableRead = () => rig.Runner.RequestCancel();
+
+        rig.RunToEnd();
+
+        Assert.Equal(StopReason.Cancelled, rig.Report.Reason);
+        Assert.Equal(0, rig.Report.Moved);
+        Assert.Equal(0, rig.Gateway.Mutations);
+    }
+
+    // Fake now matches the plugin's Guard (0 for a gone shelf); the runner pins what it does with it: a clean block, no mutation.
+    // The detail says "no slot holds a whole chunk" rather than ShelfGone (filed as a low card).
+    [Fact]
+    public void Tick_SourceGoneDuringMovableRead_BlockedBeforeStartWithNoMutation()
+    {
+        Rig rig = new(10, new[] { 15, 15 });
+        rig.Gateway.OnMovableRead = () => rig.Gateway.Shelf(_src).IsAlive = false;
+
+        rig.RunToEnd();
+
+        Assert.Equal(StopReason.BlockedBeforeStart, rig.Report.Reason);
+        Assert.Equal(0, rig.Gateway.Mutations);
+        Assert.Equal(30, rig.SourceNow);
+    }
+
+    // Client shape (confirmTicks > 0): the host applies the take some ticks late; 15 + 15 still completes at 20, no wait timeout
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(3)]
+    public void Tick_ClientShapeOverSplitSlots_CompletesAtTwentyWithoutWaitTimeout(int hostDelay)
+    {
+        Rig rig = new(10, new[] { 15, 15 }, confirmTicks: 4);
+        List<(int Due, int Index)> pending = new();
+        int tickNo = 0;
+        rig.Gateway.TakeBehavior = _ =>
+        {
+            List<(SlotRef Slot, ItemId Item, int Count)> slots = rig.Gateway.Shelf(_src).Slots;
+            int at = slots.FindIndex(s => s.Count >= 10);
+            pending.Add((tickNo + hostDelay, at));
+            return GatewayOutcome.Ok;
+        };
+
+        for (; tickNo < 200 && rig.Runner.State != TransferState.Finished; tickNo++)
+        {
+            foreach ((int due, int index) in pending.Where(p => p.Due <= tickNo).ToList())
+            {
+                (SlotRef slotRef, ItemId item, int count) = rig.Gateway.Shelf(_src).Slots[index];
+                rig.Gateway.Shelf(_src).Slots[index] = (slotRef, item, count - 10);
+                rig.Gateway.Inventory += 10;
+                pending.Remove((due, index));
+            }
+
+            rig.Runner.Tick(1);
+        }
+
+        Assert.Equal(StopReason.Completed, rig.Report.Reason);
+        Assert.Equal(20, rig.Report.Moved);
+        Assert.Equal(10, rig.Report.Remaining);
+        Assert.Equal(0, rig.Report.StrandedInInventory);
+        Assert.Equal(20, rig.Dst.Count);
+        Assert.Equal(0, rig.Gateway.Inventory);
     }
 
     private static List<string> FormatLog(FakeModLog log) =>
