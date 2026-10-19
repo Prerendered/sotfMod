@@ -201,6 +201,24 @@ public sealed class OverlayModel
         RebuildGroups();
     }
 
+    /// <summary>Expands the group now holding the row, so a regrouped row stays in view; no-op if absent or already open.</summary>
+    public void ExpandGroupOf(string shelfKey)
+    {
+        if (State != OverlayState.Ready)
+        {
+            return;
+        }
+
+        ShelfGroup? group = Groups.FirstOrDefault(candidate => candidate.Rows.Any(row => row.Shelf.Key == shelfKey));
+        if (group is null || group.Expanded)
+        {
+            return;
+        }
+
+        _expandedByGroup[group.Name] = true;
+        RebuildGroups();
+    }
+
     /// <summary>Refuses unknown and unselectable rows (I4); a refusal leaves the current selection as it was.</summary>
     public bool SelectRow(string shelfKey)
     {

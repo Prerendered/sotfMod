@@ -1,7 +1,8 @@
 // purpose: the `transfer` command (debug console and the transfer prompt): list target shelves by index and label, start
 //          a transfer of the aimed item to an index or a label, cancel it
 // owns:    TransferCommand
-// deps:    TransferDriver, AimWatcher, ShelfRegistry, IShelfGateway, ShelfListBuilder, TargetQuery, StopReasonText, IModLog,
+// deps:    TransferDriver, AimWatcher, ShelfRegistry, IShelfGateway, ShelfTargetScan, ShelfListBuilder, TargetQuery,
+//          StopReasonText, IModLog,
 //          TheForest.DebugConsole (interop: RegisterCommand, TryGetDynamicCommands, LogCommandInfo), UnityEngine
 // caution: indexes refer to the last list snapshot, never a fresh scan, so the number typed is the row printed; a label
 //          rescans and replaces that snapshot. I5 - labels are only read. I2 - never calls TakeOne/StoreOne; only the
@@ -303,15 +304,7 @@ public sealed class TransferCommand : MonoBehaviour
         }
 
         Vector3 player = camera.transform.position;
-        List<ShelfCandidate> candidates = new();
-        foreach (ShelfRef shelf in registry.List())
-        {
-            // CanHold then GetFreeCapacity back to back share one hook walk in the gateway.
-            bool canHold = aim is not null && gateway.CanHold(shelf, aim.Item);
-            int free = aim is null ? 0 : gateway.GetFreeCapacity(shelf, aim.Item);
-            candidates.Add(new ShelfCandidate(shelf, free, canHold));
-        }
-
+        IReadOnlyList<ShelfCandidate> candidates = ShelfTargetScan.ReadCandidates(gateway, registry.List(), aim?.Item);
         sourceCount = aim is null ? 0 : gateway.GetCount(aim.Shelf, aim.Item);
         int unit = aim is null ? 1 : gateway.GetTransferUnit(aim.Shelf, aim.Slot, aim.Item);
         ShelfList list = ShelfListBuilder.Build(candidates, aim?.Shelf.Key ?? "", sourceCount,
