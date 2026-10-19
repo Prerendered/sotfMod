@@ -1,12 +1,15 @@
 // purpose: the transfer overlay (§02): the transfer key on an aimed shelf slot opens a left-anchored IMGUI panel with the
 //          source slot and the other shelves grouped by base; a row click selects it, a header click collapses it, and
-//          each row's rename / group link edits its label inline. Esc closes it with nothing moved
+//          each row's rename / group link edits its label inline. The amount (All, stepper, typed) and Confirm start one
+//          transfer; the panel then shows its progress and the result line. Esc closes it with nothing moved
 // owns:    OverlayUi
 // deps:    OverlayModel, ShelfTargetScan, ShelfListBuilder, IShelfGateway (reads only), TransferCommand (CaptureAim,
-//          ReleaseAim, IsCapturedShelfGone, GetShelfName), LabelsFeature (Store, SetLabel, IsValidName, SaveNow),
-//          LabelPruneGuard, InputBlocker, OverlayStyles, ModConfig (TransferKey, PruneMode), IModLog, UnityEngine IMGUI
-// caution: I1/I2 - no Confirm path yet: never calls TakeOne/StoreOne or the driver. Selection, collapse and Esc go through
-//          OverlayModel (I4: it refuses a dimmed row); this class renders the model and forwards input. I5 - labels are
+//          ReleaseAim, IsCapturedShelfGone, GetShelfName, StartCaptured, RequestCancel, IsRunning, GetProgress),
+//          LabelsFeature (Store, SetLabel, IsValidName, SaveNow), LabelPruneGuard, InputBlocker, OverlayStyles,
+//          ModConfig (TransferKey, PruneMode), IModLog, UnityEngine IMGUI
+// caution: I1/I2 - never calls TakeOne/StoreOne; Confirm starts the run through TransferCommand.StartCaptured, the typed
+//          prompt's driver path. Amount, Confirm, selection, collapse and Esc go through OverlayModel (I4: it clamps the
+//          amount and refuses a dimmed row); this class renders the model and forwards input. I5 - labels are
 //          written only through LabelsFeature.SetLabel. The list is cached: rebuilt on a 1 m move or a label save, never
 //          per frame, and the gateway is read once per open. Update and OnGUI are P2 boundaries: a throw logs
 //          error event=ui.overlay, gives input back at once and halts the overlay for the session
@@ -24,6 +27,7 @@ using ShelfTransfer.Core.Gateway;
 using ShelfTransfer.Core.Labels;
 using ShelfTransfer.Core.Logging;
 using ShelfTransfer.Core.Shelves;
+using ShelfTransfer.Core.Transfer;
 using ShelfTransfer.Core.Ui;
 using ShelfTransfer.Plugin.Commands;
 using ShelfTransfer.Plugin.Config;
@@ -41,10 +45,13 @@ public sealed class OverlayUi : MonoBehaviour
     private const string _pruneLogEvent = "labels.prune";
     private const string _pruneCandidateLogEvent = "labels.prune_candidate";
     private const string _editControl = "ShelfTransfer.OverlayLabelEdit";
+    private const string _amountControl = "ShelfTransfer.OverlayAmount";
 
     // Criterion 2 allows 1 m against a tape check, so a smaller move never needs new rows.
     private const float _rebuildDistance = 1f;
     private const float _noteSeconds = 4f;
+    private const float _clampedNoteSeconds = 3f;
+    private const int _amountMaxLength = 10;
     private const int _maxLabelChars = 22;
     private const int _groupChipColumns = 3;
 
@@ -56,12 +63,30 @@ public sealed class OverlayUi : MonoBehaviour
     private const int _renameLinkWidth = 56;
     private const int _groupLinkWidth = 48;
     private const int _scrollbarWidth = 20;
+    private const int _amountLabelWidth = 64;
+    private const int _stepperWidth = 36;
+    private const int _amountFieldWidth = 96;
+    private const int _allButtonWidth = 56;
+    private const int _actionButtonWidth = 120;
 
     private const string _titleText = "Transfer";
     private const string _closeText = "Esc";
     private const string _sendToText = "Send to";
     private const string _hintText = "Click a shelf to select it. Esc closes, nothing is moved";
+    private const string _amountHintText = "Set the amount, then Confirm. Esc closes, nothing is moved";
     private const string _editHintText = "Enter saves the label, Esc cancels the edit";
+    private const string _runningHintText = "Esc: stop after the current item";
+    private const string _runningChunkHintText = "Esc: stop after the current chunk";
+    private const string _resultHintText = "Esc closes";
+    private const string _amountText = "Amount";
+    private const string _stepDownText = "-";
+    private const string _stepUpText = "+";
+    private const string _allText = "All";
+    private const string _confirmText = "Confirm";
+    private const string _cancelButtonText = "Cancel";
+    private const string _clampedText = "Clamped to what fits";
+    private const string _doneText = "Done";
+    private const string _stoppedText = "Stopped";
     private const string _cannotHoldText = "can't hold";
     private const string _renameText = "rename";
     private const string _groupText = "group";
@@ -89,6 +114,21 @@ public sealed class OverlayUi : MonoBehaviour
         RegroupRow,
         SaveEdit,
         CancelEdit,
+    }
+
+    // Applied at the end of Draw for the same reason as ListClick: Confirm and Cancel change what the panel draws.
+    private enum PanelClick
+    {
+        None,
+        Confirm,
+        Cancel,
+    }
+
+    private enum NoteTone
+    {
+        Success,
+        Warn,
+        Error,
     }
 
     private IModLog? _log;
@@ -127,8 +167,19 @@ public sealed class OverlayUi : MonoBehaviour
     private bool _shouldFocusEdit;
 
     private string? _note;
-    private bool _isNoteError;
+    private NoteTone _noteTone;
     private float _noteUntil;
+
+    // Set by the driver's finish callback, which runs outside this class's catch, so it only stores; Tick applies it,
+    // and only to the overlay instance that confirmed (a result for a closed overlay is dropped).
+    private (OverlayModel Model, TransferReport Report)? _finished;
+    private bool _isAmountFocused;
+    private (int Moved, int Planned) _progress;
+    private string _progressText = string.Empty;
+    private string? _stepText;
+    private float _resultHeight;
+    private string? _resultHeightText;
+    private OverlayStyles? _resultHeightStyles;
 
     public OverlayUi(IntPtr ptr) : base(ptr) { }
 
@@ -163,14 +214,14 @@ public sealed class OverlayUi : MonoBehaviour
 
     public void OnGUI()
     {
-        if (_log is null || _isHalted || _model is null)
+        if (_log is null || _command is null || _isHalted || _model is null)
         {
             return;
         }
 
         try
         {
-            Draw(_log);
+            Draw(_log, _command);
         }
         catch (Exception ex)
         {
@@ -185,6 +236,7 @@ public sealed class OverlayUi : MonoBehaviour
         Func<IReadOnlyList<ShelfRef>> listShelves)
     {
         _inputBlocker.Tick(log);
+        ApplyFinished(log);
         if (_model is null)
         {
             // Not while any panel holds input: in the label editor the key is a character of the name, and while
@@ -205,13 +257,53 @@ public sealed class OverlayUi : MonoBehaviour
             return;
         }
 
-        HandlePanelKey(log, _inputBlocker.ReadPanelKey());
+        HandlePanelKey(log, command, _inputBlocker.ReadPanelKey());
+        if (_model is not OverlayModel model)
+        {
+            return;
+        }
+
+        // Planned is 0 until the runner's first tick; until then the requested amount shows. Kept after the run ends, so
+        // the frame before the result still shows the final count.
+        if (model.State == OverlayState.Running && command.GetProgress() is { } progress && progress.Planned > 0)
+        {
+            SetProgress(progress);
+        }
+
+        // The list is hidden from Confirm on (design D9) and the model ignores a list while running.
         Camera camera = Camera.main;
-        if (_model is OverlayModel model && camera != null
+        if (model.State is not (OverlayState.Running or OverlayState.Result) && camera != null
             && (camera.transform.position - _builtAt).sqrMagnitude > _rebuildDistance * _rebuildDistance)
         {
             RebuildList(log, model, camera, "moved");
         }
+    }
+
+    [HideFromIl2Cpp]
+    private void ApplyFinished(IModLog log)
+    {
+        if (_finished is not { } finished)
+        {
+            return;
+        }
+
+        _finished = null;
+        (OverlayModel model, TransferReport report) = finished;
+        if (!ReferenceEquals(model, _model))
+        {
+            return;
+        }
+
+        model.OnTransferFinished(report);
+        log.Write(LogLevel.Info, _logEvent, new KeyValuePair<string, object?>[]
+        {
+            new("state", "result"),
+            new("reason", report.Reason),
+            new("moved", report.Moved),
+            new("remaining", report.Remaining),
+            new("stranded", report.StrandedInInventory),
+            new("auto_close", model.AutoClose),
+        });
     }
 
     [HideFromIl2Cpp]
@@ -258,10 +350,13 @@ public sealed class OverlayUi : MonoBehaviour
 
         _itemText = string.Format(CultureInfo.InvariantCulture, "Item {0} x {1}", aim.Item.Value, aim.Count);
         _unitText = unit > 1 ? string.Format(CultureInfo.InvariantCulture, "(moves in {0}s)", unit) : null;
+        _stepText = unit > 1 ? string.Format(CultureInfo.InvariantCulture, "step {0}", unit) : null;
         _itemWidthStyles = null;
         _shelfText = "From " + command.GetShelfName(aim.Shelf);
         _listScroll = Vector2.zero;
         _note = null;
+        _finished = null;
+        SetProgress(default);
         _model = model;
 
         _inputBlocker.Block();
@@ -458,9 +553,10 @@ public sealed class OverlayUi : MonoBehaviour
         return command.IsCapturedShelfGone ? "shelf_gone" : null;
     }
 
-    // While a label edit is open Enter saves it and Esc cancels only the edit, as in the label editor (card 16).
+    // While a label edit is open Enter saves it and Esc cancels only the edit, as in the label editor (card 16). Enter in
+    // the amount field is Confirm (design: Keyboard); anywhere else it does nothing, so a stray Enter starts no run.
     [HideFromIl2Cpp]
-    private void HandlePanelKey(IModLog log, KeyCode key)
+    private void HandlePanelKey(IModLog log, TransferCommand command, KeyCode key)
     {
         if (key == KeyCode.None)
         {
@@ -474,6 +570,10 @@ public sealed class OverlayUi : MonoBehaviour
         else if (_editKey is not null)
         {
             SubmitEdit(log);
+        }
+        else if (_isAmountFocused && _model is OverlayModel model)
+        {
+            ConfirmTransfer(log, command, model);
         }
     }
 
@@ -491,7 +591,8 @@ public sealed class OverlayUi : MonoBehaviour
         }
     }
 
-    // The model decides what Esc means; before a Confirm exists it can only close (nothing moved, card 42 criterion 5).
+    // The model decides what Esc means: before Confirm it closes with nothing moved (card 42 criterion 5); while running
+    // it asks once for a stop after the in-flight item or chunk (D7), which the runner honours between cycles.
     [HideFromIl2Cpp]
     private void Escape(IModLog log, string reason)
     {
@@ -500,6 +601,44 @@ public sealed class OverlayUi : MonoBehaviour
         {
             Close(log, reason);
         }
+        else if (action == OverlayAction.Cancel)
+        {
+            // TransferDriver logs transfer.cancel; false only when the run finished this frame, whose result is pending.
+            _command?.RequestCancel();
+        }
+    }
+
+    // A second Confirm is ignored: the model gives no request once Running (crit 7), and none starts while another UI's
+    // run is active. The ui.overlay line comes first so transfer.request follows it, as the prompt's submit line does.
+    [HideFromIl2Cpp]
+    private void ConfirmTransfer(IModLog log, TransferCommand command, OverlayModel model)
+    {
+        if (command.IsRunning || !model.ConfirmEnabled)
+        {
+            return;
+        }
+
+        if (_editKey is not null)
+        {
+            CancelEdit(log, "switch");
+        }
+
+        TransferRequest? request = model.Confirm();
+        if (request is null)
+        {
+            return;
+        }
+
+        log.Write(LogLevel.Info, _logEvent, new KeyValuePair<string, object?>[]
+        {
+            new("state", "confirm"),
+            new("target", request.Target.Key),
+            new("amount", request.Amount),
+            new("unit", model.TransferUnit),
+        });
+        _isAmountFocused = false;
+        SetProgress((0, request.Amount));
+        command.StartCaptured(request, report => _finished = (model, report));
     }
 
     [HideFromIl2Cpp]
@@ -527,6 +666,9 @@ public sealed class OverlayUi : MonoBehaviour
         _candidates = Array.Empty<ShelfCandidate>();
         _store = null;
         _note = null;
+        _finished = null;
+        _isAmountFocused = false;
+        SetProgress(default);
         EndEdit();
         _command?.ReleaseAim();
     }
@@ -552,7 +694,8 @@ public sealed class OverlayUi : MonoBehaviour
     [HideFromIl2Cpp]
     private void Select(IModLog log, OverlayModel model, string key)
     {
-        // The model refuses a dimmed row (I4) and keeps the current selection; the refusal is logged as evidence.
+        // The model refuses a dimmed row (I4) and keeps the current selection; the refusal is logged as evidence. A dimmed
+        // row has Fits 0 (can't hold, or less than one chunk free), so the model's "nothing fits" wording is true for both.
         if (!model.SelectRow(key))
         {
             log.Write(LogLevel.Info, _logEvent, new KeyValuePair<string, object?>[]
@@ -560,6 +703,7 @@ public sealed class OverlayUi : MonoBehaviour
                 new("state", "refuse"),
                 new("target", key),
             });
+            ShowNote(OverlayModel.TargetFullReason, NoteTone.Warn);
             return;
         }
 
@@ -601,7 +745,7 @@ public sealed class OverlayUi : MonoBehaviour
                 new("reason", "no_store"),
                 new("shelf", key),
             });
-            ShowNote(_noStoreText, true);
+            ShowNote(_noStoreText, NoteTone.Error);
             return;
         }
 
@@ -653,7 +797,7 @@ public sealed class OverlayUi : MonoBehaviour
         {
             bool isTooLong = (label?.Trim().Length ?? 0) > LabelsFeature.MaxNameLength
                 || (group?.Trim().Length ?? 0) > LabelsFeature.MaxNameLength;
-            ShowNote(isTooLong ? _tooLongText : _invalidCharText, true);
+            ShowNote(isTooLong ? _tooLongText : _invalidCharText, NoteTone.Error);
             log.Write(LogLevel.Info, _labelLogEvent, new KeyValuePair<string, object?>[]
             {
                 new("action", "reject"),
@@ -725,22 +869,29 @@ public sealed class OverlayUi : MonoBehaviour
             LabelSaveStatus.Blocked => (_saveBlockedText, true),
             _ => (_noStoreText, true),
         };
-        ShowNote(text, isError);
+        ShowNote(text, isError ? NoteTone.Error : NoteTone.Success);
     }
 
     [HideFromIl2Cpp]
-    private void ShowNote(string text, bool isError)
+    private void ShowNote(string text, NoteTone tone, float seconds = _noteSeconds)
     {
         _note = text;
-        _isNoteError = isError;
-        _noteUntil = Time.unscaledTime + _noteSeconds;
+        _noteTone = tone;
+        _noteUntil = Time.unscaledTime + seconds;
     }
 
     [HideFromIl2Cpp]
-    private void Draw(IModLog log)
+    private void SetProgress((int Moved, int Planned) progress)
+    {
+        _progress = progress;
+        _progressText = string.Format(CultureInfo.InvariantCulture, "{0} / {1} moved", progress.Moved, progress.Planned);
+    }
+
+    [HideFromIl2Cpp]
+    private void Draw(IModLog log, TransferCommand command)
     {
         // Esc never reaches Input.GetKeyDown while input is blocked (card 54); the IMGUI event does.
-        HandlePanelKey(log, _inputBlocker.ReadPanelKeyEvent());
+        HandlePanelKey(log, command, _inputBlocker.ReadPanelKeyEvent());
         OverlayModel? model = _model;
         if (model is null)
         {
@@ -755,15 +906,31 @@ public sealed class OverlayUi : MonoBehaviour
         float width = styles.PanelWidthPx;
         float innerWidth = width - (2f * padding);
         string? status = model.StatusText;
+        // From Confirm on the list is hidden, not dimmed, so the target cannot change mid-run (design D9).
+        bool isBrowsing = model.State is not (OverlayState.Running or OverlayState.Result);
 
-        float headerHeight = styles.TitleLineHeight + gap + styles.TitleLineHeight + styles.BodyLineHeight + gap
-            + 1f + gap + styles.SmallLineHeight;
+        float headerHeight = styles.TitleLineHeight + gap + styles.TitleLineHeight + styles.BodyLineHeight + gap + 1f + gap;
         float footerHeight = gap + styles.SmallLineHeight;
-        float contentHeight = (status is null ? 0f : styles.BodyLineHeight) + GetLinesHeight(styles);
-        float maxListHeight = Math.Max((Screen.height * OverlayStyles.PanelMaxHeightFraction) - headerHeight - footerHeight
-            - (2f * padding), styles.Px(OverlayStyles.RowHeight));
-        float listHeight = Math.Min(contentHeight, maxListHeight);
-        float height = (2f * padding) + headerHeight + listHeight + footerHeight;
+        float controlsHeight = GetControlsHeight(styles);
+        float contentHeight = 0f;
+        float listHeight = 0f;
+        float bodyHeight;
+        if (isBrowsing)
+        {
+            contentHeight = (status is null ? 0f : styles.BodyLineHeight) + GetLinesHeight(styles);
+            float maxListHeight = Math.Max((Screen.height * OverlayStyles.PanelMaxHeightFraction) - headerHeight
+                - styles.SmallLineHeight - controlsHeight - footerHeight - (2f * padding), styles.Px(OverlayStyles.RowHeight));
+            listHeight = Math.Min(contentHeight, maxListHeight);
+            bodyHeight = styles.SmallLineHeight + listHeight + controlsHeight;
+        }
+        else
+        {
+            bodyHeight = model.State == OverlayState.Running
+                ? GetRunningHeight(styles)
+                : styles.TitleLineHeight + GetResultHeight(styles, model.ResultText ?? string.Empty, innerWidth);
+        }
+
+        float height = (2f * padding) + headerHeight + bodyHeight + footerHeight;
         Rect panel = new(Screen.width * OverlayStyles.PanelLeftFraction, (Screen.height - height) / 2f, width, height);
         DrawPanel(styles, panel);
 
@@ -782,15 +949,33 @@ public sealed class OverlayUi : MonoBehaviour
         y += gap;
         GUI.DrawTexture(new Rect(x, y, innerWidth, 1f), styles.DividerTexture);
         y += 1f + gap;
-        GUI.Label(new Rect(x, y, innerWidth, styles.SmallLineHeight), _sendToText, styles.Small);
-        y += styles.SmallLineHeight;
 
-        // Applied after the list is drawn: a click that rebuilds _lines must not change it while it is enumerated.
-        (ListClick click, string clickKey) = DrawList(model, styles, status, new Rect(x, y, innerWidth, listHeight),
-            contentHeight);
-        y += listHeight + gap;
-        DrawFooter(styles, new Rect(x, y, innerWidth, styles.SmallLineHeight));
+        (ListClick click, string clickKey) = (ListClick.None, string.Empty);
+        PanelClick panelClick = PanelClick.None;
+        if (isBrowsing)
+        {
+            GUI.Label(new Rect(x, y, innerWidth, styles.SmallLineHeight), _sendToText, styles.Small);
+            y += styles.SmallLineHeight;
+            // Applied after the list is drawn: a click that rebuilds _lines must not change it while it is enumerated.
+            (click, clickKey) = DrawList(model, styles, status, new Rect(x, y, innerWidth, listHeight), contentHeight);
+            y += listHeight;
+            panelClick = DrawControls(log, command, model, styles, x, y, innerWidth);
+            y += controlsHeight;
+        }
+        else if (model.State == OverlayState.Running)
+        {
+            DrawRunning(model, styles, x, y, innerWidth);
+            y += GetRunningHeight(styles);
+        }
+        else
+        {
+            y = DrawResult(model, styles, x, y, innerWidth);
+        }
+
+        y += gap;
+        DrawFooter(model, styles, new Rect(x, y, innerWidth, styles.SmallLineHeight));
         ApplyClick(log, model, click, clickKey);
+        ApplyPanelClick(log, command, model, panelClick);
     }
 
     [HideFromIl2Cpp]
@@ -820,7 +1005,222 @@ public sealed class OverlayUi : MonoBehaviour
     }
 
     [HideFromIl2Cpp]
-    private void DrawFooter(OverlayStyles styles, Rect area)
+    private void ApplyPanelClick(IModLog log, TransferCommand command, OverlayModel model, PanelClick click)
+    {
+        switch (click)
+        {
+            case PanelClick.Confirm:
+                ConfirmTransfer(log, command, model);
+                break;
+            case PanelClick.Cancel:
+                HandleEscape(log, "button");
+                break;
+        }
+    }
+
+    // Gap, amount row, gap, action row, then one line for the reason Confirm is disabled (design: caption under the row).
+    [HideFromIl2Cpp]
+    private static float GetControlsHeight(OverlayStyles styles) =>
+        (2f * styles.Px(OverlayStyles.Space2)) + (2f * styles.Px(OverlayStyles.ControlHeight)) + styles.SmallLineHeight;
+
+    [HideFromIl2Cpp]
+    private PanelClick DrawControls(IModLog log, TransferCommand command, OverlayModel model, OverlayStyles styles, float x,
+        float y, float width)
+    {
+        float gap = styles.Px(OverlayStyles.Space2);
+        float controlHeight = styles.Px(OverlayStyles.ControlHeight);
+        y += gap;
+        DrawAmountRow(log, model, styles, new Rect(x, y, width, controlHeight));
+        y += controlHeight + gap;
+
+        string? reason = GetConfirmBlockedReason(command, model);
+        float buttonWidth = styles.Px(_actionButtonWidth);
+        PanelClick click = PanelClick.None;
+        if (DrawButton(styles, new Rect(x, y, buttonWidth, controlHeight), _confirmText, styles.ButtonPrimary, reason is null))
+        {
+            click = PanelClick.Confirm;
+        }
+
+        if (GUI.Button(new Rect(x + width - buttonWidth, y, buttonWidth, controlHeight), _cancelButtonText, styles.Button))
+        {
+            click = PanelClick.Cancel;
+        }
+
+        y += controlHeight;
+        if (reason is not null)
+        {
+            GUI.Label(new Rect(x, y, width, styles.SmallLineHeight), reason, styles.Small);
+        }
+
+        return click;
+    }
+
+    // The model knows only its own run; a run started from the typed prompt blocks Confirm too (one runner at a time, P2).
+    [HideFromIl2Cpp]
+    private static string? GetConfirmBlockedReason(TransferCommand command, OverlayModel model) =>
+        model.ConfirmEnabled && command.IsRunning ? OverlayModel.RunningReason : model.ConfirmDisabledReason;
+
+    // Every amount rule (All default, whole-chunk steps, clamp to what fits, invalid text) is OverlayModel's; this only
+    // forwards the input and shows AmountDisplay.
+    [HideFromIl2Cpp]
+    private void DrawAmountRow(IModLog log, OverlayModel model, OverlayStyles styles, Rect row)
+    {
+        bool canEdit = model.State == OverlayState.Ready && model.SelectedRow is not null;
+        float gap = styles.Px(OverlayStyles.Space2);
+        float x = row.x;
+        float labelWidth = styles.Px(_amountLabelWidth);
+        GUI.Label(new Rect(x, row.y, labelWidth, row.height), _amountText, styles.MutedBody);
+        x += labelWidth;
+
+        float stepperWidth = styles.Px(_stepperWidth);
+        if (DrawButton(styles, new Rect(x, row.y, stepperWidth, row.height), _stepDownText, styles.Button, canEdit))
+        {
+            model.StepAmount(-1);
+            WriteAmount(log, model, "step_down", null);
+        }
+
+        x += stepperWidth + gap;
+        Rect field = new(x, row.y, styles.Px(_amountFieldWidth), row.height);
+        if (canEdit)
+        {
+            GUI.SetNextControlName(_amountControl);
+            string typed = GUI.TextField(field, model.AmountDisplay, _amountMaxLength, styles.TextField);
+            if (!string.Equals(typed, model.AmountDisplay, StringComparison.Ordinal))
+            {
+                SetAmountText(log, model, typed);
+            }
+        }
+        else
+        {
+            GUI.Label(field, model.AmountDisplay, styles.ButtonDisabled);
+        }
+
+        _isAmountFocused = canEdit && GUI.GetNameOfFocusedControl() == _amountControl;
+        x += field.width + gap;
+        if (DrawButton(styles, new Rect(x, row.y, stepperWidth, row.height), _stepUpText, styles.Button, canEdit))
+        {
+            model.StepAmount(1);
+            WriteAmount(log, model, "step_up", null);
+        }
+
+        x += stepperWidth + gap;
+        float allWidth = styles.Px(_allButtonWidth);
+        // Selecting the same row again is the model's reset to its All default, which then follows Fits on a refresh.
+        if (DrawButton(styles, new Rect(x, row.y, allWidth, row.height), _allText, styles.Button, canEdit)
+            && model.SelectedRow is ShelfRow selected && model.SelectRow(selected.Shelf.Key))
+        {
+            WriteAmount(log, model, "all", null);
+        }
+
+        x += allWidth + gap;
+        if (_stepText is not null)
+        {
+            GUI.Label(new Rect(x, row.y, Math.Max(0f, row.xMax - x), row.height), _stepText, styles.Small);
+        }
+    }
+
+    [HideFromIl2Cpp]
+    private void SetAmountText(IModLog log, OverlayModel model, string typed)
+    {
+        model.SetAmountText(typed);
+        // The field already shows the clamped number (crit 2); the note says why it changed under the player's fingers.
+        if (model.Amount > 0 && int.TryParse(typed.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out int number)
+            && number > model.Amount)
+        {
+            ShowNote(_clampedText, NoteTone.Warn, _clampedNoteSeconds);
+        }
+
+        WriteAmount(log, model, "type", typed);
+    }
+
+    [HideFromIl2Cpp]
+    private static void WriteAmount(IModLog log, OverlayModel model, string source, string? typed) =>
+        log.Write(LogLevel.Info, _logEvent, new KeyValuePair<string, object?>[]
+        {
+            new("state", "amount"),
+            new("source", source),
+            new("typed", typed),
+            new("amount", model.Amount),
+            new("shown", model.AmountDisplay),
+            new("confirm", model.ConfirmEnabled),
+            new("reason", model.ConfirmDisabledReason),
+        });
+
+    // A disabled control is drawn as a label: no hover, no focus stop, no click (design: Buttons, disabled).
+    [HideFromIl2Cpp]
+    private static bool DrawButton(OverlayStyles styles, Rect rect, string text, GUIStyle style, bool isEnabled)
+    {
+        if (!isEnabled)
+        {
+            GUI.Label(rect, text, styles.ButtonDisabled);
+            return false;
+        }
+
+        return GUI.Button(rect, text, style);
+    }
+
+    // Status, progress line, gap, bar, gap, the disabled Confirm (crit 7) and its reason.
+    [HideFromIl2Cpp]
+    private static float GetRunningHeight(OverlayStyles styles) =>
+        (2f * styles.BodyLineHeight) + (2f * styles.Px(OverlayStyles.Space2)) + styles.Px(OverlayStyles.ProgressHeight)
+        + styles.Px(OverlayStyles.ControlHeight) + styles.SmallLineHeight;
+
+    // Minimal running state; the Stop button (card 25) and the result panel (card 24) build on it.
+    [HideFromIl2Cpp]
+    private void DrawRunning(OverlayModel model, OverlayStyles styles, float x, float y, float width)
+    {
+        float gap = styles.Px(OverlayStyles.Space2);
+        GUI.Label(new Rect(x, y, width, styles.BodyLineHeight), model.StatusText, styles.Body);
+        y += styles.BodyLineHeight;
+        GUI.Label(new Rect(x, y, width, styles.BodyLineHeight), _progressText, styles.MutedBody);
+        y += styles.BodyLineHeight + gap;
+
+        // The numbers carry the progress; the bar is a second encoding of the same moved / planned.
+        float barHeight = styles.Px(OverlayStyles.ProgressHeight);
+        GUI.DrawTexture(new Rect(x, y, width, barHeight), styles.ProgressTrackTexture);
+        (int moved, int planned) = _progress;
+        if (planned > 0 && moved > 0)
+        {
+            GUI.DrawTexture(new Rect(x, y, width * Math.Min(moved, planned) / planned, barHeight), styles.AccentTexture);
+        }
+
+        y += barHeight + gap;
+        float controlHeight = styles.Px(OverlayStyles.ControlHeight);
+        DrawButton(styles, new Rect(x, y, styles.Px(_actionButtonWidth), controlHeight), _confirmText, styles.ButtonPrimary,
+            isEnabled: false);
+        y += controlHeight;
+        GUI.Label(new Rect(x, y, width, styles.SmallLineHeight), model.ConfirmDisabledReason, styles.Small);
+    }
+
+    [HideFromIl2Cpp]
+    private float DrawResult(OverlayModel model, OverlayStyles styles, float x, float y, float width)
+    {
+        // AutoClose is set for Completed only, so it tells a full move from an early stop without re-deriving the reason.
+        GUI.Label(new Rect(x, y, width, styles.TitleLineHeight), model.AutoClose ? _doneText : _stoppedText,
+            model.AutoClose ? styles.TitleSuccess : styles.TitleWarn);
+        y += styles.TitleLineHeight;
+        string text = model.ResultText ?? string.Empty;
+        float height = GetResultHeight(styles, text, width);
+        GUI.Label(new Rect(x, y, width, height), text, styles.BodyWrap);
+        return y + height;
+    }
+
+    // Measured once per result text and style set, not per OnGUI call.
+    [HideFromIl2Cpp]
+    private float GetResultHeight(OverlayStyles styles, string text, float width)
+    {
+        if (!ReferenceEquals(_resultHeightStyles, styles) || !string.Equals(_resultHeightText, text, StringComparison.Ordinal))
+        {
+            _resultHeight = Math.Max(styles.BodyWrap.CalcHeight(new GUIContent(text), width), styles.BodyLineHeight);
+            _resultHeightText = text;
+            _resultHeightStyles = styles;
+        }
+
+        return _resultHeight;
+    }
+
+    [HideFromIl2Cpp]
+    private void DrawFooter(OverlayModel model, OverlayStyles styles, Rect area)
     {
         if (_note is not null && Time.unscaledTime >= _noteUntil)
         {
@@ -829,13 +1229,28 @@ public sealed class OverlayUi : MonoBehaviour
 
         if (_note is not null)
         {
-            GUI.Label(area, _note, _isNoteError ? styles.SmallError : styles.SmallSuccess);
+            GUIStyle noteStyle = _noteTone switch
+            {
+                NoteTone.Warn => styles.SmallWarn,
+                NoteTone.Error => styles.SmallError,
+                _ => styles.SmallSuccess,
+            };
+            GUI.Label(area, _note, noteStyle);
         }
         else
         {
-            GUI.Label(area, _editKey is null ? _hintText : _editHintText, styles.Small);
+            GUI.Label(area, GetHint(model), styles.Small);
         }
     }
+
+    [HideFromIl2Cpp]
+    private string GetHint(OverlayModel model) => model.State switch
+    {
+        OverlayState.Running => model.TransferUnit > 1 ? _runningChunkHintText : _runningHintText,
+        OverlayState.Result => _resultHintText,
+        _ when _editKey is not null => _editHintText,
+        _ => model.SelectedRow is null ? _hintText : _amountHintText,
+    };
 
     [HideFromIl2Cpp]
     private static void DrawPanel(OverlayStyles styles, Rect panel)
