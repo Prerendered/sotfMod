@@ -20,6 +20,8 @@ public sealed class OverlayStyles
     public const int RowHeight = 34;
     public const int GroupHeaderHeight = 32;
     public const int ChipHeight = 28;
+    public const int ControlHeight = 36;
+    public const int ProgressHeight = 10;
     public const int SelectedBarWidth = 3;
     public const int PanelWidth = 520;
     public const float PanelMaxHeightFraction = 0.7f;
@@ -49,9 +51,13 @@ public sealed class OverlayStyles
     public static readonly Color Muted = Rgb(0xA9ADB1);
     public static readonly Color Disabled = Rgb(0x959A9F);
     public static readonly Color Primary = Rgb(0x6D4FD6);
+    public static readonly Color PrimaryHover = Rgb(0x7A5CE0);
+    public static readonly Color PrimaryDisabledFill = Rgb(0x2E3236);
+    public static readonly Color OnPrimary = Rgb(0xFFFFFF);
     public static readonly Color Accent = Rgb(0xB79CFF);
     public static readonly Color ErrorText = Rgb(0xFF8A80);
     public static readonly Color SuccessText = Rgb(0x7FD18B);
+    public static readonly Color WarnText = Rgb(0xE8B14A);
     public static readonly Color Border = Rgb(0x7D838A);
     public static readonly Color Divider = Rgb(0x3F444A);
 
@@ -73,6 +79,7 @@ public sealed class OverlayStyles
         RowHoverTexture = BuildTexture(RowHover);
         RowSelectedTexture = BuildTexture(RowSelected);
         AccentTexture = BuildTexture(Accent);
+        ProgressTrackTexture = BuildTexture(SurfaceRaised);
 
         Title = BuildLabel(skin, _titleFontSize, Foreground);
         Title.fontStyle = FontStyle.Bold;
@@ -94,12 +101,22 @@ public sealed class OverlayStyles
         SmallOnAccentRight.alignment = TextAnchor.MiddleRight;
         SmallSuccess = BuildLabel(skin, _smallFontSize, SuccessText);
         SmallError = BuildLabel(skin, _smallFontSize, ErrorText);
+        SmallWarn = BuildLabel(skin, _smallFontSize, WarnText);
+        BodyWrap = BuildLabel(skin, _bodyFontSize, Foreground);
+        BodyWrap.wordWrap = true;
+        BodyWrap.alignment = TextAnchor.UpperLeft;
+        TitleSuccess = BuildLabel(skin, _titleFontSize, SuccessText);
+        TitleSuccess.fontStyle = FontStyle.Bold;
+        TitleWarn = BuildLabel(skin, _titleFontSize, WarnText);
+        TitleWarn.fontStyle = FontStyle.Bold;
         Link = BuildLink(skin, Accent, Foreground);
         LinkOnAccent = BuildLink(skin, ForegroundDimOnAccent, ForegroundOnAccent);
         RowHit = new GUIStyle();
 
-        Button = BuildButton(skin, SurfaceRaised, RowHover, Foreground);
-        ChipSelected = BuildButton(skin, Primary, Primary, ForegroundOnAccent);
+        Button = BuildButton(skin, SurfaceRaised, RowHover, Foreground, Border);
+        ButtonPrimary = BuildButton(skin, Primary, PrimaryHover, OnPrimary, Primary);
+        ButtonDisabled = BuildButton(skin, PrimaryDisabledFill, PrimaryDisabledFill, Disabled, Divider);
+        ChipSelected = BuildButton(skin, Primary, Primary, ForegroundOnAccent, Border);
         TextField = BuildTextField(skin);
     }
 
@@ -120,6 +137,8 @@ public sealed class OverlayStyles
     public Texture2D RowSelectedTexture { get; }
 
     public Texture2D AccentTexture { get; }
+
+    public Texture2D ProgressTrackTexture { get; }
 
     public GUIStyle Title { get; }
 
@@ -148,6 +167,15 @@ public sealed class OverlayStyles
 
     public GUIStyle SmallError { get; }
 
+    public GUIStyle SmallWarn { get; }
+
+    /// <summary>Body text that wraps, top-aligned: the result line.</summary>
+    public GUIStyle BodyWrap { get; }
+
+    public GUIStyle TitleSuccess { get; }
+
+    public GUIStyle TitleWarn { get; }
+
     /// <summary>Text-only button (rename / group links), brighter on hover.</summary>
     public GUIStyle Link { get; }
 
@@ -158,6 +186,12 @@ public sealed class OverlayStyles
 
     /// <summary>Secondary button: SurfaceRaised fill with a 1 px Border edge, RowHover on hover.</summary>
     public GUIStyle Button { get; }
+
+    /// <summary>Confirm: Primary fill, PrimaryHover on hover, white text.</summary>
+    public GUIStyle ButtonPrimary { get; }
+
+    /// <summary>Drawn with GUI.Label for a disabled control, so it shows no hover and takes no click.</summary>
+    public GUIStyle ButtonDisabled { get; }
 
     /// <summary>The picked group chip in the inline group edit: Primary fill.</summary>
     public GUIStyle ChipSelected { get; }
@@ -206,14 +240,14 @@ public sealed class OverlayStyles
         return style;
     }
 
-    private GUIStyle BuildButton(GUISkin skin, Color fill, Color hoverFill, Color text)
+    private GUIStyle BuildButton(GUISkin skin, Color fill, Color hoverFill, Color text, Color edge)
     {
         GUIStyle style = new(skin.button) { fontSize = ScaleFont(_bodyFontSize), alignment = TextAnchor.MiddleCenter };
         // One px frame in a 3x3 texture; border 1 keeps the edge 1 px at any size (9-slice).
         style.border = new RectOffset(1, 1, 1, 1);
-        SetState(style.normal, BuildFramedTexture(fill, Border), text);
-        SetState(style.hover, BuildFramedTexture(hoverFill, Border), text);
-        SetState(style.active, BuildFramedTexture(Darken(fill), Border), text);
+        SetState(style.normal, BuildFramedTexture(fill, edge), text);
+        SetState(style.hover, BuildFramedTexture(hoverFill, edge), text);
+        SetState(style.active, BuildFramedTexture(Darken(fill), edge), text);
         SetState(style.focused, style.normal.background, text);
         return style;
     }

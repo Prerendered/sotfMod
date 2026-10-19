@@ -1,5 +1,6 @@
 // purpose: the `transfer` command (debug console and the transfer prompt): list target shelves by index and label, start
-//          a transfer of the aimed item to an index or a label, cancel it
+//          a transfer of the aimed item to an index or a label, cancel it; also the overlay's start path (StartCaptured), so
+//          both UIs reach the one TransferDriver the same way
 // owns:    TransferCommand
 // deps:    TransferDriver, AimWatcher, ShelfRegistry, IShelfGateway, ShelfTargetScan, ShelfListBuilder, TargetQuery,
 //          StopReasonText, IModLog,
@@ -42,6 +43,13 @@ public sealed class TransferCommand : MonoBehaviour
     private const string _cancelArgument = "cancel";
     private const string _usage = "Usage: transfer list | transfer <count> <index or label> | transfer cancel";
     private const string _failedText = "transfer failed, see the mod log";
+
+    // The overlay has no typed line; this stands in for `args=` so its refusals are told apart from the prompt's.
+    private const string _overlayArguments = "overlay";
+    private const string _busyDetail = "busy";
+    private const string _aimLostDetail = "aim lost";
+    private const string _targetIsSourceDetail = "target is the source";
+    private const string _driverNotReadyDetail = "driver not ready";
 
     // The console can drop dynamic commands (ClearDynamicCommands); a cheap lookup once a second re-adds ours.
     private const double _registerCheckSeconds = 1.0;
@@ -127,9 +135,74 @@ public sealed class TransferCommand : MonoBehaviour
     public bool RunCaptured(string arguments, List<string> output, Action<string> onFinished) =>
         Run(arguments, _capturedAim, TrackCaptured, output, onFinished);
 
+    /// <summary>
+    /// Starts the overlay's request on the CaptureAim slot through the same driver as a typed command (I2: one runner
+    /// path). A refusal is logged as the typed path logs it and passed to <paramref name="onFinished"/> at once as a
+    /// BlockedBeforeStart report, so the caller learns every outcome in one place. True when a transfer started.
+    /// </summary>
+    [HideFromIl2Cpp]
+    public bool StartCaptured(TransferRequest request, Action<TransferReport> onFinished)
+    {
+        if (_log is null || _gateway is null || _driver is null)
+        {
+            throw new InvalidOperationException("TransferCommand.Init has not run");
+        }
+
+        AimTarget? aim = _capturedAim;
+        string? detail = RefuseIfBusy() ? _busyDetail
+            : aim is null || aim.Shelf.Key != request.Source.Key ? _aimLostDetail
+            : request.Target.Key == request.Source.Key ? _targetIsSourceDetail
+            : !TrackCaptured() ? _aimLostDetail
+            : null;
+        if (detail is null && _driver.TryStart(request, onFinished))
+        {
+            _runningText = $"Moving up to {request.Amount} of item {request.Item.Value} to {GetShelfName(request.Target)}...";
+            return true;
+        }
+
+        detail ??= _driverNotReadyDetail;
+        // One read, so the transfer.stop line and the report cannot disagree.
+        int remaining = _gateway.GetCount(request.Source, request.Item);
+        if (detail != _busyDetail)
+        {
+            WriteBlocked(_log, remaining, detail, _overlayArguments);
+        }
+
+        onFinished(new TransferReport(StopReason.BlockedBeforeStart, 0, 0, remaining, 0, detail));
+        return false;
+    }
+
+    /// <summary>
+    /// The overlay's busy refusal, the only place it is logged: when a run is active (from any UI) writes the prompt's
+    /// busy transfer.request line with args="overlay" and returns true. Call once per Confirm attempt, never per frame.
+    /// </summary>
+    public bool RefuseIfBusy()
+    {
+        if (_log is null || _driver is null)
+        {
+            throw new InvalidOperationException("TransferCommand.Init has not run");
+        }
+
+        if (!_driver.IsRunning)
+        {
+            return false;
+        }
+
+        WriteBusy(_log, _overlayArguments);
+        return true;
+    }
+
+    /// <summary>Honoured after the in-flight item or chunk is stored (D7); false when nothing runs.</summary>
+    public bool RequestCancel() => _driver is not null && _driver.RequestCancel();
+
     /// <summary>The running transfer's start line, or null when none runs.</summary>
     [HideFromIl2Cpp]
     public string? GetRunningText() => IsRunning ? _runningText : null;
+
+    /// <summary>The running transfer's items moved and planned (0 until it has planned); null when none runs.</summary>
+    [HideFromIl2Cpp]
+    public (int Moved, int Planned)? GetProgress() =>
+        _driver is not null && _driver.IsRunning ? (_driver.Moved, _driver.Planned) : null;
 
     public void Update()
     {
@@ -319,12 +392,7 @@ public sealed class TransferCommand : MonoBehaviour
     {
         if (driver.IsRunning)
         {
-            log.Write(LogLevel.Warn, "transfer.request", new KeyValuePair<string, object?>[]
-            {
-                new("outcome", "refused"),
-                new("reason", "busy"),
-                new("args", arguments),
-            });
+            WriteBusy(log, arguments);
             output.Add("A transfer is already running; wait for it or type: transfer cancel");
             return false;
         }
@@ -355,14 +423,14 @@ public sealed class TransferCommand : MonoBehaviour
         ShelfRef target = _indexedTargets[index - 1].Shelf;
         if (target.Key == aim.Shelf.Key)
         {
-            output.Add(Block(log, gateway, aim, "target is the source", arguments, "That index is the shelf you are aiming at."));
+            output.Add(Block(log, gateway, aim, _targetIsSourceDetail, arguments, "That index is the shelf you are aiming at."));
             return false;
         }
 
         // A list rescans and can map a duplicate key to the other twin; the source must be the looked-at shelf.
         if (!trackSource())
         {
-            output.Add(Block(log, gateway, aim, "aim lost", arguments,
+            output.Add(Block(log, gateway, aim, _aimLostDetail, arguments,
                 "Could not confirm the aimed shelf; aim at the slot and try again."));
             return false;
         }
@@ -380,7 +448,7 @@ public sealed class TransferCommand : MonoBehaviour
         TransferRequest request = new(aim.Shelf, aim.Slot, target, aim.Item, amount);
         if (!driver.TryStart(request, report => onFinished(StopReasonText.Format(report).Text)))
         {
-            output.Add(Block(log, gateway, aim, "driver not ready", arguments, "Transfer could not start, see the mod log."));
+            output.Add(Block(log, gateway, aim, _driverNotReadyDetail, arguments, "Transfer could not start, see the mod log."));
             return false;
         }
 
@@ -465,13 +533,27 @@ public sealed class TransferCommand : MonoBehaviour
         return withGroup && !string.IsNullOrWhiteSpace(stored.Group) ? $"{name} [{stored.Group}]" : name;
     }
 
+    [HideFromIl2Cpp]
+    private static void WriteBusy(IModLog log, string arguments) =>
+        log.Write(LogLevel.Warn, "transfer.request", new KeyValuePair<string, object?>[]
+        {
+            new("outcome", "refused"),
+            new("reason", _busyDetail),
+            new("args", arguments),
+        });
+
     // Mirrors the runner's own transfer.stop fields, so a refused command reads the same in the log as a refused plan.
     // Returns the player-facing message.
     [HideFromIl2Cpp]
     private static string Block(IModLog log, IShelfGateway gateway, AimTarget? aim, string detail, string arguments,
         string message)
     {
-        int? sourceCount = aim is null ? null : gateway.GetCount(aim.Shelf, aim.Item);
+        WriteBlocked(log, aim is null ? null : gateway.GetCount(aim.Shelf, aim.Item), detail, arguments);
+        return message;
+    }
+
+    [HideFromIl2Cpp]
+    private static void WriteBlocked(IModLog log, int? sourceCount, string detail, string arguments) =>
         log.Write(LogLevel.Info, "transfer.stop", new KeyValuePair<string, object?>[]
         {
             new("reason", StopReason.BlockedBeforeStart),
@@ -482,8 +564,6 @@ public sealed class TransferCommand : MonoBehaviour
             new("detail", detail),
             new("args", arguments),
         });
-        return message;
-    }
 
     // The prompt's counterpart of AimWatcher.TrackCurrent: the controller captured at open instead of a fresh ray.
     [HideFromIl2Cpp]

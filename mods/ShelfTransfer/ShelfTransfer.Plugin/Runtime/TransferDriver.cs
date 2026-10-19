@@ -31,6 +31,11 @@ public sealed class TransferDriver : MonoBehaviour
 
     public bool IsRunning => _runner is not null;
 
+    public int Moved => _runner?.Moved ?? 0;
+
+    /// <summary>The runner's clamped amount; 0 until it has planned (its first tick) or when nothing runs.</summary>
+    public int Planned => _runner?.Requested ?? 0;
+
     // Managed parameters cannot cross into Il2Cpp; hidden so ClassInjector does not try to expose it.
     [HideFromIl2Cpp]
     public void Init(IModLog log, ModConfig config, IShelfGateway gateway)
