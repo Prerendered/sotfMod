@@ -2,8 +2,8 @@
 //          source slot (item, count, shelf) and a read-only target list; Esc closes it with nothing moved
 // owns:    OverlayUi
 // deps:    OverlayModel, ShelfListBuilder, IShelfGateway (reads only), TransferCommand (CaptureAim, ReleaseAim,
-//          IsCapturedShelfGone, GetShelfName), LabelsFeature (Store, SaveNow), InputBlocker, OverlayStyles, ModConfig
-//          (TransferKey), IModLog, UnityEngine IMGUI
+//          IsCapturedShelfGone, GetShelfName), LabelsFeature (Store, SaveNow), LabelPruneGuard, InputBlocker,
+//          OverlayStyles, ModConfig (TransferKey), IModLog, UnityEngine IMGUI
 // caution: I1/I2 - no Confirm path yet: never calls TakeOne/StoreOne or the driver. Esc goes through OverlayModel.Escape;
 //          this class renders the model and forwards input. Update and OnGUI are P2 boundaries: a throw logs
 //          error event=ui.overlay, gives input back at once and halts the overlay for the session
@@ -34,6 +34,7 @@ public sealed class OverlayUi : MonoBehaviour
 {
     private const string _inputBlockName = "ShelfTransfer.OverlayInput";
     private const string _logEvent = "ui.overlay";
+    private const string _pruneLogEvent = "labels.prune";
 
     private const int _closeButtonWidth = 56;
     private const int _rowIndent = 16;
@@ -58,6 +59,7 @@ public sealed class OverlayUi : MonoBehaviour
     private bool _isHalted;
 
     private readonly InputBlocker _inputBlocker = new(_inputBlockName, _logEvent);
+    private readonly LabelPruneGuard _pruneGuard = new();
 
     // Built once at open: the list cannot change while this card's overlay is open, so no text is formatted per frame.
     private readonly List<(bool IsHeader, bool IsDimmed, string Label, string Distance, string Bearing, string Fit)> _lines = new();
@@ -65,6 +67,8 @@ public sealed class OverlayUi : MonoBehaviour
     private OverlayModel? _model;
     private string _itemText = string.Empty;
     private string? _unitText;
+    private float _itemWidth;
+    private OverlayStyles? _itemWidthStyles;
     private string _shelfText = string.Empty;
     private Vector2 _listScroll;
 
@@ -183,13 +187,14 @@ public sealed class OverlayUi : MonoBehaviour
         Vector3 player = camera.transform.position;
         ShelfList list = BuildTargetList(gateway, shelves, aim, sourceCount, unit,
             new WorldPosition(player.x, player.y, player.z), store?.Entries ?? _noLabels);
-        int pruned = PruneLabels(store, shelves, aim, list);
+        LabelPruneResult? prune = PruneLabels(log, store, shelves, aim);
 
         OverlayModel model = new(aim, unit);
         model.OnShelfList(list);
         BuildLines(model);
         _itemText = string.Format(CultureInfo.InvariantCulture, "Item {0} x {1}", aim.Item.Value, aim.Count);
         _unitText = unit > 1 ? string.Format(CultureInfo.InvariantCulture, "(moves in {0}s)", unit) : null;
+        _itemWidthStyles = null;
         _shelfText = "From " + command.GetShelfName(aim.Shelf);
         _listScroll = Vector2.zero;
         _model = model;
@@ -205,7 +210,9 @@ public sealed class OverlayUi : MonoBehaviour
             new("unit", unit),
             new("key", key.ToString()),
             new("targets", list.Groups.Sum(group => group.Rows.Count)),
-            new("pruned", pruned),
+            new("pruned", prune?.Pruned.Count ?? 0),
+            new("prune", FormatPruneOutcome(prune?.Outcome)),
+            new("prune_pending", prune?.Pending ?? 0),
         });
     }
 
@@ -227,26 +234,45 @@ public sealed class OverlayUi : MonoBehaviour
         return ShelfListBuilder.Build(candidates, aim.Shelf.Key, sourceCount, player, labels, unit);
     }
 
-    // §07 prune on open. An empty listing would make every label look stale and the save would make that permanent
-    // (card 21 guard), so nothing is pruned unless the registry found at least one shelf.
+    // §07 prune on open. LabelPruneGuard decides (two consecutive scans, never the shared unknown file); each pruned
+    // entry is logged in full first so the User can restore it by hand from the log.
     [HideFromIl2Cpp]
-    private static int PruneLabels(LabelStore? store, IReadOnlyList<ShelfRef> shelves, AimTarget aim, ShelfList list)
+    private LabelPruneResult? PruneLabels(IModLog log, LabelStore? store, IReadOnlyList<ShelfRef> shelves, AimTarget aim)
     {
-        if (store is null || shelves.Count == 0 || list.StaleLabelKeys.Count == 0)
+        if (store is null)
         {
-            return 0;
+            return null;
         }
 
-        List<string> liveKeys = shelves.Select(shelf => shelf.Key).Append(aim.Shelf.Key).ToList();
-        int pruned = store.Prune(liveKeys).Count;
-        if (pruned > 0)
+        LabelPruneResult result = _pruneGuard.Prune(store, shelves.Select(shelf => shelf.Key).ToList(), aim.Shelf.Key);
+        foreach (PrunedLabel entry in result.Pruned)
+        {
+            log.Write(LogLevel.Info, _pruneLogEvent, new KeyValuePair<string, object?>[]
+            {
+                new("world", store.SanitisedWorldId),
+                new("shelf", entry.Key),
+                new("label", entry.Label.Label),
+                new("group", entry.Label.Group),
+            });
+        }
+
+        if (result.Pruned.Count > 0)
         {
             // Logs labels.write (JsonLabelFileSystem, or LabelsFeature when blocked).
             LabelsFeature.SaveNow();
         }
 
-        return pruned;
+        return result;
     }
+
+    [HideFromIl2Cpp]
+    private static string FormatPruneOutcome(LabelPruneOutcome? outcome) => outcome switch
+    {
+        LabelPruneOutcome.Checked => "checked",
+        LabelPruneOutcome.SkippedUnknownWorld => "skipped_unknown_world",
+        LabelPruneOutcome.SkippedNoShelves => "skipped_no_shelves",
+        _ => "no_store",
+    };
 
     [HideFromIl2Cpp]
     private void BuildLines(OverlayModel model)
@@ -329,6 +355,15 @@ public sealed class OverlayUi : MonoBehaviour
     {
         _isHalted = true;
         log.WriteException(_logEvent, ex);
+        if (_model is not null)
+        {
+            log.Write(LogLevel.Info, _logEvent, new KeyValuePair<string, object?>[]
+            {
+                new("state", "close"),
+                new("reason", "error"),
+            });
+        }
+
         ResetOverlay();
         _inputBlocker.ReleaseNow();
     }
@@ -401,7 +436,14 @@ public sealed class OverlayUi : MonoBehaviour
         GUI.Label(new Rect(x, y, width, styles.TitleLineHeight), _itemText, styles.Title);
         if (_unitText is not null)
         {
-            float itemWidth = styles.Title.CalcSize(new GUIContent(_itemText)).x + styles.Px(OverlayStyles.Space2);
+            // Measured once per open (and per style rebuild), not in TryOpen: the styles need GUI.skin, valid only in OnGUI.
+            if (!ReferenceEquals(_itemWidthStyles, styles))
+            {
+                _itemWidth = styles.Title.CalcSize(new GUIContent(_itemText)).x;
+                _itemWidthStyles = styles;
+            }
+
+            float itemWidth = _itemWidth + styles.Px(OverlayStyles.Space2);
             GUI.Label(new Rect(x + itemWidth, y, Math.Max(0f, width - itemWidth), styles.TitleLineHeight), _unitText,
                 styles.MutedBody);
         }
