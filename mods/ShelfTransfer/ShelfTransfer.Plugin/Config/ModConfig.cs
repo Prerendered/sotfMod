@@ -1,11 +1,13 @@
 // purpose: every BepInEx config entry the mod reads, bound once into BepInEx/config/<guid>.cfg (P5)
 // owns:    ModConfig
-// deps:    BepInEx ConfigFile, UnityEngine.KeyCode (interop)
+// deps:    BepInEx ConfigFile, UnityEngine.KeyCode (interop), LabelPruneMode
 // caution: read entries through .Value each time, never cache, so .cfg edits apply live
 
 using BepInEx.Configuration;
 
 using UnityEngine;
+
+using ShelfTransfer.Core.Labels;
 
 namespace ShelfTransfer.Plugin.Config;
 
@@ -13,6 +15,7 @@ public sealed class ModConfig
 {
     private const string _keysSection = "Keys";
     private const string _transferSection = "Transfer";
+    private const string _labelsSection = "Labels";
     private const string _debugSection = "Debug";
 
     private const int _itemsPerFrameDefault = 1;
@@ -47,6 +50,12 @@ public sealed class ModConfig
             + "transfer stops. Single-player and hosted games confirm at once; 0 never waits.",
             new AcceptableValueRange<int>(_confirmTicksMin, _confirmTicksMax)));
 
+        // DryRun until card 82 shows the shelf scan finds every shelf: it missed real shelves and pruned their labels.
+        PruneMode = file.Bind(_labelsSection, "PruneMode", LabelPruneMode.DryRun,
+            "What the transfer overlay does with labels of shelves it could not find on two opens in a row. DryRun only "
+            + "logs them (labels.prune_candidate) and changes nothing. Archive moves labels of shelves not found twice "
+            + "into <world>.pruned.json; leave on DryRun until card 82.");
+
         DiscoveryEnabled = file.Bind(_debugSection, "DiscoveryEnabled", false,
             "Enables the Discovery key. Debug aid for finding game storage types; leave off for normal play.");
         // Upper bound is only there so AcceptableValueRange can reject negatives.
@@ -66,6 +75,8 @@ public sealed class ModConfig
     public ConfigEntry<int> ItemsPerFrame { get; }
 
     public ConfigEntry<int> ConfirmTicks { get; }
+
+    public ConfigEntry<LabelPruneMode> PruneMode { get; }
 
     public ConfigEntry<bool> DiscoveryEnabled { get; }
 

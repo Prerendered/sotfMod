@@ -3,7 +3,7 @@
 // owns:    OverlayUi
 // deps:    OverlayModel, ShelfListBuilder, IShelfGateway (reads only), TransferCommand (CaptureAim, ReleaseAim,
 //          IsCapturedShelfGone, GetShelfName), LabelsFeature (Store, SaveNow), LabelPruneGuard, InputBlocker,
-//          OverlayStyles, ModConfig (TransferKey), IModLog, UnityEngine IMGUI
+//          OverlayStyles, ModConfig (TransferKey, PruneMode), IModLog, UnityEngine IMGUI
 // caution: I1/I2 - no Confirm path yet: never calls TakeOne/StoreOne or the driver. Esc goes through OverlayModel.Escape;
 //          this class renders the model and forwards input. Update and OnGUI are P2 boundaries: a throw logs
 //          error event=ui.overlay, gives input back at once and halts the overlay for the session
@@ -35,6 +35,7 @@ public sealed class OverlayUi : MonoBehaviour
     private const string _inputBlockName = "ShelfTransfer.OverlayInput";
     private const string _logEvent = "ui.overlay";
     private const string _pruneLogEvent = "labels.prune";
+    private const string _pruneCandidateLogEvent = "labels.prune_candidate";
 
     private const int _closeButtonWidth = 56;
     private const int _rowIndent = 16;
@@ -59,7 +60,7 @@ public sealed class OverlayUi : MonoBehaviour
     private bool _isHalted;
 
     private readonly InputBlocker _inputBlocker = new(_inputBlockName, _logEvent);
-    private readonly LabelPruneGuard _pruneGuard = new();
+    private LabelPruneGuard? _pruneGuard;
 
     // Built once at open: the list cannot change while this card's overlay is open, so no text is formatted per frame.
     private readonly List<(bool IsHeader, bool IsDimmed, string Label, string Distance, string Bearing, string Fit)> _lines = new();
@@ -134,7 +135,7 @@ public sealed class OverlayUi : MonoBehaviour
             KeyCode key = config.TransferKey.Value;
             if (key != KeyCode.None && !InputBlocker.IsAnyHeld && Input.GetKeyDown(key))
             {
-                TryOpen(log, command, gateway, listShelves, key);
+                TryOpen(log, command, gateway, listShelves, key, config.PruneMode.Value);
             }
 
             return;
@@ -153,7 +154,7 @@ public sealed class OverlayUi : MonoBehaviour
 
     [HideFromIl2Cpp]
     private void TryOpen(IModLog log, TransferCommand command, IShelfGateway gateway,
-        Func<IReadOnlyList<ShelfRef>> listShelves, KeyCode key)
+        Func<IReadOnlyList<ShelfRef>> listShelves, KeyCode key, LabelPruneMode pruneMode)
     {
         Camera camera = Camera.main;
         if (camera == null)
@@ -187,7 +188,7 @@ public sealed class OverlayUi : MonoBehaviour
         Vector3 player = camera.transform.position;
         ShelfList list = BuildTargetList(gateway, shelves, aim, sourceCount, unit,
             new WorldPosition(player.x, player.y, player.z), store?.Entries ?? _noLabels);
-        (string Outcome, int Pruned, int Pending) prune = PruneLabels(log, store, shelves, aim);
+        (string Outcome, int Pruned, int Pending, int Candidates) prune = PruneLabels(log, store, shelves, aim, pruneMode);
 
         OverlayModel model = new(aim, unit);
         model.OnShelfList(list);
@@ -213,6 +214,7 @@ public sealed class OverlayUi : MonoBehaviour
             new("pruned", prune.Pruned),
             new("prune", prune.Outcome),
             new("prune_pending", prune.Pending),
+            new("prune_candidates", prune.Candidates),
         });
     }
 
@@ -234,19 +236,42 @@ public sealed class OverlayUi : MonoBehaviour
         return ShelfListBuilder.Build(candidates, aim.Shelf.Key, sourceCount, player, labels, unit);
     }
 
-    // §07 prune on open. LabelPruneGuard decides (two consecutive scans, never the shared unknown file) and archives
-    // each entry to <world>.pruned.json before removing it; a failed save puts them back (I5: a prune never loses data).
+    // §07 prune on open. LabelPruneGuard decides (two consecutive scans, never the shared unknown file). DryRun (the
+    // default until card 82: the registry missed real shelves) only logs each due key once; Archive moves each entry to
+    // <world>.pruned.json before removing it and a failed save puts them back (I5: a prune never loses data).
     [HideFromIl2Cpp]
-    private (string Outcome, int Pruned, int Pending) PruneLabels(
-        IModLog log, LabelStore? store, IReadOnlyList<ShelfRef> shelves, AimTarget aim)
+    private (string Outcome, int Pruned, int Pending, int Candidates) PruneLabels(
+        IModLog log, LabelStore? store, IReadOnlyList<ShelfRef> shelves, AimTarget aim, LabelPruneMode mode)
     {
         if (store is null)
         {
-            return ("no_store", 0, 0);
+            return ("no_store", 0, 0, 0);
+        }
+
+        // A .cfg mode change starts the two-open run over rather than carrying dry-run sightings into a real prune.
+        if (_pruneGuard is null || _pruneGuard.Mode != mode)
+        {
+            _pruneGuard = new LabelPruneGuard(mode);
         }
 
         string world = store.SanitisedWorldId;
         LabelPruneResult result = _pruneGuard.Prune(store, shelves.Select(shelf => shelf.Key).ToList(), aim.Shelf.Key);
+        if (result.Outcome == LabelPruneOutcome.DryRun)
+        {
+            foreach (PrunedLabel entry in result.NewCandidates)
+            {
+                log.Write(LogLevel.Info, _pruneCandidateLogEvent, new KeyValuePair<string, object?>[]
+                {
+                    new("world", world),
+                    new("shelf", entry.Key),
+                    new("label", entry.Label.Label),
+                    new("group", entry.Label.Group),
+                });
+            }
+
+            return (FormatPruneOutcome(result.Outcome), 0, result.Pending, result.Candidates);
+        }
+
         if (result.Outcome == LabelPruneOutcome.ArchiveFailed)
         {
             string outcome = FormatPruneOutcome(result.Outcome);
@@ -257,7 +282,7 @@ public sealed class OverlayUi : MonoBehaviour
                 new("pending", result.Pending),
                 new("detail", result.Detail),
             });
-            return (outcome, 0, result.Pending);
+            return (outcome, 0, result.Pending, result.Candidates);
         }
 
         foreach (PrunedLabel entry in result.Pruned)
@@ -284,16 +309,17 @@ public sealed class OverlayUi : MonoBehaviour
                 new("restored", result.Pruned.Count),
                 new("detail", saved.Detail),
             });
-            return ("save_failed", 0, result.Pending);
+            return ("save_failed", 0, result.Pending, result.Candidates);
         }
 
-        return (FormatPruneOutcome(result.Outcome), result.Pruned.Count, result.Pending);
+        return (FormatPruneOutcome(result.Outcome), result.Pruned.Count, result.Pending, result.Candidates);
     }
 
     [HideFromIl2Cpp]
     private static string FormatPruneOutcome(LabelPruneOutcome outcome) => outcome switch
     {
         LabelPruneOutcome.Checked => "checked",
+        LabelPruneOutcome.DryRun => "dry_run",
         LabelPruneOutcome.SkippedUnknownWorld => "skipped_unknown_world",
         LabelPruneOutcome.SkippedNoShelves => "skipped_no_shelves",
         LabelPruneOutcome.ArchiveFailed => "archive_failed",
