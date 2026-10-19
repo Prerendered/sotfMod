@@ -1,10 +1,12 @@
 // purpose: pins the overlay amount in whole chunks (card 68, I4 amended): typed, default All, stepper and refresh, and its agreement with the runner's plan
 // owns:    OverlayModelChunkTests
-// deps:    OverlayModel, AimTarget, ShelfList, ShelfRow, TransferRunner, FakeShelfGateway
+// deps:    OverlayModel, AimTarget, ShelfList, ShelfListBuilder, ShelfRow, TransferRunner, FakeShelfGateway
 
 using System;
+using System.Collections.Generic;
 
 using ShelfTransfer.Core.Gateway;
+using ShelfTransfer.Core.Labels;
 using ShelfTransfer.Core.Shelves;
 using ShelfTransfer.Core.Tests.Fakes;
 using ShelfTransfer.Core.Transfer;
@@ -186,15 +188,33 @@ public sealed class OverlayModelChunkTests
 
     // Card 69 owns the should-fix: a source of 5 with a roomy target yields Fits = 5 (min(source, free)), which the 4-arg
     // clamp reads as "target cannot fit a chunk", while the runner says NothingToMove. The amount agrees (0); this pins
-    // the CURRENT text, which card 69 changes to NothingToMoveReason when it wires the overlay.
+    // the text card 69 made NothingToMoveReason.
     [Fact]
-    public void SelectRow_SourceUnderOneChunk_ShowsTargetFullTextUntilCard69()
+    public void SelectRow_SourceUnderOneChunk_ShowsNothingToMoveText()
     {
         OverlayModel model = Selected(sourceCount: 5, fits: 5);
 
         Assert.Equal(0, model.Amount);
         Assert.False(model.ConfirmEnabled);
-        Assert.Equal(OverlayModel.TargetFullReason, model.ConfirmDisabledReason);
+        Assert.Equal(OverlayModel.NothingToMoveReason, model.ConfirmDisabledReason);
+    }
+
+    // Criterion 2 end to end: the real builder gives every row Fits 0, so the none-selectable text must name the source.
+    [Theory]
+    [InlineData(5, 10, true, OverlayModel.NothingToMoveReason)]
+    [InlineData(5, 1, false, OverlayModel.NoTargetText)]
+    public void BuiltList_NoSelectableRow_StatusNamesTheCause(int sourceCount, int unit, bool canHold, string expected)
+    {
+        ShelfCandidate roomy = new(new ShelfRef("a", "StorageShelf", new WorldPosition(1f, 0f, 1f)), 100, canHold);
+        ShelfList list = ShelfListBuilder.Build(new[] { roomy }, _sourceShelf.Key, sourceCount,
+            new WorldPosition(0f, 0f, 0f), new Dictionary<string, ShelfLabel>(), unit);
+        OverlayModel model = new(new AimTarget(_sourceShelf, _slot, _item, sourceCount), unit);
+
+        model.OnShelfList(list);
+
+        Assert.False(model.SelectRow("a"));
+        Assert.Equal(expected, model.StatusText);
+        Assert.Equal(expected, model.ConfirmDisabledReason);
     }
 
     [Fact]
@@ -207,6 +227,20 @@ public sealed class OverlayModelChunkTests
 
         Assert.NotNull(request);
         Assert.Equal(50, request!.Amount);
+    }
+
+    [Theory]
+    [InlineData(10, "Stopping after the current chunk...")]
+    [InlineData(1, "Stopping after the current item...")]
+    public void Escape_WhileRunning_CancellingTextNamesTheChunkOnlyForChunkedItems(int unit, string expected)
+    {
+        OverlayModel model = Selected(sourceCount: 100, fits: 100, unit: unit);
+        model.SetAmountText(unit.ToString());
+        Assert.NotNull(model.Confirm());
+
+        model.Escape();
+
+        Assert.Equal(expected, model.StatusText);
     }
 
     // Criterion 5: unit 1 behaves as before

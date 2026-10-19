@@ -31,6 +31,21 @@ public sealed class ShelfListBuilderTests
 
     private static List<ShelfRow> AllRows(ShelfList list) => list.Groups.SelectMany(g => g.Rows).ToList();
 
+    [Theory]
+    [InlineData(53, 10, 50)]
+    [InlineData(53, 1, 53)]
+    [InlineData(9, 10, 0)]
+    [InlineData(53, 0, 53)] // unreadable unit: the runner clamps it as 1, so must the list
+    public void Build_Fits_RoundsDownToWholeChunks(int free, int unit, int expected)
+    {
+        ShelfList list = ShelfListBuilder.Build(
+            new[] { Shelf("a", 1, 0, free: free) }, _sourceKey, 100, _player, _noLabels, unit);
+
+        ShelfRow row = Assert.Single(AllRows(list));
+        Assert.Equal(expected, row.Fits);
+        Assert.Equal(expected > 0, row.Selectable);
+    }
+
     // ---- criterion 1
 
     [Fact]
