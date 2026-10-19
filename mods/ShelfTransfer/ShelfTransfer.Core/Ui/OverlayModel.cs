@@ -57,6 +57,7 @@ public sealed class OverlayModel
     public const string RunningReason = "A transfer is running";
     public const string FinishedReason = "The transfer has finished";
     public const string ClosedReason = "The overlay is closed";
+    public const string ClampedToFitNote = "Clamped to what fits";
 
     private static readonly IReadOnlyList<ShelfGroup> _noGroups = Array.Empty<ShelfGroup>();
 
@@ -73,6 +74,9 @@ public sealed class OverlayModel
     // Null exactly when Amount is confirmable.
     private string? _amountReason;
 
+    // Built once, not on every keystroke that rounds.
+    private readonly string? _roundedToChunkNote;
+
     /// <summary><paramref name="transferUnit"/>: items one take moves (IShelfGateway.GetTransferUnit), so the amount is
     /// clamped to whole chunks exactly as the runner plans it (I4).</summary>
     public OverlayModel(AimTarget source, int transferUnit = 1)
@@ -84,6 +88,9 @@ public sealed class OverlayModel
 
         Source = source;
         TransferUnit = transferUnit;
+        _roundedToChunkNote = transferUnit > 1
+            ? string.Format(CultureInfo.InvariantCulture, "Rounded down to whole chunks of {0}", transferUnit)
+            : null;
     }
 
     public OverlayState State { get; private set; } = OverlayState.Loading;
@@ -102,6 +109,10 @@ public sealed class OverlayModel
 
     /// <summary>What the amount field shows: the clamped amount, or the player's text while it is invalid.</summary>
     public string AmountDisplay { get; private set; } = string.Empty;
+
+    /// <summary>Why the last typed amount shows less than was typed; null when it shows as typed and after any other
+    /// amount change. Too small is no note: the field keeps the typed text and ConfirmDisabledReason says why.</summary>
+    public string? AmountNote { get; private set; }
 
     public bool IsCancelRequested { get; private set; }
 
@@ -198,6 +209,24 @@ public sealed class OverlayModel
         }
 
         _expandedByGroup[groupName] = !group.Expanded;
+        RebuildGroups();
+    }
+
+    /// <summary>Expands the group now holding the row, so a regrouped row stays in view; no-op if absent or already open.</summary>
+    public void ExpandGroupOf(string shelfKey)
+    {
+        if (State != OverlayState.Ready)
+        {
+            return;
+        }
+
+        ShelfGroup? group = Groups.FirstOrDefault(candidate => candidate.Rows.Any(row => row.Shelf.Key == shelfKey));
+        if (group is null || group.Expanded)
+        {
+            return;
+        }
+
+        _expandedByGroup[group.Name] = true;
         RebuildGroups();
     }
 
@@ -352,6 +381,19 @@ public sealed class OverlayModel
         _requestedAmount = clamp.Reason == ClampReason.Ok ? clamp.Amount : requested;
         _invalidAmountText = null;
         UpdateAmount();
+        AmountNote = typedText is not null ? GetAmountNote(requested) : null;
+    }
+
+    // Fits is whole chunks, so Amount = min(rounded request, Fits): when the rounded request already fits, only the
+    // chunk rule cut the number (a typed 53 shown as 50 on a roomy shelf is not about fit).
+    private string? GetAmountNote(int requested)
+    {
+        if (Amount <= 0 || Amount >= requested)
+        {
+            return null;
+        }
+
+        return AmountClamp.RoundDownToChunk(requested, TransferUnit) > Amount ? ClampedToFitNote : _roundedToChunkNote;
     }
 
     private void UpdateAmount()
@@ -370,6 +412,7 @@ public sealed class OverlayModel
 
         Amount = clamp.Reason == ClampReason.Ok ? clamp.Amount : 0;
         AmountDisplay = Amount.ToString(CultureInfo.InvariantCulture);
+        AmountNote = null;
         _amountReason = clamp.Reason switch
         {
             ClampReason.Ok => null,
@@ -393,6 +436,7 @@ public sealed class OverlayModel
         _amountReason = reason;
         Amount = 0;
         AmountDisplay = text;
+        AmountNote = null;
     }
 
     private void ClearSelection()
@@ -403,6 +447,7 @@ public sealed class OverlayModel
         _amountReason = null;
         Amount = 0;
         AmountDisplay = string.Empty;
+        AmountNote = null;
     }
 
     private void ClearList()
