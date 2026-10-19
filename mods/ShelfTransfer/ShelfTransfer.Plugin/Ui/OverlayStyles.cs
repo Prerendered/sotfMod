@@ -145,6 +145,8 @@ public sealed class OverlayStyles
             clipping = TextClipping.Clip,
             alignment = TextAnchor.MiddleLeft,
             padding = new RectOffset(0, 0, 0, 0),
+            // Labels carry User label/group text; a "<size=500>" in a hand-edited label file must render as typed.
+            richText = false,
         };
         style.normal.textColor = color;
         return style;

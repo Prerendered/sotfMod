@@ -187,7 +187,7 @@ public sealed class OverlayUi : MonoBehaviour
         Vector3 player = camera.transform.position;
         ShelfList list = BuildTargetList(gateway, shelves, aim, sourceCount, unit,
             new WorldPosition(player.x, player.y, player.z), store?.Entries ?? _noLabels);
-        LabelPruneResult? prune = PruneLabels(log, store, shelves, aim);
+        (string Outcome, int Pruned, int Pending) prune = PruneLabels(log, store, shelves, aim);
 
         OverlayModel model = new(aim, unit);
         model.OnShelfList(list);
@@ -210,9 +210,9 @@ public sealed class OverlayUi : MonoBehaviour
             new("unit", unit),
             new("key", key.ToString()),
             new("targets", list.Groups.Sum(group => group.Rows.Count)),
-            new("pruned", prune?.Pruned.Count ?? 0),
-            new("prune", FormatPruneOutcome(prune?.Outcome)),
-            new("prune_pending", prune?.Pending ?? 0),
+            new("pruned", prune.Pruned),
+            new("prune", prune.Outcome),
+            new("prune_pending", prune.Pending),
         });
     }
 
@@ -234,44 +234,70 @@ public sealed class OverlayUi : MonoBehaviour
         return ShelfListBuilder.Build(candidates, aim.Shelf.Key, sourceCount, player, labels, unit);
     }
 
-    // §07 prune on open. LabelPruneGuard decides (two consecutive scans, never the shared unknown file); each pruned
-    // entry is logged in full first so the User can restore it by hand from the log.
+    // §07 prune on open. LabelPruneGuard decides (two consecutive scans, never the shared unknown file) and archives
+    // each entry to <world>.pruned.json before removing it; a failed save puts them back (I5: a prune never loses data).
     [HideFromIl2Cpp]
-    private LabelPruneResult? PruneLabels(IModLog log, LabelStore? store, IReadOnlyList<ShelfRef> shelves, AimTarget aim)
+    private (string Outcome, int Pruned, int Pending) PruneLabels(
+        IModLog log, LabelStore? store, IReadOnlyList<ShelfRef> shelves, AimTarget aim)
     {
         if (store is null)
         {
-            return null;
+            return ("no_store", 0, 0);
         }
 
+        string world = store.SanitisedWorldId;
         LabelPruneResult result = _pruneGuard.Prune(store, shelves.Select(shelf => shelf.Key).ToList(), aim.Shelf.Key);
+        if (result.Outcome == LabelPruneOutcome.ArchiveFailed)
+        {
+            string outcome = FormatPruneOutcome(result.Outcome);
+            log.Write(LogLevel.Warn, _pruneLogEvent, new KeyValuePair<string, object?>[]
+            {
+                new("world", world),
+                new("outcome", outcome),
+                new("pending", result.Pending),
+                new("detail", result.Detail),
+            });
+            return (outcome, 0, result.Pending);
+        }
+
         foreach (PrunedLabel entry in result.Pruned)
         {
             log.Write(LogLevel.Info, _pruneLogEvent, new KeyValuePair<string, object?>[]
             {
-                new("world", store.SanitisedWorldId),
+                new("world", world),
                 new("shelf", entry.Key),
                 new("label", entry.Label.Label),
                 new("group", entry.Label.Group),
+                new("archived", true),
             });
         }
 
-        if (result.Pruned.Count > 0)
+        // SaveNow logs labels.write (JsonLabelFileSystem, or LabelsFeature when blocked).
+        LabelSaveResult? saved = LabelPruneGuard.SavePruned(store, result.Pruned, LabelsFeature.SaveNow);
+        if (saved is { Status: not LabelSaveStatus.Saved })
         {
-            // Logs labels.write (JsonLabelFileSystem, or LabelsFeature when blocked).
-            LabelsFeature.SaveNow();
+            log.Write(LogLevel.Warn, _pruneLogEvent, new KeyValuePair<string, object?>[]
+            {
+                new("world", world),
+                new("outcome", "save_failed"),
+                new("status", saved.Status.ToString()),
+                new("restored", result.Pruned.Count),
+                new("detail", saved.Detail),
+            });
+            return ("save_failed", 0, result.Pending);
         }
 
-        return result;
+        return (FormatPruneOutcome(result.Outcome), result.Pruned.Count, result.Pending);
     }
 
     [HideFromIl2Cpp]
-    private static string FormatPruneOutcome(LabelPruneOutcome? outcome) => outcome switch
+    private static string FormatPruneOutcome(LabelPruneOutcome outcome) => outcome switch
     {
         LabelPruneOutcome.Checked => "checked",
         LabelPruneOutcome.SkippedUnknownWorld => "skipped_unknown_world",
         LabelPruneOutcome.SkippedNoShelves => "skipped_no_shelves",
-        _ => "no_store",
+        LabelPruneOutcome.ArchiveFailed => "archive_failed",
+        _ => outcome.ToString(),
     };
 
     [HideFromIl2Cpp]
