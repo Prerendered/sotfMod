@@ -44,6 +44,8 @@ public static class ShelfListBuilder
         IReadOnlyDictionary<string, ShelfLabel> labels,
         int transferUnit = 1)
     {
+        // An unreadable unit (gateway 0) clamps as 1, as the runner does, so the list never throws on it (I4).
+        int unit = transferUnit < 1 ? 1 : transferUnit;
         var liveKeys = new HashSet<string>(StringComparer.Ordinal) { sourceKey };
         var rowsByGroup = new Dictionary<string, List<ShelfRow>>(StringComparer.Ordinal);
         foreach (ShelfCandidate candidate in shelves)
@@ -62,7 +64,7 @@ public static class ShelfListBuilder
                 rowsByGroup.Add(groupName, rows);
             }
 
-            rows.Add(BuildRow(candidate, stored?.Label, sourceCount, playerPosition, transferUnit));
+            rows.Add(BuildRow(candidate, stored?.Label, sourceCount, playerPosition, unit));
         }
 
         List<ShelfGroup> groups = rowsByGroup

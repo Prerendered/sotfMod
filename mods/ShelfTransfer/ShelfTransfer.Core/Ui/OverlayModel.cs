@@ -125,7 +125,7 @@ public sealed class OverlayModel
         OverlayState.Loading => LoadingText,
         OverlayState.Empty => EmptyText,
         OverlayState.Error => ErrorText,
-        OverlayState.Ready when !_hasSelectableRow => NoTargetText,
+        OverlayState.Ready when !_hasSelectableRow => GetNoSelectableRowText(),
         OverlayState.Running => IsCancelRequested ? (TransferUnit > 1 ? CancellingChunkText : CancellingText) : RunningText,
         _ => null,
     };
@@ -329,11 +329,15 @@ public sealed class OverlayModel
     {
         if (SelectedRow is null)
         {
-            return _hasSelectableRow ? SelectTargetReason : NoTargetText;
+            return _hasSelectableRow ? SelectTargetReason : GetNoSelectableRowText();
         }
 
         return _amountReason;
     }
+
+    // A source under one chunk zeroes every row's Fits, so no shelf is to blame; say what the runner would.
+    private string GetNoSelectableRowText() =>
+        Source.Count > 0 && Source.Count < TransferUnit ? NothingToMoveReason : NoTargetText;
 
     private void ApplyRequestedAmount(int requested, string? typedText)
     {

@@ -35,6 +35,7 @@ public sealed class ShelfListBuilderTests
     [InlineData(53, 10, 50)]
     [InlineData(53, 1, 53)]
     [InlineData(9, 10, 0)]
+    [InlineData(53, 0, 53)] // unreadable unit: the runner clamps it as 1, so must the list
     public void Build_Fits_RoundsDownToWholeChunks(int free, int unit, int expected)
     {
         ShelfList list = ShelfListBuilder.Build(

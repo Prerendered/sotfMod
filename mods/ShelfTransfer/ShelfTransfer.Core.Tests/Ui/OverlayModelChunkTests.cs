@@ -1,10 +1,12 @@
 // purpose: pins the overlay amount in whole chunks (card 68, I4 amended): typed, default All, stepper and refresh, and its agreement with the runner's plan
 // owns:    OverlayModelChunkTests
-// deps:    OverlayModel, AimTarget, ShelfList, ShelfRow, TransferRunner, FakeShelfGateway
+// deps:    OverlayModel, AimTarget, ShelfList, ShelfListBuilder, ShelfRow, TransferRunner, FakeShelfGateway
 
 using System;
+using System.Collections.Generic;
 
 using ShelfTransfer.Core.Gateway;
+using ShelfTransfer.Core.Labels;
 using ShelfTransfer.Core.Shelves;
 using ShelfTransfer.Core.Tests.Fakes;
 using ShelfTransfer.Core.Transfer;
@@ -195,6 +197,24 @@ public sealed class OverlayModelChunkTests
         Assert.Equal(0, model.Amount);
         Assert.False(model.ConfirmEnabled);
         Assert.Equal(OverlayModel.NothingToMoveReason, model.ConfirmDisabledReason);
+    }
+
+    // Criterion 2 end to end: the real builder gives every row Fits 0, so the none-selectable text must name the source.
+    [Theory]
+    [InlineData(5, 10, true, OverlayModel.NothingToMoveReason)]
+    [InlineData(5, 1, false, OverlayModel.NoTargetText)]
+    public void BuiltList_NoSelectableRow_StatusNamesTheCause(int sourceCount, int unit, bool canHold, string expected)
+    {
+        ShelfCandidate roomy = new(new ShelfRef("a", "StorageShelf", new WorldPosition(1f, 0f, 1f)), 100, canHold);
+        ShelfList list = ShelfListBuilder.Build(new[] { roomy }, _sourceShelf.Key, sourceCount,
+            new WorldPosition(0f, 0f, 0f), new Dictionary<string, ShelfLabel>(), unit);
+        OverlayModel model = new(new AimTarget(_sourceShelf, _slot, _item, sourceCount), unit);
+
+        model.OnShelfList(list);
+
+        Assert.False(model.SelectRow("a"));
+        Assert.Equal(expected, model.StatusText);
+        Assert.Equal(expected, model.ConfirmDisabledReason);
     }
 
     [Fact]
