@@ -2,7 +2,7 @@
 // owns:    FakeShelfGateway, FakeShelf
 // deps:    IShelfGateway
 // caution: calls are logged as "Name(key)" or "Name" (inventory); OnCall fires after logging and before the call acts, so it can flip IsAlive, request cancel or throw.
-//          A shelf given Slots is a mixed shelf: ListStock, GetCount and GetTransferUnit read the slots, take/store still use Count
+//          A shelf given Slots is a mixed shelf: ListStock, GetCount, GetTransferUnit and TakeOne use the slots, StoreOne still uses Count
 
 using System;
 using System.Collections.Generic;
@@ -98,6 +98,41 @@ public sealed class FakeShelfGateway : IShelfGateway
         return GatewayOutcome.Ok;
     }
 
+    /// <summary>The plugin's take on a mixed shelf: one chunk of the item's unit from the given slot, or from the first slot
+    /// holding a whole chunk of it when Index is null (a short slot falls through, as the plugin's any-hook take).</summary>
+    public GatewayOutcome ApplySlotTake(ShelfRef shelf, SlotRef slot, ItemId item)
+    {
+        List<(SlotRef Slot, ItemId Item, int Count)> slots = _shelves[shelf.Key].Slots;
+        int unit = UnitOf(item);
+        int index = slot.Index is null
+            ? slots.FindIndex(s => s.Item == item && s.Count >= unit)
+            : slots.FindIndex(s => s.Slot == slot);
+        if (index < 0)
+        {
+            return slot.Index is null ? GatewayOutcome.Refused("no slot holds the item") : GatewayOutcome.Failed("slot gone");
+        }
+
+        (SlotRef at, ItemId held, int count) = slots[index];
+        if (count <= 0)
+        {
+            return GatewayOutcome.Refused("slot empty");
+        }
+
+        if (held != item)
+        {
+            return GatewayOutcome.Refused("slot holds item " + held);
+        }
+
+        if (count < unit)
+        {
+            return GatewayOutcome.Refused($"partial chunk {count} of {unit}");
+        }
+
+        slots[index] = (at, held, count - unit);
+        Inventory += unit;
+        return GatewayOutcome.Ok;
+    }
+
     public GatewayOutcome ApplyStore(ShelfRef shelf)
     {
         FakeShelf fake = _shelves[shelf.Key];
@@ -171,7 +206,8 @@ public sealed class FakeShelfGateway : IShelfGateway
         TakeCalls++;
         TakeSlots.Add(slot);
         Record($"TakeOne({shelf.Key})");
-        return TakeBehavior?.Invoke(TakeCalls) ?? ApplyTake(shelf);
+        return TakeBehavior?.Invoke(TakeCalls)
+            ?? (_shelves[shelf.Key].Slots.Count > 0 ? ApplySlotTake(shelf, slot, item) : ApplyTake(shelf));
     }
 
     public GatewayOutcome StoreOne(ShelfRef shelf, ItemId item)
