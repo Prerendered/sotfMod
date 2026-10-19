@@ -112,6 +112,35 @@ public sealed class InteropShelfGateway : IShelfGateway
             return 0;
         });
 
+    // Reads only (I2): TakeOne's hook walk and TakeFrom's whole-chunk rule, so a slot it would refuse adds nothing (card 85).
+    public int GetMovableCount(ShelfRef shelf, SlotRef slot, ItemId item) =>
+        Guard("get_movable_count", _ => 0, () =>
+        {
+            if (!TryGetShelf(shelf, out ItemStorageController? controller))
+            {
+                return 0;
+            }
+
+            int total = 0;
+            foreach (ItemStorageHookPoint hook in CopyHooks(controller))
+            {
+                InWorldLayoutItemGroup? group = FindActiveGroup(hook);
+                if (slot.Index is int index)
+                {
+                    if (IsSlot(hook, group, index))
+                    {
+                        return ReadMovable(group, item);
+                    }
+                }
+                else
+                {
+                    total += ReadMovable(group, item);
+                }
+            }
+
+            return total;
+        });
+
     // Reads only (I2): each stocked hook's group fields and count, folded in Core. The unit is the group's _transferAmount, as
     // GetTransferUnit reads it for the same slot.
     public IReadOnlyList<ShelfStockEntry> ListStock(ShelfRef shelf) =>
@@ -252,6 +281,19 @@ public sealed class InteropShelfGateway : IShelfGateway
 
         group.RemoveItem(false);
         return null;
+    }
+
+    // What repeated TakeFrom calls on the group would move: whole chunks only, nothing for another item or a bad unit.
+    private static int ReadMovable(InWorldLayoutItemGroup? group, ItemId item)
+    {
+        if (group == null || group._itemId != item.Value)
+        {
+            return 0;
+        }
+
+        int unit = group._transferAmount;
+        int count = group.GetCurrentCount();
+        return unit < 1 || count <= 0 ? 0 : count / unit * unit;
     }
 
     // AimWatcher's resolution (the stocked group's _storage); the hook's own component only for an empty slot.

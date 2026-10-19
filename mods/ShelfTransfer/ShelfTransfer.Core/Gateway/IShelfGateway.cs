@@ -26,6 +26,10 @@ public interface IShelfGateway
     /// 0 when no stocked slot holds the item.</summary>
     int GetTransferUnit(ShelfRef shelf, SlotRef slot, ItemId item);
 
+    /// <summary>Items repeated <see cref="TakeOne"/> calls with this slot can move: each matching slot's count rounded down to
+    /// whole chunks of its unit, summed (one slot when Index is set). Reads only.</summary>
+    int GetMovableCount(ShelfRef shelf, SlotRef slot, ItemId item);
+
     /// <summary>Every item type with stock on the shelf (<see cref="ShelfStockEntry.BuildList"/>), read fresh. Empty, never
     /// null, when the shelf is empty or gone. Reads only.</summary>
     IReadOnlyList<ShelfStockEntry> ListStock(ShelfRef shelf);

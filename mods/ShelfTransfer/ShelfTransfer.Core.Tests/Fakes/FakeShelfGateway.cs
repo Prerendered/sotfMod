@@ -2,7 +2,8 @@
 // owns:    FakeShelfGateway, FakeShelf
 // deps:    IShelfGateway
 // caution: calls are logged as "Name(key)" or "Name" (inventory); OnCall fires after logging and before the call acts, so it can flip IsAlive, request cancel or throw.
-//          A shelf given Slots is a mixed shelf: ListStock, GetCount, GetTransferUnit and TakeOne use the slots, StoreOne still uses Count
+//          A shelf given Slots is a mixed shelf: ListStock, GetCount, GetTransferUnit, GetMovableCount and TakeOne use the slots, StoreOne
+//          still uses Count
 
 using System;
 using System.Collections.Generic;
@@ -43,6 +44,9 @@ public sealed class FakeShelfGateway : IShelfGateway
 
     /// <summary>Per-item chunk on a mixed shelf (e.g. 10 for rifle ammo); an item missing here uses <see cref="TransferUnit"/>.</summary>
     public Dictionary<ItemId, int> ItemUnits { get; } = new();
+
+    /// <summary>GetMovableCount calls; the runner reads it only for a chunk (unit > 1).</summary>
+    public int MovableCountReads { get; private set; }
 
     public int TakeCalls { get; private set; }
 
@@ -188,6 +192,24 @@ public sealed class FakeShelfGateway : IShelfGateway
 
         bool isStocked = fake.Slots.Any(s => s.Item == item && s.Count > 0 && (slot.Index is null || s.Slot == slot));
         return isStocked ? UnitOf(item) : 0;
+    }
+
+    // As the plugin, whole chunks per slot that TakeOne with this slot could reach. Counted, not logged, like GetTransferUnit.
+    public int GetMovableCount(ShelfRef shelf, SlotRef slot, ItemId item)
+    {
+        MovableCountReads++;
+        FakeShelf fake = _shelves[shelf.Key];
+        if (fake.Slots.Count == 0)
+        {
+            return TransferUnit < 1 ? 0 : fake.Count / TransferUnit * TransferUnit;
+        }
+
+        int unit = UnitOf(item);
+        return unit < 1
+            ? 0
+            : fake.Slots
+                .Where(s => s.Item == item && s.Count > 0 && (slot.Index is null || s.Slot == slot))
+                .Sum(s => s.Count / unit * unit);
     }
 
     public IReadOnlyList<ShelfStockEntry> ListStock(ShelfRef shelf)
